@@ -20,6 +20,7 @@
 #include <stddef.h>
 
 #include "pto_types.h"
+#include "tensor_pool.h"
 
 // =============================================================================
 // Configuration Constants
@@ -272,6 +273,7 @@ struct PTO2TaskDescriptor {
     bool     is_active;           // Task slot is in use
 
 
+    TensorData* tensor_data[16];
     PTOParam params[16];
     int param_count{0};
 };

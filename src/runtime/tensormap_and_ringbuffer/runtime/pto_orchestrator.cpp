@@ -243,11 +243,16 @@ void pto2_submit_task(
 
     task->param_count = num_params;
     for (int i = 0; i < num_params; i++) {
-        task->params[i].type = params[i].type;
+        auto &p = task->params[i];
+        p.type = params[i].type;
         if (params[i].type == PTOParamType::SCALAR) {
-            task->params[i].scalar_value = params[i].scalar_value;
+            p.scalar_value = params[i].scalar_value;
+            task->tensor_data[i] = nullptr;
         } else {
-            task->params[i].tensor = std::move(params[i].tensor);
+            p.tensor = std::move(params[i].tensor);
+            auto &tensor_data = p.tensor.data();
+            task->tensor_data[i] = &tensor_data;
+            tensor_data.update_start_offset();
         }
     }
 

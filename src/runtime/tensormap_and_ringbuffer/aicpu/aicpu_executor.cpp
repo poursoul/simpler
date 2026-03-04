@@ -391,12 +391,13 @@ static void build_pto2_payload(PTO2DispatchPayload* out, Runtime* runtime,
     int n = 0;
 
     for (int i = 0; i < task->param_count; i++) {
-        if (task->params[i].type == PTOParamType::SCALAR) {
-            out->args[n++] = task->params[i].scalar_value;
+        if (!task->is_tensor[i]) {
+            out->args[n++] = task->scalar_value[i];
         } else {
-            // Pass pointer to the Tensor (in task-owned storage), not the raw buffer address.
-            // Kernels expect args[i] to be a Tensor* from which they read buffer.addr.
-            out->args[n++] = reinterpret_cast<uint64_t>(task->tensor_data[i]);
+            // Pass pointer to TensorData in task descriptor's inline tensor storage.
+            // Kernels expect args[i] to be a TensorData* from which they read buffer.addr.
+            out->args[n++] = reinterpret_cast<uint64_t>(&task->tensors[i]);
+            task->tensors[i].update_start_offset();
         }
     }
 
@@ -1078,7 +1079,7 @@ int AicpuExecutor::run(Runtime* runtime) {
 
             // Wait for all scheduler threads (0, 1, 2) to finish before destroying
             // runtime. Scheduler threads read tensor_data pointers from task descriptors
-            // that point into TensorPool — freeing early is use-after-free.
+            // that point into the task descriptor's inline TensorData — freeing early is use-after-free.
             while (finished_count_.load(std::memory_order_acquire) < thread_num_ - 1) {
             }
             DEV_INFO("Thread 3: All scheduler threads finished, destroying runtime");

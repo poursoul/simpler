@@ -23,7 +23,7 @@ ATOL = 1e-2
 # All test cases - small scale (16x16 tiles)
 ALL_CASES = {
     "Case1": {
-        "batch": 1,
+        "batch": 4,
         "num_heads": 16,
         "kv_head_num": 1,
         "head_dim": 16,

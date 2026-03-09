@@ -226,7 +226,7 @@ typedef struct {
  * Dependency list entry (singly-linked list node)
  * Stored in DepListPool ring buffer
  * 
- * Used for both fanin_list and fanout_list
+ * Used for fanout_list (fanin uses inline array in TaskDescriptor)
  */
 struct PTO2DepListEntry {
     int32_t task_id;          // The dependent/dependency task ID
@@ -245,7 +245,8 @@ struct PTO2DepListEntry {
  * 
  * Concurrency notes:
  * - fanout_head, fanout_count protected by fanout_lock (per-task spinlock)
- * - fanin_head, fanin_count set once at submission, read-only after
+ * - fanin_count set once at submission, read-only after (hot path for ready check)
+ * - fanin_tasks stored in TaskPayload (cold path for release)
  * - Other fields set by Orchestrator, read by Scheduler
  */
 struct PTO2TaskDescriptor {
@@ -253,28 +254,33 @@ struct PTO2TaskDescriptor {
     int32_t task_id;              // Unique task identifier (absolute, not wrapped)
     int32_t kernel_id;            // InCore function to execute
     int32_t worker_type;          // Target: CUBE, VECTOR, AI_CPU, ACCELERATOR
-    // Dependency lists (linked list heads - offsets into DepListPool)
-    // Fanin: producers this task depends on (set once at submission)
-    PTO2DepListEntry* fanin_head;           // Offset to first fanin entry (0 = empty)
-    int32_t fanin_count;          // Number of producer dependencies
-    
+    // Fanin: number of producer dependencies (set once at submission, read-only after)
+    int32_t fanin_count;
+
     // Fanout: consumers that depend on this task (grows as consumers submit)
     // PROTECTED BY fanout_lock
     std::atomic<int32_t> fanout_lock; // Per-task spinlock (0=unlocked, 1=locked)
     PTO2DepListEntry* fanout_head;    // Pointer to first fanout entry (nullptr = empty), PROTECTED BY fanout_lock
-    std::atomic<int32_t> fanout_count;// 1 (owning scope) + number of consumers
-    
+    int32_t fanout_count;// 1 (owning scope) + number of consumers
+
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
     void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
+};
 
-    // Status flags
-    bool     is_active;           // Task slot is in use
-
-    Tensor tensors[16];           // Value copies of tensors for scheduler access
+/**
+ * Task payload data (cold path - only accessed during orchestration and dispatch)
+ *
+ * Separated from PTO2TaskDescriptor to keep the descriptor cache-friendly
+ * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
+ */
+struct PTO2TaskPayload {
+    Tensor tensors[16];
     uint64_t scalar_value[16];
     bool is_tensor[16];
     int param_count{0};
+    int32_t fanin_tasks[PTO2_MAX_INPUTS];   // Producer task IDs (cold path, used by on_task_release)
+    int32_t fanin_actual_count{0};           // Actual fanin count (without the +1 redundance)
 };
 
 // =============================================================================
@@ -309,20 +315,20 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 // scheduler traversing the list after task completion.
 // =============================================================================
 
-static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
+static inline void pto2_fanout_lock(PTO2TaskDescriptor& task) {
     for (;;) {
-        while (task->fanout_lock.load(std::memory_order_acquire) != 0) {
+        while (task.fanout_lock.load(std::memory_order_acquire) != 0) {
         }
         int32_t expected = 0;
-        if (task->fanout_lock.compare_exchange_weak(expected, 1,
+        if (task.fanout_lock.compare_exchange_weak(expected, 1,
                                         std::memory_order_acquire, std::memory_order_relaxed)) {
             return;
         }
     }
 }
 
-static inline void pto2_fanout_unlock(PTO2TaskDescriptor* task) {
-    task->fanout_lock.store(0, std::memory_order_release);
+static inline void pto2_fanout_unlock(PTO2TaskDescriptor& task) {
+    task.fanout_lock.store(0, std::memory_order_release);
 }
 
 #endif // PTO_RUNTIME2_TYPES_H

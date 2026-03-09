@@ -32,6 +32,9 @@
 #include "pto_scheduler.h"
 #include "pto_orchestrator.h"
 
+// Maximum number of orchestrator threads supported
+constexpr int PTO2_MAX_ORCH_THREADS = 4;
+
 // =============================================================================
 // Runtime Context
 // =============================================================================
@@ -82,7 +85,8 @@ struct PTO2Runtime {
 
     // Components
     PTO2SharedMemoryHandle* sm_handle;
-    PTO2OrchestratorState   orchestrator;
+    PTO2OrchestratorState   orchestrators[PTO2_MAX_ORCH_THREADS];
+    int                     orch_count;     // Number of active orchestrator states
     PTO2SchedulerState      scheduler;
 
     // GM Heap for output buffers
@@ -115,13 +119,11 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode);
  * @param mode             Execution mode
  * @param task_window_size Number of task slots
  * @param heap_size        Size of GM heap
- * @param dep_list_size    Size of dependency list pool
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
                                          uint64_t task_window_size,
-                                         uint64_t heap_size,
-                                         uint64_t dep_list_size);
+                                         uint64_t heap_size);
 
 /**
  * Create runtime from existing shared memory and GM heap (e.g. on device).
@@ -136,7 +138,8 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
 PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
                                           PTO2SharedMemoryHandle* sm_handle,
                                           void* gm_heap,
-                                          uint64_t heap_size);
+                                          uint64_t heap_size,
+                                          int orch_count = 1);
 
 /**
  * Destroy runtime and free all resources
@@ -152,6 +155,12 @@ void pto2_runtime_reset(PTO2Runtime* rt);
  * Set execution mode
  */
 void pto2_runtime_set_mode(PTO2Runtime* rt, PTO2RuntimeMode mode);
+
+/**
+ * Set the orchestrator index for the current thread.
+ * Must be called before any orchestration API calls on a given thread.
+ */
+void pto2_set_orch_thread_idx(int idx);
 
 // =============================================================================
 // Orchestration API (called by orchestration function)
@@ -275,7 +284,6 @@ private:
  *       .arg_count          = arg_count,
  *       .expected_arg_count = 7,
  *       .task_window_size   = 16384,
- *       .dep_list_pool_size = 65536,
  *       .heap_size          = 256 * 1024,
  *       .gm_heap_ptr        = s_gm_heap_stub,
  *   };
@@ -286,7 +294,6 @@ struct PTO2OrchestrationBeginInfo {
     int         arg_count;
     int         expected_arg_count;
     uint64_t      task_window_size;
-    uint64_t      dep_list_pool_size;
     uint64_t      heap_size;
     void*       gm_heap_ptr = nullptr;
 };
@@ -319,13 +326,11 @@ public:
         }
         header_ = static_cast<PTO2SharedMemoryHeader*>(begin_info.sm_ptr);
 
-        uint64_t sm_size = pto2_sm_calculate_size(begin_info.task_window_size,
-                                                  begin_info.dep_list_pool_size);
+        uint64_t sm_size = pto2_sm_calculate_size(begin_info.task_window_size);
         PTO2SharedMemoryHandle* sm_handle =
             pto2_sm_create_from_buffer(begin_info.sm_ptr, sm_size,
                                        begin_info.task_window_size,
-                                       begin_info.heap_size,
-                                       begin_info.dep_list_pool_size);
+                                       begin_info.heap_size);
         if (!sm_handle) return;
 
         void*   gm_heap      = begin_info.gm_heap_ptr;

@@ -71,10 +71,8 @@ void pto2_ready_queue_reset(PTO2ReadyQueue* queue) {
 
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
-                          PTO2DepListPool* dep_pool,
                           void* heap_base) {
     sched->sm_handle = sm_handle;
-    sched->dep_pool = dep_pool;
     sched->heap_base = heap_base;
     sched->task_state = nullptr;
     sched->fanin_refcount = nullptr;

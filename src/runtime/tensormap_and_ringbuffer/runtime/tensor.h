@@ -51,6 +51,9 @@ struct Segment {
  *   - Start at buffer.addr + (1*6+0)*4 = buffer.addr + 24 bytes
  *   - Inner dim: access 6 consecutive elements
  *   - Outer dim: 3 rows with stride 6 elements (derived from raw_shapes[1])
+ *
+ * Each Tensor carries a pointer to its owning TensorPool, enabling safe
+ * multi-orchestrator operation without global/thread-local singletons.
  */
 struct Tensor {
     // === Data fields (same layout as former TensorData) ===

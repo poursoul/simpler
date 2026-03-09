@@ -451,6 +451,7 @@ class CodeRunner:
         # Runtime configuration - read from kernel_config or use defaults
         runtime_config = getattr(self._kernel_config, 'RUNTIME_CONFIG', {})
         self.aicpu_thread_num = runtime_config.get('aicpu_thread_num', 3)
+        self.orch_thread_num = runtime_config.get('orch_thread_num', 1)
         self.block_dim = runtime_config.get('block_dim', 24)
         self.runtime_name = runtime_config.get('runtime', 'host_build_graph')
 
@@ -840,6 +841,7 @@ class CodeRunner:
                 device_id=self.device_id,
                 aicpu_binary=aicpu_binary,
                 aicore_binary=aicore_binary,
+                orch_thread_num=self.orch_thread_num,
             )
 
             logger.info("Launch completed successfully")  # Will only print if not hung

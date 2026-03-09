@@ -174,9 +174,6 @@ struct PTO2SchedulerState {
     // Ready queues (one per worker type)
     PTO2ReadyQueue ready_queues[PTO2_NUM_WORKER_TYPES];
 
-    // Dependency list pool reference
-    PTO2DepListPool* dep_pool;
-
     // Statistics
     std::atomic<int64_t> tasks_completed;
     std::atomic<int64_t> tasks_consumed;
@@ -221,13 +218,8 @@ struct PTO2SchedulerState {
         sync_to_sm();
     }
 
-    void check_and_handle_consumed(int32_t task_id, PTO2TaskDescriptor* task) {
-        int32_t slot = pto2_task_slot(task_id);
-
-        int32_t fc = task->fanout_count.load(std::memory_order_acquire);
-        int32_t rc = fanout_refcount[slot].load(std::memory_order_acquire);
-
-        if (rc != fc) return;
+    void check_and_handle_consumed(int32_t slot, PTO2TaskDescriptor& task) {
+        if (fanout_refcount[slot].load(std::memory_order_acquire) != task.fanout_count) return;
 
         PTO2TaskState expected = PTO2_TASK_COMPLETED;
         if (!task_state[slot].compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
@@ -250,9 +242,9 @@ struct PTO2SchedulerState {
 
     void release_producer(int32_t producer_id) {
         int32_t slot = pto2_task_slot(producer_id);
-        PTO2TaskDescriptor* producer = pto2_sm_get_task(sm_handle, producer_id);
+        PTO2TaskDescriptor& producer = pto2_sm_get_task_by_slot(sm_handle, slot);
         fanout_refcount[slot].fetch_add(1, std::memory_order_acq_rel);
-        check_and_handle_consumed(producer_id, producer);
+        check_and_handle_consumed(slot, producer);
     }
 
     bool release_fanin_and_check_ready(int32_t task_id,
@@ -265,12 +257,8 @@ struct PTO2SchedulerState {
         int32_t new_refcount = fanin_refcount[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == task->fanin_count) {
-            PTO2TaskState expected = PTO2_TASK_PENDING;
-            if (task_state[slot].compare_exchange_strong(
-                    expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                ready_queues[task->worker_type].push(task_id);
-                return true;
-            }
+            ready_queues[task->worker_type].push(task_id);
+            return true;
         }
         return false;
     }
@@ -306,20 +294,33 @@ struct PTO2SchedulerState {
     }
 
     void on_scope_end(const int32_t* task_ids, int32_t count) {
+        // Phase 1: Batch increment fanout_refcount (touches only fanout_refcount array)
         for (int32_t i = 0; i < count; i++) {
-            release_producer(task_ids[i]);
+            int32_t slot = pto2_task_slot(task_ids[i]);
+            fanout_refcount[slot].fetch_add(1, std::memory_order_acq_rel);
+        }
+        // Phase 2: Batch check for CONSUMED transitions + ring advancement
+        for (int32_t i = 0; i < count; i++) {
+            int32_t slot = pto2_task_slot(task_ids[i]);
+            PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, slot);
+            check_and_handle_consumed(slot, task);
         }
     }
 
+    /**
+     * Mark task COMPLETED, notify consumers (fanout), check self for CONSUMED.
+     * Fanin traversal (producer release for memory reclamation) is deferred
+     * to on_task_release() and called from idle time in the scheduler loop.
+     */
     PTO2CompletionStats on_task_complete(int32_t task_id) {
         PTO2CompletionStats stats = {0, 0, 0};
         int32_t slot = pto2_task_slot(task_id);
-        PTO2TaskDescriptor* task = pto2_sm_get_task(sm_handle, task_id);
+        PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, task_id);
 
         tasks_completed.fetch_add(1, std::memory_order_relaxed);
         pto2_fanout_lock(task);
         task_state[slot].store(PTO2_TASK_COMPLETED, std::memory_order_release);
-        PTO2DepListEntry* current = task->fanout_head;  // Protected by fanout_lock
+        PTO2DepListEntry* current = task.fanout_head;  // Protected by fanout_lock
         pto2_fanout_unlock(task);
 
         while (current != nullptr) {
@@ -336,18 +337,24 @@ struct PTO2SchedulerState {
             current = current->next;
         }
 
-        current = task->fanin_head;
-        while (current != nullptr) {
-            int32_t producer_id = current->task_id;
-            release_producer(producer_id);
-#if PTO2_PROFILING
-            stats.fanin_edges++;
-#endif
-            current = current->next;
-        }
-
-        check_and_handle_consumed(task_id, task);
+        check_and_handle_consumed(slot, task);
         return stats;
+    }
+
+    /**
+     * Cold path: release producers (fanin traversal) + check self for CONSUMED.
+     * Returns fanin edge count for profiling.
+     */
+    int32_t on_task_release(int32_t task_id) {
+        int32_t slot = pto2_task_slot(task_id);
+        PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, slot);
+        PTO2TaskPayload* payload = &sm_handle->task_payloads[slot];
+        int32_t fanin_edges = payload->fanin_actual_count;
+        for (int32_t i = 0; i < fanin_edges; i++) {
+            release_producer(payload->fanin_tasks[i]);
+        }
+        check_and_handle_consumed(slot, task);
+        return fanin_edges;
     }
 };
 
@@ -357,7 +364,6 @@ struct PTO2SchedulerState {
 
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
-                          PTO2DepListPool* dep_pool,
                           void* heap_base);
 void pto2_scheduler_destroy(PTO2SchedulerState* sched);
 void pto2_scheduler_reset(PTO2SchedulerState* sched);

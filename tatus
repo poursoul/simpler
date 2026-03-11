@@ -1,0 +1,3361 @@
+[33mcommit 4291f40219288b1e95841b57c9bd79d765e1bb1a[m[33m ([m[1;36mHEAD -> [m[1;32mfix-bug[m[33m, [m[1;31mcp/fix-bug[m[33m)[m
+Author: poursoul <poursoul@126.com>
+Date:   Wed Mar 11 09:06:22 2026 +0800
+
+    Fix: avoid dep pool waste on early-finished producers and fix slot lookup
+    
+    - Move dep_pool_cur_entry writes inside the else branch so entries
+      are only consumed when the producer has not already completed
+    - Fix on_task_complete passing task_id instead of slot to
+      pto2_sm_get_task_by_slot
+
+[33mcommit c63d1072789e6882fb9cdaf08bee2346d036cb2f[m[33m ([m[1;31morigin/main[m[33m)[m
+Author: chenshengxin2026 <hw_chenshengxin@163.com>
+Date:   Tue Mar 10 22:21:24 2026 +0800
+
+    Refactor: unify paged_attention golden implementations (#234)
+    
+    Extract common paged_attention golden logic into shared module to reduce
+    code duplication across examples and tests.
+    
+    - Add golden/paged_attention_golden.py with shared generate_inputs(),
+      paged_attention(), compute_golden(), and run_golden_test() functions
+    - Refactor 7 golden.py files to import from shared module instead of
+      duplicating ~200 lines each
+    - Each variant now only defines its specific ALL_CASES, RTOL/ATOL, and
+      return_all_sizes configuration
+    - Update examples/scripts/run_example.py to add golden/ to sys.path
+    - Net reduction: 1643 deletions, 360 additions (-1283 lines)
+    
+    Affected files:
+    - golden/paged_attention_golden.py (new shared module)
+    - examples/scripts/run_example.py
+    - examples/host_build_graph/paged_attention/golden.py
+    - examples/tensormap_and_ringbuffer/{paged_attention,batch_paged_attention}/golden.py
+    - tests/device_tests/aicpu_build_graph/paged_attention/golden.py
+    - tests/device_tests/host_build_graph/paged_attention/golden.py
+    - tests/device_tests/tensormap_and_ringbuffer/{paged_attention,batch_paged_attention}/golden.py
+
+[33mcommit 28dffa74a81866e61f72d74c32994da57d025dd2[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 10 21:32:26 2026 +0800
+
+    Update: fix paged_attention_unroll tensor shapes and align with paged_attention (#244)
+    
+    - Fix sij_buf/pij_buf shapes from (n_blocks*q_tile, block_size) to
+      (q_tile, n_blocks*block_size) for correct semantic representation
+    - Simplify kernel q_tile_size extraction since shapes[0] is now q_tile
+    - Align ALL_CASES with paged_attention (Case1 + Case2, default Case1)
+    - Add paged_attention_unroll to benchmark_rounds.sh
+
+[33mcommit e74344a4ced753f956558717842c246d5565699a[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 10 21:10:28 2026 +0800
+
+    Add: paged_attention_v2 with consolidated 4-task-per-group pipeline (#239)
+    
+    Add paged_attention_v2 device test under tensormap_and_ringbuffer runtime
+    with N_UNROLL=8 batching and consolidated task pipeline:
+    
+    - QK matmul batches up to 8 key blocks per CUBE invocation
+    - Two-pass softmax over all blocks in group: Pass 1 finds global row max
+      via GM round-trip TMAX, Pass 2 computes exp with uniform scale and
+      accumulates row sum in UB
+    - PV matmul uses SplitK accumulation (TMATMUL + TMATMUL_ACC) for single
+      accumulated output per group
+    - Orchestration submits exactly 4 tasks per group (QK, Softmax, PV, Update)
+      instead of 3*n_blocks+1
+    - Online update operates at group granularity with same interface
+    - Golden test covers batch=2, num_heads=2, variable sequence lengths
+
+[33mcommit 6de7fbe82e854f6bd27b8458cede298449827589[m
+Author: Siyu Zhu <zhusy54@foxmail.com>
+Date:   Tue Mar 10 19:20:08 2026 +0800
+
+    Refactor: add local-first dispatch to skip MPMC queue for same-thread ready tasks (#172)
+    
+    Introduce thread-local PTO2LocalReadyBuffer so that Phase 1 (task
+    completion / fanout traversal) stores newly-ready tasks in a stack-
+    allocated buffer instead of pushing to the global MPMC queue. Phase 2
+    consumes from the local buffer first (LIFO for cache locality), falling
+    back to the global queue only when the buffer is empty. Remaining tasks
+    are unconditionally drained back to the global queue after dispatch.
+    
+    Co-authored-by: zhusy54 <zhusiyu1@hisilicon.com>
+
+[33mcommit 533f8cb84d0ad3aed2a331f630568b7510780f95[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Tue Mar 10 17:58:29 2026 +0800
+
+    Refactor: move self-consumed check from on_task_done to on_task_release (#240)
+    
+    The self-consumed check now runs after fan-in processing in
+    on_task_release instead of at the end of on_task_done, ensuring
+    consumed status is evaluated in the release path alongside
+    dependency resolution.
+
+[33mcommit 1c609824b1a0fe68b7088f51077f2b5dc7cd394c[m
+Author: chenshengxin2026 <hw_chenshengxin@163.com>
+Date:   Tue Mar 10 17:26:20 2026 +0800
+
+    Unify: modify alternating_matmul_add to device_tests and tune benchmark params (#231)
+    
+    Move alternating_matmul_add from examples/ to tests/device_tests/
+    tensormap_and_ringbuffer/ to align with other benchmarks. Reduce
+    matmul tile size from 128x128 to 64x64 and add tile size from
+    64x128 to 64x64 so that per-task latency is ~7us. Reconfigure
+    case parameters (batch=500, M=N=4) to target ~2000 total tasks
+    (matmul+add). Add alternating_matmul_add to benchmark_rounds.sh
+    and add a matching Case0 to benchmark_bgemm (500 tasks, 64x64,
+    incore_loop=4) for apple-to-apple comparison.
+    
+    alternating_matmul_add orchestration uses an interleaved submit
+    pattern: matmul and add task groups are submitted alternately in
+    a single loop (matmul_group_0, add_group_0, matmul_group_1,
+    add_group_1, ...). Each group contains matmul_batch or add_batch
+    tiles respectively. Matmul tasks go to CUBE workers, add tasks
+    go to VECTOR workers. All tasks within and across groups are
+    fully independent (no dependencies), so the runtime is free to
+    schedule them in any order — the alternating submit order is
+    designed to let the scheduler interleave CUBE and VECTOR work
+    for better hardware utilization.
+
+[33mcommit d5f3b3bd4a57edb7c2ceab1cab183de749ca0443[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 10 16:35:02 2026 +0800
+
+    Fix: move progress logging out of scheduler hot path (#238)
+    
+    - Remove per-task progress logging from check_running_cores_for_completion
+      template to eliminate atomic load and branch on every task completion
+    - Add loop-level progress logging after batch fetch_add where the
+      completed count is accurate (using fetch_add return value, zero
+      extra atomic ops)
+    - Use integer division comparison to correctly detect interval crossings
+      when multiple tasks complete in a single scan loop
+    - Add last_progress_count context to stall detection log for correlating
+      stalls with the last known progress point
+
+[33mcommit 487288cf840f5fea1d9d73e88f10f841802c8b8a[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 10 16:08:34 2026 +0800
+
+    Fix: remove incorrect profiling fallback and fix parser (#233)
+    
+    - Remove #else fallback in aicpu_executor.cpp that incorrectly output
+      detailed phase breakdown when PTO2_SCHED_PROFILING=0
+    - Add fanout/fanin/pop stats to Level 1 output (complete and dispatch)
+    - Fix parser: add regexes for complete [fanout:][fanin:] and dispatch [pop:]
+    - Fix parser: summary line was overwriting phase data (use update not replace)
+    - Remove legacy parser rules for formats no longer produced by C++ code
+
+[33mcommit a6ae1ccc4cd290edea2ad929c0fe123ab244affa[m[33m ([m[1;31myhr/main[m[33m)[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Tue Mar 10 11:46:45 2026 +0800
+
+    Refactor: separate AIC/AIV core tracking in AICPU scheduler (#232)
+    
+    - Extract CoreTypeTracker struct to track idle/running cores per type
+      independently, replacing flat arrays with aic()/aiv() accessors
+    - Split dispatch loop into separate AIC and AIV paths, eliminating
+      per-core type checks and mixed-queue iteration in the inner loop
+    - Move build_pto2_payload, check_running_cores_for_completion, and
+      dispatch_ready_tasks_to_idle_cores into AicpuExecutor as CoreType-
+      parameterized template methods
+    - Fix reassign_cores_for_all_threads double-matching bug by adding
+      found flag to skip idle search when core is already running
+    - Remove unused scheduler/orchestrator APIs (mark_running, is_done,
+      pto2_orchestrator_wait_all, pto2_orchestrator_has_space)
+    - Normalize int to int32_t throughout for type consistency
+
+[33mcommit d0e3404abafdadd61f4d332f36d9826be1e23dee[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Tue Mar 10 10:37:16 2026 +0800
+
+    Feat: multiple orchestrators (#226)
+    
+    * Update orchestration entry function signature with orch_thread_num/index
+    
+    - Update DeviceOrchestrationFunc typedef to include orch_thread_num and orch_thread_index
+    - Update all orchestration entry functions to accept new parameters
+    - Existing single-orchestrator examples suppress unused parameter warnings
+    
+    * Restructure runtime core: split task descriptor, thread-safe ring buffers, and scheduler optimization
+    
+    - Split PTO2TaskDescriptor into hot path (~80B) and cold PTO2TaskPayload (~2.9KB)
+    - Make HeapRing and TaskRing thread-safe with atomic CAS operations
+    - Move dep_list_pool from shared memory to per-orchestrator private allocation
+    - Split scheduler into hot path (on_task_complete) and cold path (on_task_release)
+    - Inline ready queue push during orchestration, removing finalize phase
+    - Adapt AICPU executor to new task payload and shared memory API
+    - Fix memset on std::atomic types: use value-initialization and store()
+    
+    * Update profiling for multi-orchestrator and scheduler hot/cold split
+    
+    - Add num_orch_threads parameter to phase profiling initialization
+    - Remove finalize_cycle from orchestrator summary (phase removed)
+    - Remove dynamic expected_tasks polling from host performance collector
+      (total tasks known upfront with new architecture)
+    - Update thread count calculation for profiling records
+    
+    * Implement multi-orchestrator AICPU executor and device runner support
+    
+    - Add CoreStateTracker for per-thread core state management
+    - Support orchestrator threads transitioning to scheduler threads
+    - Implement dynamic core reassignment after orchestration completes
+    - Update device runner validation for configurable orch_thread_num
+    - Update orchestration examples with work partitioning by orch_thread_index
+
+[33mcommit 3a9cc27786df9228a73df7b2db90f238ef63325c[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Mon Mar 9 21:37:40 2026 +0800
+
+    Feature: add A5 platform with enhanced hardware capabilities (#185)
+    
+    Introduce A5 platform support with 50% capacity increase over A2A3 and
+    optimized register protocol. Includes production-ready platform implementation,
+    platform-specific compilation configuration, and temporary validation runtime.
+    
+    ## A5 Platform Highlights
+    
+    Hardware capacity (50% increase over A2A3):
+    - Max block dimension: 24 → 36
+    - Max AICPU threads: 4 → 7
+    - Max cores per thread: 72 → 108
+    
+    Register protocol updates:
+    - DATA_MAIN_BASE offset: 0xA0 → 0xD0
+    - COND offset: 0x4C8 → 0x5108
+    - Remove FAST_PATH_ENABLE (simplified protocol)
+    
+    System counter improvement:
+    - Frequency: 50 MHz → 1000 MHz (20x faster)
+    
+    Simulation optimization:
+    - Sparse register mapping (2 x 4KB pages)
+    - Memory savings: 16KB per core
+    - New sparse_reg_ptr() helper for efficient register access
+    
+    ## Directory Structure
+    
+    New A5 code under src/a5/:
+    - platform/: Production-ready A5 platform (onboard + sim)
+    - runtime/host_build_graph/: Temporary validation runtime (copied from A2A3)
+    
+    Platform mapping:
+    - a5 → src/a5/platform/onboard/
+    - a5sim → src/a5/platform/sim/
+    
+    ## Runtime Strategy
+    
+    A5 (temporary validation):
+    - host_build_graph: Copied from A2A3 for platform validation only
+    - Full runtime suite to be implemented in future work
+    
+    ## Documentation
+    
+    - src/a5/runtime/README.md: A5 runtime status and roadmap
+
+[33mcommit 47fb6b685944eeb3145ba1623013454b918fede5[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 21:14:08 2026 +0800
+
+    Add benchmark script and improve code_runner INOUT tensor handling (#227)
+    
+    - Add tools/benchmark_rounds.sh for automated multi-example benchmarking
+      with per-round timing extraction from device logs
+    - Require explicit __outputs__ in golden.py (remove out_ prefix fallback)
+    - Support ARG_INOUT_PTR for tensors that appear in both generate_inputs
+      and __outputs__
+    - Reset output tensors between rounds for multi-round correctness
+
+[33mcommit 87b1716bf9ee7df1d3f594b8b7d9eceb06aee91e[m
+Author: Siyu Zhu <zhusy54@foxmail.com>
+Date:   Mon Mar 9 20:51:20 2026 +0800
+
+    perf(platform): replace phase double-buffer with non-blocking ring buffer (#224)
+    
+    The phase profiling double-buffer caused Orchestrator spin-wait stalls
+    of 9-55ms every ~2047 tasks when Host could not drain buffers fast enough.
+    Replace with a 16-slot ring buffer per thread so AICPU never blocks on
+    buffer switches; if Host is slow, data is discarded instead of stalling.
+    
+    - Add thread_idx and num_sched_threads validation (shared-memory safety)
+    - Use continue for invalid PerfRecord core_index to collect remaining entries
+    - Update drop-record comment in performance_collector_aicpu
+    
+    Co-authored-by: zhusy54 <zhusiyu1@hisilicon.com>
+
+[33mcommit 6d5023fcc06ac0fe2a1135629ea7697bcad0466b[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Mon Mar 9 20:44:41 2026 +0800
+
+    Add orch_thread_num parameter threading through the full stack (#225)
+    
+    * Add orch_thread_num parameter threading through the full stack
+    
+    - Add orch_thread_num to kernel_config RUNTIME_CONFIG for tensormap_and_ringbuffer examples
+    - Thread parameter through code_runner.py → bindings.py → C API → device_runner
+    - Add orch_thread_num field to all Runtime classes for API compatibility
+    - Store in tensormap_and_ringbuffer Runtime (active), stub in other runtimes
+    
+    * Update tests/device_tests/tensormap_and_ringbuffer/batch_paged_attention/kernels/kernel_config.py
+
+[33mcommit c0b3472912892f4aec50e1065e25a6bcf1e552bb[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Mon Mar 9 20:39:43 2026 +0800
+
+    Refactor: parameterize toolchain and runtime compiler for A5 platform support (#223)
+    
+    Separate platform-specific initialization logic to prepare for A5 integration:
+    - Add platform parameter to CCECToolchain for architecture selection (dav-c220 vs dav-c310)
+    - Split RuntimeCompiler init: add dedicated _init_a5() and _init_a5sim() methods
+    - Update compiler paths: A5 uses tools/bisheng_compiler/bin/ instead of bin/
+    - Add early runtime validation in CodeRunner with clearer error messages
+    - Improve error reporting to clarify platform-specific runtime availability
+
+[33mcommit 7a465d309b29080aceb8dc562ea569b5e04a6cd4[m
+Author: Zhangqi Chen <wshchzhq@gmail.com>
+Date:   Mon Mar 9 20:06:34 2026 +0800
+
+    Refactor: move multi-round config to per-example RUNTIME_CONFIG and remove log parsing (#194)
+    
+    Move round count from CLI-only `-n` flag to per-example `RUNTIME_CONFIG['rounds']`
+    in kernel_config.py so CI automatically runs the right number of rounds per example.
+    The `-n` CLI flag remains as an override. Remove inline log parsing from
+    run_example.py (to be a separate tool script later).
+
+[33mcommit fbf7a341bba4163317c41bb0f7e0fac389b8fb97[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 19:09:45 2026 +0800
+
+    Fix: add AICore cache flush at kernel exit for multi-round correctness (#222)
+    
+    - Move cache invalidate from before the spin-wait loop into the loop
+      body only (was redundant) across all three runtime variants
+    - Add dcci flush after the task dispatch loop so dirty handshake state
+      is written back to HBM before AICore exits
+    - Remove planning-style section comments in AICPU deinit
+
+[33mcommit 545830319430dba615ef37ebe8dbaebfe287ee4f[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Mon Mar 9 19:09:06 2026 +0800
+
+    Update: optimize Tensor layout and orchestrator profiling (#221)
+    
+    - Reorder Tensor struct fields: move buffer to first position for
+      cache-friendly access in hot-path lookups (hash, overlap check)
+    - Increase PTO2_SCOPE_TASKS_INIT_CAP from 256 to 65536 to avoid
+      reallocation in large task graphs
+    - Move ORCH_ALLOC profiling marker after task initialization for more
+      accurate measurement
+    - Add scope profiling to paged_attention test orchestration and disable
+      verbose tensor debug logging
+
+[33mcommit 1d5280a1203e4f72b38e2386abdc44c608385cf5[m
+Author: jie <writalnaie@gmail.com>
+Date:   Mon Mar 9 18:34:28 2026 +0800
+
+    Support: save all temporal files in specifed directory (#220)
+    
+    - Runtime files
+    - Kernel files
+    - Orchestration files
+    
+    Co-authored-by: Jie Yin <yinjie27@huawei.com>
+
+[33mcommit 55df5891e746d23c220aa2c2a8004ea50e48959a[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 17:12:44 2026 +0800
+
+    Refactor: unify AICPU spin-wait macros to SPIN_WAIT_HINT (#219)
+    
+    Remove PTO2_SPIN_PAUSE() and PTO2_SPIN_PAUSE_LIGHT() from
+    pto_runtime2_types.h; replace all call sites with SPIN_WAIT_HINT().
+    PTO2_SPIN_PAUSE() violated codestyle rule #5 by calling sched_yield()
+    on hardware.  Use __has_include guard for spin_hint.h so Host .so
+    (which lacks the AICPU include path) compiles with a no-op fallback.
+
+[33mcommit bc570a8eca2bdc4e1faaffa3f0ffc115d4c6b6b6[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 16:58:28 2026 +0800
+
+    CI: cat fail log on failure and fix pto-isa clone race (#218)
+    
+    - Print the full task log inline when a task fails in ci.sh
+    - Add file lock (fcntl) around pto-isa clone in code_runner.py to
+      prevent parallel workers from racing on the git clone, which caused
+      3 of 4 workers to fail with "PTO_ISA_ROOT could not be resolved"
+
+[33mcommit ad382e482cb01a83eae58a24316355d915b26535[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 16:41:31 2026 +0800
+
+    CI: use per-runner env vars for device range and CANN path (#217)
+    
+    Allow multiple self-hosted runners with different device ranges and
+    CANN installations to share the same CI job. Each runner defines
+    DEVICE_RANGE and ASCEND_HOME_PATH in its .env file, replacing the
+    hardcoded values.
+
+[33mcommit b98896f667f41a00a0152547ae9970b7e1a9a08e[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 16:19:56 2026 +0800
+
+    Fix: replace std::this_thread::yield with SPIN_WAIT_HINT in AICPU executor (#216)
+    
+    - Replace 4 std::this_thread::yield() calls with SPIN_WAIT_HINT() macro
+      (no-op on hardware, sched_yield on sim where thread starvation matters)
+    - Update stale TensorPool comment in pto_shared_memory.cpp to reflect
+      current Tensor struct (TensorPool was removed in #213)
+
+[33mcommit 7741a73e21810525022f10aa0438ec0a1e654790[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 15:48:37 2026 +0800
+
+    Fix: broken bash commands in address-pr-comments skill libs (#215)
+    
+    - fetch-comments.md: add originalLine, diffHunk, createdAt fields to
+      GraphQL query so all data needed for comment classification is
+      available without falling back to REST API calls
+    - reply-and-resolve.md: fix stray $ in API path, add actual GraphQL
+      resolveReviewThread mutation code using parameterized query, use
+      single quotes for -f body to avoid bash history expansion issues
+    
+    Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit 0ca30c43365b3b30f5bea0fbbb7f2830e9dba80b[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 15:31:12 2026 +0800
+
+    Fix: add remove_kernel_binary API to fix stale pointer in DeviceRunner cache (#214)
+    
+    * Fix: add remove_kernel_binary API to fix stale pointer in DeviceRunner cache
+    
+    - Add DeviceRunner::remove_kernel_binary() for both onboard (mem_alloc_.free)
+      and sim (dlclose) platforms
+    - Wire remove_kernel_binary_wrapper() through HostApi in all three runtimes
+    - Replace manual device_free(addr - sizeof(uint64_t)) with remove_kernel_binary()
+      in validate_runtime_impl(), eliminating the stale cache entry bug
+    - Simplify upload_kernel_binary() to remove unnecessary size-prefix allocation
+    - Add leak detection in finalize() to warn if kernel binaries were not cleaned up
+    
+    * Little Fix: remove stale pto2_rt_init_tensor_pool call and fix PTO_ISA_ROOT clone race
+    
+    - Remove pto2_rt_init_tensor_pool(rt) from benchmark_bgemm orchestration
+      (TensorPool was removed in PR #213 but this test file was missed)
+    - Handle parallel git clone race in _clone_pto_isa() by checking if another
+      process already completed the clone when git clone fails
+
+[33mcommit 880d254eef3fcef459f8247f08bd60e6ecf260ff[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Mon Mar 9 14:53:55 2026 +0800
+
+    Refactor: remove TensorPool and inline tensor data into Tensor (#213)
+    
+    - Delete TensorPool (ref-counted pool allocator) and merge TensorData
+      fields directly into Tensor, making it a plain value type
+    - Change PTOParam to hold a Tensor* (reference semantics) instead of
+      owning a Tensor copy; runtime copies TensorData into task descriptors
+      and writes allocated OUTPUT addresses back through the pointer
+    - Remove pto2_rt_init_tensor_pool() calls from all orchestration entries
+    - Optimize scheduler dispatch loop: skip cores with in-flight tasks
+      before MMIO read, and early-exit when both queues are empty
+
+[33mcommit 909e89c72778b039879b54c5dac8bbf5596e8b2a[m
+Author: chenshengxin2026 <hw_chenshengxin@163.com>
+Date:   Mon Mar 9 14:45:33 2026 +0800
+
+    Add: fine-grained BGEMM benchmark with configurable incore task granularity (#212)
+
+[33mcommit a104c08a5d82dde5d022a882b409de8c436387c4[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 12:39:48 2026 +0800
+
+    Support: add kernel binary tracking API to Runtime for symmetric init/cleanup (#206)
+    
+    Add registered_kernel_func_ids_[] + registered_kernel_count_ to all 3 Runtime
+    variants. Tracking is done automatically inside set_function_bin_addr() when
+    addr != 0, eliminating the need for separate record calls at each call site.
+    
+    Update validate_runtime_impl to use this tracking to free kernel binaries.
+    
+    The new API is symmetric with init: we record exactly which func_ids were
+    registered, and free only those.
+
+[33mcommit 0ace20a13c8312150a541021635944b2a741d76c[m
+Author: Siyu Zhu <zhusy54@foxmail.com>
+Date:   Mon Mar 9 12:02:03 2026 +0800
+
+    fix(sim): prevent weak AICPU symbols from polluting HOST .so global table (#211)
+    
+    In a2a3sim, HOST .so is loaded with RTLD_GLOBAL via Python ctypes.
+    The weak fallback `get_sys_cnt_aicpu()` (returns 0) in pto_orchestrator.cpp
+    was being exported into the global dynamic symbol table.  When AICPU .so
+    was subsequently loaded with RTLD_NOW|RTLD_GLOBAL, its PLT entries resolved
+    to the HOST .so's weak symbol instead of its own strong definition from
+    device_time.cpp, causing dispatch_time and finish_time in profiling records
+    to always be 0.
+    
+    Add `visibility("hidden")` to both weak fallbacks so HOST .so does not
+    export them globally.  This causes the AICPU .so's internal calls to bypass
+    the PLT entirely and call the strong local definition directly.
+    
+    Also strengthen the dcci() simulation macro from memory_order_acquire to
+    memory_order_seq_cst (dmb ish) to cover the flush/write-back direction:
+    acquire fences do not prevent store-store reordering on aarch64, which
+    could allow the AICPU to observe the FIN signal before perf_buf->count
+    is visible.
+    
+    Co-authored-by: zhusy54 <zhusiyu1@hisilicon.com>
+
+[33mcommit c053c718a5de5337623555ece84b6f9399496438[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 11:48:19 2026 +0800
+
+    Refactor: remove DeviceRunner::clean_cache() and move per-run cleanup into run() (#210)
+    
+    Platform-layer refactoring that moves resource cleanup from finalize() into
+    run() and removes the now-unnecessary clean_cache() method.
+    
+    Changes:
+    - Move print_handshake_results + finalize_runtime_args + regs cleanup from
+      finalize() to end of run() on both onboard and sim
+    - Add regs cleanup on error paths in run() (onboard)
+    - Remove clean_cache() method and calls (kernel tracking moves to Runtime layer)
+    - Remove runner.finalize() from sim finalize_runtime() for symmetry with onboard
+
+[33mcommit dba1f212ac50618d4842b87b5e4b14e5d9b9b249[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 11:29:57 2026 +0800
+
+    Support: add AICPU profiling timestamps for orchestrator and scheduler threads (#209)
+    
+    Add BENCHMARK: timestamp logging for orchestrator/scheduler end times to
+    measure total thread lifetimes, not just orchestration function duration.
+    
+    This enables profiling of the full thread execution including initialization,
+    orchestration/scheduling work, and cleanup phases.
+
+[33mcommit 0c21fe1c100cc89e185a3fab3b7cabfd9122d009[m
+Author: jie <writalnaie@gmail.com>
+Date:   Mon Mar 9 10:25:28 2026 +0800
+
+    Fix: x86 host compile error (#208)
+    
+    - Remove unnecessary runtime for compiling aicore
+    - Remove use x86 cann for header file
+    
+    Co-authored-by: Jie Yin <yinjie27@huawei.com>
+
+[33mcommit 0146071bf38b0e38bcaed254830044a7c41fa0ef[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Mon Mar 9 10:20:53 2026 +0800
+
+    Fix: enforce aarch64-first guard order in cross-platform macros (#207)
+    
+    - Reorder SPIN_WAIT_HINT preprocessor guards in simulation headers so __aarch64__ is checked before __x86_64__ in order to avoid the misdefinition of host platform macros during cross-platform compilation in Bisheng CCEC.
+    - Document the same ordering rule in README and codestyle rules.
+
+[33mcommit ab45f1047635f03569fcc5573c1fe51450524920[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 9 09:18:05 2026 +0800
+
+    Support: add cache_invalidate_range for AICPU inter-round cleanup (#204)
+    
+    Add cache_invalidate_range() as a platform-split function (DC CIVAC +
+    DSB/ISB on onboard ARM64, no-op on sim) for AICPU cache coherency.
+    On AICPU, host DMA writes (rtMemcpy) go directly to HBM without
+    invalidating the data cache; when rtMalloc returns the same address
+    across rounds, stale cached data persists.
+    
+    Call cache_invalidate_range in AicpuExecutor::deinit(Runtime*) to
+    ensure the next round reads fresh data from HBM.
+    
+    AICore self-clears stale EXIT_SIGNAL: after waking from aicpu_ready,
+    AICore writes DATA_MAIN_BASE=0 before entering the main dispatch loop.
+    This prevents reading a leftover exit signal from the previous round.
+
+[33mcommit 0f27bdf1cd58446433a88a0742acb16cb2619192[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 8 22:23:31 2026 +0800
+
+    CI: quarantine device after task failure (#205)
+    
+    When a HW task fails, the device worker exits its loop instead of
+    continuing to pick up new tasks. Remaining work is handled by
+    healthy devices. The failed task is still re-enqueued for retry.
+
+[33mcommit c95f18dd0dfd34989b794f7043a1192811d2fbdf[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 8 20:09:04 2026 +0800
+
+    Support: add pre-loop cache invalidation in AICore handshake (#203)
+    
+    Add dcci before the aicpu_ready spin-wait loop in all three AICore
+    executors. On multi-round execution, the cache may hold stale
+    aicpu_ready=0 from a previous round, causing AICore to miss the AICPU
+    ready signal until the next periodic invalidation. The pre-loop dcci
+    ensures the first read sees fresh data.
+    
+    Use ENTIRE_DATA_CACHE for the initial invalidation (broad flush to
+    catch any stale data), while keeping SINGLE_CACHE_LINE in the
+    tensormap_and_ringbuffer spin-wait loop for performance (Handshake is
+    aligned(64), exactly one cache line).
+
+[33mcommit 9b67468c96b49efe4106995847c4287b97e454ff[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 8 20:00:26 2026 +0800
+
+    Fix: multi-round state initialization and cleanup for AICPU runtime (#201)
+    
+    - Zero-initialize shared memory (task descriptors, dep list pool) in
+      pto2_sm_create_from_buffer to prevent stale data from corrupting
+      TensorPool via deref(old_index) on reused device memory
+    - Zero-initialize scheduler atomic arrays (task_state, fanin_refcount,
+      fanout_refcount) after allocation — new[] leaves std::atomic values
+      indeterminate, but scheduler logic assumes zero baseline
+    - Null out static rt pointer after runtime_destroy to prevent dangling
+      pointer access in diagnose_stuck_state on subsequent rounds
+    - Clear s_pto2_payload_per_core in deinit to prevent stale dispatch
+      payloads from persisting across rounds
+    - Clear TensorPool singleton pointer in orchestrator_destroy to prevent
+      dangling access after the owning PTO2Runtime is freed
+
+[33mcommit aabe479d05034dca327f8e0b584748658efdc7ff[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 8 19:26:32 2026 +0800
+
+    Refactor: remove dead runtime_reset code chain (#202)
+    
+    Remove 9 unused reset functions and their declarations:
+    - pto2_runtime_reset, pto2_orchestrator_reset, pto2_scheduler_reset, pto2_sm_reset
+    - pto2_ready_queue_reset, pto2_heap_ring_reset, pto2_task_ring_reset, pto2_dep_pool_reset
+    - PTO2TensorMap::reset()
+    
+    The entire chain is dead code since we use the destroy+create model.
+
+[33mcommit 8aee6cdc64ce454401c5f3ec773547ec8119c331[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 8 17:56:36 2026 +0800
+
+    Refactor: remove unused PTO2_ORCHESTRATION macro and guard (#200)
+    
+    - Remove PTO2OrchestrationBeginInfo, PTO2OrchestrationGuard, and
+      PTO2_ORCHESTRATION macro from pto_runtime2.h — dead code from the
+      "user-creates-runtime" pattern that was never invoked
+    - Simplify comment in aicpu_executor.cpp that referenced the old pattern
+
+[33mcommit f87fea7dee1a475ac513a33ba3ae9855b4c5a62a[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Mar 7 20:40:27 2026 +0800
+
+    Support: add two-level scheduler profiling with complete/dispatch sub-phase breakdown (#197)
+    
+    - Add PTO2_SCHED_PROFILING counters for on_task_complete sub-phases:
+      fanout_lock, fanout_notify, fanin_release, self_consumed
+    - Track atomic operation counts and wait cycles per sub-phase
+    - Use per-thread counter arrays indexed by thread_idx for isolation
+    - Shared inline methods accept counter-ref parameters to separate
+      orchestrator vs scheduler accounting
+    - Break down complete and dispatch phases into sub-phases:
+      complete: poll (derived), otc_lock, otc_fanout, otc_fanin, otc_self, perf
+      dispatch: poll (derived), pop, setup
+    - All percentages shown in a two-tier tree: level-1 relative to sched_total,
+      level-2 relative to parent phase
+    - Update sched_overhead_analysis.py to parse the new two-level format
+      while maintaining backward compatibility
+
+[33mcommit 398b014efff643e48b5d6e15ed46713b68e0d550[m
+Author: Siyu Zhu <zhusy54@foxmail.com>
+Date:   Sat Mar 7 19:32:56 2026 +0800
+
+    Support: add orchestrator→dispatch dependency arrows and core-to-thread mapping (#190)
+    
+    - Add task_id parameter to perf_aicpu_record_orch_phase() for per-task tracking
+    - Add core-to-thread mapping (perf_aicpu_write_core_assignments) written to
+      shared memory after orchestration, replacing the voting heuristic
+    - Export core_to_thread array and task_id in swimlane JSON
+    - Add orch_finalize→scheduler_dispatch flow arrows in Chrome trace output
+    - Swimlane converter uses explicit mapping with voting fallback for older data
+    
+    Co-authored-by: zhusy54 <zhusiyu1@hisilicon.com>
+
+[33mcommit 3108bc63544c8aba11e54718116363583cb58eb2[m
+Author: jie <writalnaie@gmail.com>
+Date:   Sat Mar 7 18:27:38 2026 +0800
+
+    Print all compiled files when verbose (#198)
+    
+    Co-authored-by: Jie Yin <yinjie27@huawei.com>
+
+[33mcommit cb832f4aef677304414c3f5b6e0e0be5001a14c6[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Fri Mar 6 21:05:46 2026 +0800
+
+    Support: add matmul_batch and add_batch to control task execution granularity (#196)
+    
+    Enable batching multiple tiles per kernel task to tune execution time.
+    Extend config to 5 elements, add kernel loops, and synchronization
+    barriers to prevent data races in multi-tile processing.
+    
+    New features:
+    - Configurable task granularity: control tiles per task via matmul_batch/add_batch
+    - Reduced scheduling overhead: fewer tasks with larger workloads
+    - Parameter validation: divisibility checks and overflow protection
+    - Synchronization barriers: prevent data races in multi-tile loops
+    - Backward compatibility: default batch=1 preserves original behavior
+    - Flexible configurations: support symmetric and asymmetric batching
+
+[33mcommit 97cb468bb70082ea965aeacd756d98f0ad11b498[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Mar 6 19:16:30 2026 +0800
+
+    Support: add hierarchical profiling macros with two-tier scheduler output (#195)
+    
+    - Add PTO2_SCHED_PROFILING and PTO2_TENSORMAP_PROFILING macros
+    - Implement hierarchical validation: PTO2_PROFILING → PTO2_ORCH_PROFILING/PTO2_SCHED_PROFILING → PTO2_TENSORMAP_PROFILING
+    - Two-tier scheduler output: detailed breakdown (PTO2_SCHED_PROFILING=1) vs summary (PTO2_SCHED_PROFILING=0)
+    - Wrap all enable_profiling runtime checks in #if PTO2_PROFILING guards
+    - Separate concerns: macros control compilation/logging, enable_profiling flag controls data collection
+    - Remove enable_profiling check from orchestrator/scheduler logs (macro-controlled only)
+    - Update sched_overhead_analysis.py to support both output formats
+    - Add comprehensive profiling_levels.md documentation
+    - Fix compilation with all profiling macro combinations
+
+[33mcommit 734fe6387e898e8db260c269665c6c2f9ae19dd0[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Fri Mar 6 17:50:08 2026 +0800
+
+    Fix: correct task submission order in alternating_orch (#193)
+    
+    The previous implementation used global linear alternating, which caused
+    tasks from different batches to be mixed together. For example, with
+    batch=2, M=3, N=2, add_2 (from batch 1) would be submitted before
+    matmul_2 (from batch 0) completed its batch group.
+    
+    Changed to batch-grouped submission: for each batch, submit all M matmul
+    tasks first, then all N add tasks. This ensures clear batch boundaries
+    and prevents cross-batch task mixing.
+
+[33mcommit 94bc95055dd31a57a77999e82623b8d48e9ab15e[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Fri Mar 6 17:04:38 2026 +0800
+
+    Add: alternating matmul-add example for tensormap_and_ringbuffer (#192)
+    
+    - Implement dual-core orchestration: AIC for matmul, AIV for add
+    - Support configurable batch size and task counts (M matmuls, N adds)
+    - Golden test covers fixed-seed (case1) and random-seed (case2) scenarios
+    - Demonstrates tensormap_and_ringbuffer runtime with multi-core coordination
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit cdcecbba3a8e7dbf3c3625c1e895431bd3bdfa88[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Mar 6 16:20:49 2026 +0800
+
+    Support: add per-phase atomic operation and wait-time tracking (#191)
+    
+    - Add atomic count globals and struct fields (alloc, params, heap,
+      fanin, finalize, scope_end) to track atomic ops per orchestration phase
+    - Add wait-time tracking for blocking phases (task_ring_alloc,
+      heap_ring_alloc, fanout_lock contention, ready queue push CAS retries)
+    - Instrument pto2_fanout_lock with per-load/CAS counting and wait cycles
+    - Instrument ring buffer alloc functions with try_alloc counting and
+      wait cycles
+    - Instrument ready queue push() with load/CAS counting and contention
+      wait cycles
+    - Instrument release_producer and check_and_handle_consumed for
+      scope_end atomic counting
+    - Display work/wait time split and atomics=N in device log output
+
+[33mcommit e1b2f934890980d815c408998b89d116f46c3e63[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Mar 6 11:33:47 2026 +0800
+
+    Refactor: guard profiling stats and clean up device log output (#183)
+    
+    - Wrap tasks_completed/tasks_consumed atomics in #if PTO2_PROFILING
+      (eliminates cross-thread cache-line bouncing when profiling disabled)
+    - Guard orchestrator stats (tasks_submitted, buffers/bytes_allocated)
+    - Remove dead field total_dispatch_cycles from PTO2SchedulerState
+    - Fix PTO2CompletionStats unused variable error at PTO2_PROFILING=0
+    - Replace all hardcoded "Thread 3:" with "Thread %d:", thread_idx
+    - Add "Thread %d:" prefix to PTO2 progress log for consistency
+    - Demote orchestration entry trace to DEV_INFO (not profiling data)
+    - Wrap timing/count DEV_ALWAYS logs with #if PTO2_PROFILING
+
+[33mcommit 671cec9f7284a940b20fe195576b29ef0d4ca579[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Mar 6 10:17:03 2026 +0800
+
+    Refactor: merge duplicate doc/docs directories in tensormap_and_ringbuffer (#189)
+
+[33mcommit e9f65be4064a8efc6f9ad1a228570867bc7eaa2b[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Mar 6 10:16:27 2026 +0800
+
+    Refactor: consolidate PTO2_PROFILING macro into pto_runtime2_types.h (#188)
+    
+    - Remove redundant definitions from pto_scheduler.h, pto_orchestrator.h, and aicpu_executor.cpp
+    - Define once in pto_runtime2_types.h (already included by all three files)
+    - Eliminates maintenance risk of inconsistent definitions across files
+
+[33mcommit 2e203bcb7b6c24a8ac4d6036fc2d5b2f117620c3[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Mar 5 21:35:23 2026 +0800
+
+    Docs: add runtime logic, orchestration guides, and roadmap (#151)
+    
+    Add comprehensive documentation for all three runtimes:
+    - INCORE_ORCHESTRATION_GUIDE for each runtime (host_build_graph, aicpu_build_graph, tensormap_and_ringbuffer)
+    - RUNTIME_LOGIC explaining execution flow and component interactions
+    - ROADMAP for tensormap_and_ringbuffer advanced scheduling features
+    
+    All documentation placed in src/a2a3/runtime/ to align with PR #182's
+    architecture-specific directory layout.
+
+[33mcommit 71c2af437f4c213d5a532eb0e60b1d2f50de5f5f[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Mar 5 21:33:49 2026 +0800
+
+    Support: add cross-fork PR workflow to GitHub skills (#186)
+    
+    - Add checkout-pr skill to set up remote and local branch for working
+      on someone else's PR
+    - Add checkout-fork-branch shared library for local branch creation
+      and push refspec logic used by all cross-fork workflows
+    - Update github-pr to accept PR number input and handle cross-fork
+      push via detect-permission and checkout-fork-branch
+    - Update address-pr-comments to checkout cross-fork PR branches with
+      correct push target when permission is maintainer
+    - Default detect-permission remote URL to SSH protocol
+
+[33mcommit e83384b098e8ac0caf472fd23693f9b0a2d9d400[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Thu Mar 5 21:14:12 2026 +0800
+
+    Refactor: reorganize A2A3 code for multi-architecture support (#182)
+    
+    * Refactor: reorganize A2A3 code for multi-architecture support
+    
+    Restructure existing A2A3 codebase to prepare for multi-architecture layout.
+    Move all A2A3 platform and runtime code into dedicated architecture directory
+    and update build system to support architecture-aware compilation.
+    
+    Migrate A2A3 code to architecture-specific layout:
+    - Move A2A3 code: src/{platform,runtime}/ → src/a2a3/{platform,runtime}/
+    - Rename backends: a2a3/ → onboard/, a2a3sim/ → sim/ (consistent naming)
+    
+    Update compilation pipeline for architecture-aware builds:
+    - ci.sh: Auto-discover runtimes in src/{arch}/runtime/
+    - runtime_builder.py: Architecture-aware path resolution
+    - kernel_compiler.py: Platform-to-architecture mapping
+    - runtime_compiler.py: Flexible include path construction
+    
+    Platform mapping:
+    - a2a3 → src/a2a3/platform/onboard/
+    - a2a3sim → src/a2a3/platform/sim/
+    
+    Add pytest configuration:
+    - tests/conftest.py: Shared fixtures and test utilities
+    - tests/test_runtime_builder.py: Updated for new directory structure
+    
+    - A2A3 code unchanged (only relocated)
+    - Existing examples work without modification
+    - Build system supports both legacy and new layouts
+    
+    * Fix: suppress unused parameter warning for skip_frames on non-Linux
+    
+    Add void cast to skip_frames parameter in get_stacktrace() to prevent
+    compiler warnings on platforms where __linux__ is not defined and the
+    parameter goes unused.
+    
+    ---------
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 41d5c94aa7eb9107bdea33ebe393529cb1218d2c[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Mar 5 19:53:53 2026 +0800
+
+    Support: test commands read pto-isa commit and timeout from ci.yml (#184)
+    
+    Updates all test command files to extract -c (pto-isa commit) and -t
+    (timeout) flags from .github/workflows/ci.yml before running tests.
+    This ensures local test runs match CI configuration for reproducible
+    builds with pinned PTO-ISA dependency.
+    
+    Affected commands: test-all-sim, test-all-device, test-runtime-sim,
+    test-runtime-device, test-example-sim, test-example-device, and the
+    testing skill documentation.
+
+[33mcommit 70a42f2550db2566bcc58a428d5097215794b6e4[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Mar 5 19:38:17 2026 +0800
+
+    Refactor: extract shared GitHub skill procedures into modular library (#179)
+    
+    - Create `.claude/lib/github/` with 8 reusable procedure files:
+      setup, lookup-pr, detect-permission, commit-and-push,
+      fetch-comments, reply-and-resolve, branch-naming, common-issues
+    - Update github-pr and address-pr-comments skills to reference
+      shared procedures instead of duplicating logic
+    - Standardize variable naming (REPO_OWNER, PUSH_REMOTE, etc.)
+    - Fix squash step control flow: replace exit-0 with decision table
+      and re-verification gate to prevent multi-commit PRs
+
+[33mcommit 87d10e8bfaf95e48d1af4b009a198fb2039d736b[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Thu Mar 5 17:02:39 2026 +0800
+
+    Support: add complete-phase poll hit-rate logging (#181)
+
+[33mcommit df181bc8db5c667933100c69cfd6c8b6b40b81ca[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Mar 4 19:47:40 2026 +0800
+
+    CI: redesign ci.sh with two-pass PTO-ISA fallback and continuous HW queue (#174)
+    
+    - Replace round-based HW execution with continuous shared queue (no sync
+      barriers between rounds, failed tasks re-enqueue with incremented attempt)
+    - Add two-pass PTO-ISA fallback: run all tasks with latest PTO-ISA first,
+      pin and retry only failures if -c is configured
+    - Add SIM parallel pin-on-failure: collect all parallel SIM failures then
+      retry batch with pinned PTO-ISA (previously no retry path existed)
+    - Show real-time task pass/fail status during execution instead of
+      redirecting all output to log files silently
+    - Add platform suffix to log filenames to avoid SIM/HW collisions
+    - Redesign summary table with per-column layout (platform, device,
+      attempt, timing) and terminal-aware color support
+    - Run SIM pinned retries sequentially to avoid PTO-ISA clone races
+    - Enable PTO-ISA fallback for device CI (-c 1b22fea in ci.yml)
+
+[33mcommit 6eabcce67f3932b6b91557e60afb683ad96846a0[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Mar 4 10:01:10 2026 +0800
+
+    Fix: resolve scheduler data race and premature CONSUMED transition (#171)
+    
+    - Add try-lock to serialize concurrent advance_ring_pointers calls,
+      preventing data race on non-atomic last_task_alive and heap_tail
+    - Strengthen fanout_count.fetch_add ordering from relaxed to release,
+      ensuring scheduler sees up-to-date fanout_count before comparing
+      with fanout_refcount
+
+[33mcommit 7a16d1ccb05c5b260889c8c994e7376f6894042b[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 3 21:25:47 2026 +0800
+
+    Support: upgrade profiling pipeline with TensorMap instrumentation (#167)
+    
+    - Restore perf_aicpu_record_phase calls for all scheduler phases
+    - Replace old yield/orch_drain counters with notify/pop/idle metrics
+    - Upgrade DEV_ALWAYS output with per-phase breakdown and detailed stats
+    - Track both fanout and fanin edges in on_task_complete profiling stats
+    - Add Thread 3 prefix to orchestrator/TensorMap log output
+    - Add TensorMap lookup/insert profiling counters (PTO2_TENSORMAP_PROFILING)
+    - Rename PTO2_ORCH_PROFILING to PTO2_PROFILING
+    - Gate all profiling DEV_ALWAYS output behind runtime->enable_profiling
+    - Guard all per-phase perf recording with #if PTO2_PROFILING
+    - Unify release_fanin_and_check_ready into single method returning bool
+    - Add div-by-zero guards and task count validation
+    - Rewrite sched_overhead_analysis.py parser for new output format
+    - Update device_log_profiling.md examples
+
+[33mcommit 9442470172b305c492d4676248556d5fe117f18b[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Tue Mar 3 19:54:10 2026 +0800
+
+    Refactor: convert scheduler and ring buffer to C++ class methods (#169)
+    
+    - Migrate PTO2SchedulerState and PTO2ReadyQueue from C-style free
+      functions to C++ struct methods for cleaner call sites
+    - Inline read_reg/write_reg into platform_regs.h header, removing
+      the .cpp definitions to reduce call overhead on AICPU
+    - Add SCHED_FIFO thread priority for orchestrator thread to reduce
+      preemption latency on shared AICPU cores
+    - Remove AICPU parallel-mode fields from PTO2OrchestratorState
+      (fanin refcount, task_completed, completed_by_task, window_mask)
+    - Remove paged_attention_taskring device test (superseded)
+    - Add PTO2_SPIN_PAUSE_LIGHT hint in executor dispatch loop
+
+[33mcommit 261d7b041071937e03471de466c685eb3fecac6a[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Tue Mar 3 18:44:19 2026 +0800
+
+    Refactor: unify runtime atomics in tensormap_and_ringbuffer (#170)
+    
+    - Convert PTO2SharedMemoryHeader flow-control and graph-output fields to std::atomic and migrate orchestrator/scheduler/executor/ring-buffer accesses to explicit atomic operations.
+    - Convert PTO2TaskDescriptor fanout_lock/fanout_head/fanout_count to std::atomic and update fanout lock/list update paths.
+    - Remove PTO2 atomic helper macros and replace remaining call sites with direct std::atomic load/store/CAS usage.
+    - Remove redundant volatile locals from AICore task polling loop.
+    - Keep Handshake volatile fields as the only AICore boundary synchronization surface.
+    
+    This unifies the in-runtime concurrency model on std::atomic while keeping the
+    AICore handshake boundary semantics explicit.
+
+[33mcommit 9d255b42f5830648655c4c6eb75246928ba7a937[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Tue Mar 3 18:33:20 2026 +0800
+
+    Fix: harden AICPU init with physical_core_id validation and emergency shutdown (#166)
+    
+    - Validate physical_core_id against platform max before register array
+      access in both runtimes, preventing out-of-bounds memory access
+    - Consolidate cores_total_num_ into single range check (0 or overflow)
+      instead of two separate guards
+    - Zero-initialize core_id_to_reg_addr_ before handshake so emergency
+      shutdown can safely iterate partially-initialized state
+    - Add emergency_shutdown() to both runtimes: sends exit signal to all
+      already-launched cores when init fails mid-handshake
+    - Add platform_get_physical_cores_count() to supply the validation bound
+    - Extract platform_init/deinit_aicore_regs to avoid duplicated write_reg
+      pairs (incidental cleanup)
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 268c337dbb266eb61c8c47a39ebe874ddc615b33[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 3 14:37:22 2026 +0800
+
+    Refactor: migrate executor to scheduler API with CAS-based ring advancement (#160)
+    
+    Migrate the AICPU executor from local state arrays (sharded ready queues,
+    fanin refcounts, task completion tracking) to the centralized scheduler API
+    (pto2_scheduler_on_task_complete, pto2_scheduler_get_ready_task, init_task).
+    
+    Ring advancement uses CAS-based lock-free writes to header->last_task_alive
+    with ticket-based heap_tail serialization, matching the pre-migration
+    executor's concurrency model and avoiding the scope_end dependency that
+    would deadlock with small task windows.
+    
+    - Replace per-thread state arrays with PTO2SchedulerState member calls
+    - Thread 3 (orchestrator) creates PTO2Runtime; threads 0-2 wait on init flag
+    - Tasks transition directly to CONSUMED in on_task_complete after fanout
+      notifications, enabling immediate slot reuse without scope_end
+    - Fix prod_state == COMPLETED to >= COMPLETED in orchestrator early-return
+    - Simplify orchestrator by removing non-scheduler codepath for AICPU mode
+
+[33mcommit a82a4eb662a6e27ad35b85fcd2d011f145fbd250[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 3 14:35:09 2026 +0800
+
+    Refactor: reorganize github-pr skill into routed paths (#165)
+    
+    - Replace the linear 7-step workflow with Setup → Route → Path A/B structure
+    - Move gh auth to early gate, compute role variables once in Setup
+    - Extract shared "Ensure Single Valid Commit" procedure for both paths
+    - Add branch naming algorithm with commit type → prefix mapping
+    - Expand A1 branch preparation to handle 5 scenarios: default branch,
+      feature branch with related commits, unrelated commits, 0 ahead with
+      matching name, and 0 ahead with unrelated name
+    - Give each path its own focused checklist
+
+[33mcommit e92a1140a870a456ae9639b35a88af94ebcaf16b[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 3 11:18:57 2026 +0800
+
+    Support: move PTO-ISA fallback retry into ci.sh and add timeout (#164)
+    
+    - Add pin_pto_isa_on_failure() in ci.sh: pins PTO-ISA to fallback
+      commit on first test failure, then retries automatically
+    - Replace two-step GitHub Actions retry (continue-on-error +
+      conditional step) with single ./ci.sh -p a2a3sim -c 1b22fea call
+    - Add -t/--timeout flag with 10min default watchdog that aborts CI
+      via SIGTERM if execution exceeds the limit
+    - Fix parallel mode to use proper bash array expansion for commit_flag
+
+[33mcommit 13a92689ef6583591438d407f988a60a2f6e6ce3[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Tue Mar 3 10:20:30 2026 +0800
+
+    Update: update rules for other agents like codex (#163)
+
+[33mcommit 04c11d496d96e5a7440a6f0fa72049fcc59d9ba7[m[33m ([m[1;32mmain[m[33m)[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Mar 3 10:00:13 2026 +0800
+
+    Support: add PTO-ISA commit pinning via --pto-isa-commit flag (#162)
+    
+    - Add --pto-isa-commit to run_example.py (-c short form) and ci.sh
+    - Without flag, always fetch and reset to latest origin/HEAD
+    - With flag, checkout the specified commit
+    - CI workflow retries sim with --pto-isa-commit 1b22fea on failure
+      (upstream bc92b59 broke CPU_SIM include ordering)
+    - Use bash array for safe argument passing in ci.sh
+    - Log errors instead of silently swallowing in git helpers
+
+[33mcommit dcb7a123f084c749d1b979debe3981db46b34421[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 2 20:48:00 2026 +0800
+
+    Refactor: inline ring buffer hot paths and expand scheduler API (#158)
+    
+    - Move pto2_heap_ring_alloc and pto2_task_ring_alloc from .cpp to .h
+      as inline member methods for better codegen on hot allocation paths
+    - Add spinlock-based ready queue, release_fanin_and_check_ready, and
+      init_task as PTO2SchedulerState member methods
+    - Convert pto2_task_slot to scheduler member method
+    - Update orchestrator call sites for new member APIs
+
+[33mcommit b657cd81ab3641dad2bc451b6264b0d04676425c[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 2 20:39:31 2026 +0800
+
+    Support: improve address-pr-comments and github-pr skills (#157)
+    
+    - Add early exit in address-pr-comments when no unresolved comments exist
+    - Add commit message validation step in github-pr before push
+
+[33mcommit 1130f715af557d2c1d47d2b69bb2c5f780078ca4[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 2 20:18:24 2026 +0800
+
+    Refactor: convert TensorMap to C++ member API and inline hot paths (#156)
+    
+    Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit a8560f2b04fb89f659d858ae8a2d063a4a1c08d4[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 2 14:55:29 2026 +0800
+
+    Add: batch_paged_attention device test for production-scale bfloat16 (#154)
+    
+    Port batch_paged_attention from examples to device tests with:
+    - bfloat16 data type (replacing float16 from example)
+    - Production tile sizes (128x128/64x128) with runtime dispatch
+    - Production scale: batch=64, head_dim=128, context_len=8193
+    - Variable sequence length test case (CaseVarSeq)
+    - Tighter tolerance (RTOL/ATOL=1e-3 vs 1e-2 in example)
+    - Chunked batch orchestration with IN_CORE_BATCH=16
+
+[33mcommit 7df48e934fc86b01145093897940154c84392730[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Mar 2 09:56:04 2026 +0800
+
+    Feature: AICPU phase profiling with per-task orchestrator recording and dependency arrows (#150)
+    
+    - Add scheduler phase profiling: record COMPLETE/DISPATCH/SCAN/EARLY_READY
+      phases per loop iteration with per-thread buffers in shared memory
+    - Add per-task orchestrator phase recording (sync/alloc/params/lookup/heap/
+      insert/fanin/finalize/scope_end) using AicpuPhaseRecord with dedicated
+      buffer slot, exported as aicpu_orchestrator_phases JSON array
+    - Write cumulative AicpuOrchSummary to shared memory for backward compat
+    - Host-side collection reads both scheduler and orchestrator phase records,
+      exports version 2 JSON with scheduler phases, orchestrator summary, and
+      per-task orchestrator phases
+    - Swimlane converter renders scheduler phases as color-coded bars on pid=3,
+      per-task orchestrator phases on pid=4 with per-phase colors
+    - Add AICPU View (pid=2) fanout dependency arrows mirroring AICore View
+    - Add Scheduler DISPATCH to AICore/AICPU task execution flow arrows
+    - Set process sort order: Orchestrator, Scheduler, AICPU View, AICore View
+
+[33mcommit 0890c3bf0abfce1c977976e88bb308f5a634f3ad[m[33m ([m[1;31morigin/stable[m[33m)[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 1 20:19:29 2026 +0800
+
+    Refactor: per-core perf storage and deterministic device log resolution (#149)
+    
+    Per-core storage:
+    - Remove core_id from PerfRecord, store records in per-core vectors
+      indexed by core_id directly (host performance_collector)
+    - Simplify AICore executor: write records without embedding core_id
+    - Update swimlane_converter to read core_id from task-level data
+    
+    Device log resolution:
+    - Snapshot device log dir before run, diff after to find the exact new
+      log file created by this run (handles CANN async dlog writes)
+    - Pass precise --device-log path to converter instead of guessing by
+      timestamp or device-id
+    - Falls back to device-id selection for manual converter invocations
+    
+    Hardening (PR review feedback):
+    - Validate num_aicore bounds in initialize() (reject <= 0 or > MAX)
+    - Remove redundant num_aicore param from poll_and_collect(), use stored
+      member variable set during initialize()
+    - Clamp fanout_count to RUNTIME_MAX_FANOUT before iterating in JSON
+      export (guards against corrupt device data)
+    - Reserve tagged_records vector capacity before flattening per-core data
+
+[33mcommit 2fde2a2526b726d59b71e101bd11ced3274e572c[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 1 17:09:36 2026 +0800
+
+    Add: paged_attention_taskring CI case for small ring buffer coverage (#148)
+    
+    Reuse existing paged_attention kernels/orchestration with small ring
+    buffer sizes (task_window=16, heap=1MB, dep_pool=256) to exercise
+    CAS-based watermark advancement, heap wrapping, and dependency pool
+    wrapping under stress.
+
+[33mcommit 260faa67e1d7f60ca51233cb6729e58eacd8452f[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 1 16:04:08 2026 +0800
+
+    Support: add github-pr skill for pull request workflow (#147)
+    
+    - Add structured PR workflow: role detection, branch preparation,
+      rebase, push, and PR creation for both repo owners and fork
+      contributors
+    - Dynamically detect default branch instead of hardcoding main
+    - Branch creation only triggered when on default branch
+    - Existing PR detection compares local vs remote before deciding
+      whether to push updates or exit
+
+[33mcommit c1a57e06f2394f667b6d4829b4ff6f2c8ac8901e[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sun Mar 1 14:57:45 2026 +0800
+
+    Support: restructure to .claude/skills and rules, add workflow skills (#146)
+    
+    - Migrate .ai-instructions/ into .claude/ following skills/rules pattern
+      - coding conventions → .claude/rules/ (architecture, codestyle, ascend-device)
+      - git-commit and testing workflows → .claude/skills/ (with frontmatter)
+    - Add pre-commit testing strategy (4-step decision flow):
+      npu-smi detection, git-diff scope analysis, nproc parallel, idle device cap
+    - Add fix-issue skill: fetch issue → create branch → plan → implement → test
+    - Add address-pr-comments skill: triage PR comments → classify → address
+    - Rename test-sim/test-device commands to test-example-* for clarity
+    - Add test-runtime-sim and test-runtime-device commands
+    - Update test-all-device/test-all-sim with auto-detection logic
+
+[33mcommit 00a4ea491f37a949014791939e564fac7497e6b8[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 28 23:13:35 2026 +0800
+
+    Feature: CAS-based watermark advancement, slot-reuse validation, and simulation thread starvation fix (#143)
+    
+    Add lock-free heap_tail/last_task_alive advancement in AICPU parallel mode
+    with ticket-based generation counter (heap_tail_gen) to serialize concurrent
+    heap_tail writes. Add completed_by_task array for slot-reuse validation in
+    the orchestrator's early-return path, preventing stale state from recycled
+    slots.
+    
+    Fix simulation thread starvation on resource-constrained CI runners (e.g.,
+    2 CPU cores running 13+ threads) by introducing a platform-level
+    SPIN_WAIT_HINT() macro for both AICore and AICPU idle polling loops. On
+    simulation (a2a3sim), expands to CPU pause/yield hint + sched_yield() to
+    let the OS scheduler give time slices to threads doing real work; on
+    hardware (a2a3), expands to no-op. Without this, idle threads in tight
+    spin loops starve the executing core, causing AICPU iteration-based
+    timeouts (MAX_IDLE_ITERATIONS) before kernels can complete.
+    
+    Also fix race where scheduler threads could access orch_ready_queue pointers
+    before Thread 3 finished initializing them (orch_pointers_ready_ guard).
+
+[33mcommit e30fbaff4ac1e53871b619a36fbf007bab164fd0[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 28 23:08:05 2026 +0800
+
+    Fix: count implicitly completed running tasks in pipelined dispatch (#145)
+    
+    The host_build_graph AICPU executor uses a running/pending two-stage
+    pipeline: while a running task executes on AICore, the next task can be
+    dispatched as pending. When AICore finishes faster than AICPU polls the
+    COND register, the running task's FIN is overwritten by the pending
+    task's ACK or FIN, causing AICPU to never observe the running task's
+    completion.
+    
+    The code already resolved the running task's downstream dependencies in
+    this case, but forgot to increment completed_tasks_ and
+    cur_thread_completed. This caused the scheduler to stall at N-M/N
+    (e.g., 125/128) waiting for tasks that were actually done.
+    
+    Fix both Case 1 (pending FIN) and Case 2 (pending ACK) to count the
+    implicitly completed running task.
+
+[33mcommit 89cbeab7371db8a64498721ea5b0fa2f5dd19bdf[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Sat Feb 28 20:54:08 2026 +0800
+
+    Fix: add PIPE_V/PIPE_S sync to batch_paged_attention softmax_prepare (#142)
+    
+    Issue: TFILLPAD_INPLACE (PIPE_V vcopy) and SetValue loop (PIPE_S scalar writes) access the same UB memory without synchronization, causing sporadic test failures on a2a3 hardware.
+    
+    Solution:
+    - Add set_flag/wait_flag before SetValue to ensure PIPE_V completes
+    - Add dsb(DSB_UB) after SetValue for subsequent visibility
+    
+    Related to PR #140 (paged_attention fix with same root cause).
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit f42d7fb3eb829592c8631348ab2567d148c2215f[m
+Author: chenshengxin2026 <hw_chenshengxin@163.com>
+Date:   Sat Feb 28 19:26:44 2026 +0800
+
+    Fix: resolve sporadic paged attention FAIL due to cross-pipeline race and precision mismatch (#140)
+
+[33mcommit 7bc040df4668df4e723d23c8239e343c61637b67[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 28 19:24:38 2026 +0800
+
+    Support: configurable ring buffer sizes via environment variables (#141)
+    
+    Fix buffer overflow: allocate SM and heap using effective sizes
+    (env override or compile-time default) instead of always using
+    compile-time constants. Add errno/ERANGE check to strtoull parsing.
+    Fix DEV_INFO format specifiers for uint64_t values.
+
+[33mcommit 49227eb916382c5e9786c4a7c0ccacc1468aa9ff[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 28 16:43:28 2026 +0800
+
+    Refactor: make ready queue shard count runtime-configurable (#137)
+    
+    Replace compile-time PTO2_READY_QUEUE_SHARDS with runtime-configurable
+    active_shards_ in AicpuExecutor, controlled by PTO2_READY_QUEUE_SHARDS
+    env var (range 1..PLATFORM_MAX_AICPU_THREADS, default MAX-1).
+    
+    Host parses and validates the env var in runtime_maker.cpp, stores it in
+    Runtime::ready_queue_shards, and AICPU reads it during init. Arrays are
+    sized to MAX_AICPU_THREADS to accommodate any valid shard count.
+    
+    Also remove redundant "Error:"/"Warning:" prefixes from LOG_ERROR/LOG_WARN
+    calls and fix printf format specifiers.
+
+[33mcommit b7c00da21a2c2c8b9465607b9edb394809d19018[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Sat Feb 28 16:34:37 2026 +0800
+
+    Update: Migrate tensormap/ringbuffer logs to unified_log (#138)
+    
+    - Replace print-style logs (printf/fprintf/std::cout/std::cerr) with LOG_* macros in runtime and host files.
+    - Add common/unified_log.h includes where needed for the migrated call sites.
+    - Keep existing device_log.h-based logging unchanged.
+    - Exclude orchestration/common.cpp as requested due to cross-target linkage concerns.
+
+[33mcommit 03047de15a47e05afb5afbbd10174d66dee17d3b[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Sat Feb 28 15:44:00 2026 +0800
+
+    Refactor: consolidate AICPU register read/write into platform_regs (#135)
+    
+    Merge read_reg/write_reg from separate a2a3/a2a3sim aicpu_regs.cpp
+    files into a unified platform_regs.cpp implementation to eliminate
+    code duplication and simplify maintenance.
+    
+    Changes:
+    - Remove platform-specific aicpu_regs.{h,cpp} files
+    - Move read_reg/write_reg functions to platform_regs.cpp
+    - Enhance platform_regs.h to provide complete register management API
+    - Update runtime includes to use consolidated interface
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit f690b102583b02607eca3b88b0530b5a7c0c2f7a[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 28 15:21:21 2026 +0800
+
+    Feature: variable sequence length and chunked batching for batch PA (#136)
+    
+    - PA_SEQ_LEN env var for per-batch variable sequence lengths
+      (e.g. PA_SEQ_LEN=33,64,17,128 for different lengths per batch)
+    - IN_CORE_BATCH=16 chunking splits large batches into parallel chunks
+    - All kernels accept batch_start offset for chunked processing
+    - Softmax: handle valid_len=0 blocks (mij=-1e30, lij=0, pij=0)
+      to avoid NaN from exp(-inf - (-inf))
+
+[33mcommit 9ee3d35fd9b947aac6a07fcbaa790bdacac331b3[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 28 14:46:19 2026 +0800
+
+    Feature: add batch paged attention example (#134)
+    
+    Add batch_paged_attention under tensormap_and_ringbuffer examples.
+    The orchestrator submits a fixed number of tasks (1 + max_bn * 4)
+    regardless of batch size; each kernel processes all batches internally
+    via pointer arithmetic, avoiding per-batch task submission overhead.
+    
+    Key details:
+    - Online softmax with GQA support (kv_head_num=1)
+    - 16x16 tile dimensions, head_dim=16, block_size=16
+    - Non-transposed K storage: (total_blocks, block_size, kv_head_num, head_dim)
+    - Fix softmax valid_len init and manual -inf padding for small block sizes
+    - Golden covers 3 cases with varying context lengths (33, 31, 128)
+
+[33mcommit 95b6e5e41fa761f664921a670cb59cb4d5a14c6f[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Sat Feb 28 12:50:56 2026 +0800
+
+    Support: integrate auto device-log resolution for profiling (#133)
+    
+    - Add shared device_log_resolver for --device-log, --device-id, and auto-scan selection.
+    - Wire run_example.py to pass device id into swimlane_converter.py during profiling flow.
+    - Invoke scheduler overhead deep-dive from swimlane_converter when a device log is resolved.
+    - Improve diagnostics for missing dispatch_time_us/finish_time_us with fix steps.
+    - Update docs/examples and remove PTO_DEVICE_ID references from comments/docs.
+
+[33mcommit a353d43ec62fa0ba2962af2697e1571076937785[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 28 11:22:08 2026 +0800
+
+    Refactor: replace PARAMS_LIST with ALL_CASES/DEFAULT_CASE and add --all/--case CLI flags (#132)
+    
+    Replace the fragile PA_CASE env var hack in golden.py with a clean
+    ALL_CASES + DEFAULT_CASE interface. Add --all and --case flags to
+    run_example.py so users can run all test cases or select a specific
+    one from the command line.
+
+[33mcommit d66bc41993781331d3d93ef635c6c13c6c2e51d8[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Fri Feb 27 17:20:38 2026 +0800
+
+    Refactor: implement ACK/FIN dual-state handshake protocol for task scheduling (#109)
+    
+    Platform changes:
+    - Add ACK/FIN protocol macros and constants to platform_config.h
+      (TASK_ID_MASK, MAKE_ACK_VALUE, MAKE_FIN_VALUE, etc.)
+    - Simplify COND register write in aicore inner_kernel.h
+    
+    Runtime changes:
+    - Implement two-slot task tracking (pending + running) in AICPU executor
+    - Add thread-local ready queues to reduce lock contention
+    - Refactor initial task distribution with round-robin assignment
+    - Update AICore executor to use ACK/FIN protocol macros
+    
+    This enables pipelined task execution where AICore can acknowledge task
+    receipt while executing previous task, improving scheduling efficiency.
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 59ece4c4a4dcb2fc8797af9ce4f79186472e80d0[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Fri Feb 27 16:41:23 2026 +0800
+
+    Fix: update perf tools for new scheduler log format (#130) (#131)
+    
+    - sched_overhead_analysis.py: parse new multi-line phase/lock format,
+      add fanout stats, work stealing, dispatch hit/miss breakdown
+    - swimlane_converter.py: fix device log regex for new summary line
+
+[33mcommit c26cf5c7fc40767ed2f836b800331c9ca746084d[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 27 16:05:48 2026 +0800
+
+    Support: add per-phase lock profiling and device log profiling guide (#130)
+    
+    Add per-phase ready_q lock wait/hold counters to the scheduler summary
+    (scan, early_ready, complete, dispatch hit/miss) and document the full
+    device log output format in a dedicated profiling guide.
+
+[33mcommit 85f2f53c7f48b43a92390580ce2c64934b106dc7[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Fri Feb 27 15:09:31 2026 +0800
+
+    Refactor: introduce TensorPool and make Tensor a lightweight handle (#129)
+    
+    Replace the monolithic Tensor struct with a two-layer design:
+    - TensorData: holds buffer address, shapes, offsets, dtype, ref_count
+    - TensorPool: arena allocator managing TensorData instances as a singleton
+    - Tensor: lightweight handle (int32_t index into TensorPool)
+    
+    Key changes:
+    - Replace strides/repeats with raw_shapes/shapes/offsets representation,
+      simplifying view creation and overlap detection
+    - Add pto2_rt_init_tensor_pool(rt) for orchestration .so to initialize
+      TensorPool singleton in its own address space
+    - Migrate all tensormap_and_ringbuffer example orchestration files and
+      AICore kernels to the new multi-dim API
+    - Update kernel tensor access from Tensor* to TensorData* with
+      start_offset for proper view support
+
+[33mcommit 7f28dcd2f893b2dbb49c1a7477f6450e0eaf13e7[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 27 10:52:03 2026 +0800
+
+    Update: enhance stall diagnostics and progress logging (#127)
+    
+    - Lower MAX_IDLE_ITERATIONS from 50M to 800K (~20s) to fail fast on hang
+    - Add STALL_LOG_INTERVAL (50k iters) with per-slot diagnostic scan:
+      classifies stuck tasks as STUCK-READY, STUCK-WAIT, or IN-FLIGHT
+    - Thread 0 logs PTO2 progress after each task completion
+    - Promote total submitted tasks log from DEV_INFO to DEV_ALWAYS
+    - Print per-core dispatch state during stall diagnosis
+    - Remove dead WARN_INTERVAL (unreachable since MAX_IDLE_ITERATIONS < WARN_INTERVAL)
+    - Relax memory ordering to relaxed for diagnostic-only atomic reads
+
+[33mcommit eb07a4072a44cb74be8cff4d631277c2f21e3ac8[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 27 09:52:54 2026 +0800
+
+    Refactor: shard ready queues with per-thread push and work stealing (#125)
+    
+    Split AIC and AIV ready queues into 3 shards (PTO2_READY_QUEUE_SHARDS=3).
+    Each scheduler thread pushes to its own shard (thread_idx % 3), and pops
+    by checking its own shard first then stealing from others in round-robin
+    order. This eliminates most lock contention between the 3 scheduler
+    threads under normal load.
+
+[33mcommit dd6fda64cd67473966b85d241f9fc52355408afd[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Feb 26 21:43:28 2026 +0800
+
+    Refactor: reorder scheduling loop for lower dispatch latency (#123)
+    
+    Move Complete and Dispatch phases before Scan and Orch Drain in the
+    scheduler loop. This records finish_ts at the top of each iteration,
+    reducing tail overhead (time from AICore completion to AICPU recording),
+    and dispatches new tasks to idle cores sooner.
+    
+    New order: Complete → Dispatch → Scan → Orch Drain
+    Old order: Scan → Orch Drain → Complete → Dispatch
+
+[33mcommit 703b13ed126a344d807c9583b5283ebc6c0ad9e4[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Feb 26 21:43:13 2026 +0800
+
+    Add: scheduler overhead analysis tool and profiling enhancements (#124)
+    
+    - Add tools/sched_overhead_analysis.py: analyzes tail OH from perf data
+      and AICPU scheduler loop breakdown from device logs, with CLI args
+      (--perf-json, --device-log) and auto-selection of latest files
+    - Enhance tools/swimlane_converter.py: add --device-log flag, rename
+      metrics for clarity (Sched -> Latency, Scheduler loop overhead ->
+      Sched CPU), add per-task execution vs scheduler overhead summary
+
+[33mcommit dd9f9c0c98969a5ee701645bd10741718c52dd45[m
+Author: MagicDoge <36667074+luohuan19@users.noreply.github.com>
+Date:   Thu Feb 26 20:26:13 2026 +0800
+
+    Fix: add clean_cache() to clear test-specific resources between tests (#105)
+    
+    Previously, cached kernel addresses persisted across tests, causing stale
+    data issues when running multiple tests sequentially.
+    
+    This adds a lightweight clean_cache() method to DeviceRunner that:
+    - On hardware: frees kernel memory and clears address cache
+    - On simulator: closes dlopen'd kernel libraries and clears address cache
+    
+    The method is called in finalize_runtime() to ensure each test starts
+    with a clean cache while preserving device resources for reuse.
+
+[33mcommit eede5613f28f9fa2c1ac0b29b27fa6eacb2ef2db[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Feb 26 20:20:18 2026 +0800
+
+    Fix: use SEQ_CST ordering to prevent IRIW hazard on ARM (#122)
+    
+    Upgrade four atomic operations from ACQ_REL/ACQUIRE/RELEASE to SEQ_CST
+    to close an IRIW (Independent Reads of Independent Writes) race between
+    the scheduler and orchestrator threads on ARM:
+    
+      Scheduler:    fetch_add(refcount)  → load(fanin_count)
+      Orchestrator: store(fanin_count)   → load(refcount)
+    
+    With ACQ_REL, ARM allows both threads to simultaneously see stale values,
+    leaving a consumer task stuck forever. SEQ_CST guarantees a single total
+    order so at least one thread observes the other's write.
+
+[33mcommit 5a357b66a90844c1c371f92186557070f5766955[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Feb 26 20:12:00 2026 +0800
+
+    Refactor: consolidate fanout lock into shared header (#121)
+    
+    Move pto2_fanout_lock/unlock from static inline in pto_orchestrator.cpp
+    to shared header pto_runtime2_types.h so both orchestrator and scheduler
+    use identical acquire/release semantics.
+    
+    Reorder completion: store state=2 (RELEASE) before lock acquire to close
+    a TOCTOU race where the orchestrator could insert a consumer between our
+    state check and fanout_head read. Add detailed comment explaining the
+    mutual exclusion guarantee.
+
+[33mcommit da60e72d16b188fe363408f08059fbd9716dc850[m
+Author: majin0824 <116326396+doraemonmj@users.noreply.github.com>
+Date:   Thu Feb 26 19:31:20 2026 +0800
+
+    Fix: guard unregister call with was_registered_ flag in PerformanceCollector (#118)
+    
+    Previously, finalize() used pointer inequality (perf_shared_mem_host_ !=
+    perf_shared_mem_dev_) to decide whether to call unregister_cb. This was
+    fragile: in simulation mode the two pointers are equal (correct skip), but
+    it could not distinguish a failed/skipped registration in hardware mode.
+    
+    Changes:
+    - Add was_registered_ bool field (default false) to PerformanceCollector
+    - Set was_registered_ = true only after register_cb succeeds in initialize()
+    - Replace the pointer-inequality guard with was_registered_ in finalize()
+    - Add null-check for host_ptr after register_cb returns 0 (succeeds but
+      returns nullptr is treated as an error)
+    - Propagate the return code from unregister_cb and log on failure instead
+      of silently ignoring it
+    - Reset was_registered_ = false in finalize() after cleanup
+    
+    This ensures unregister_cb is called if and only if registration actually
+    succeeded, fixing spurious free/unregister errors (507899) when profiling
+    is enabled on hardware.
+    
+    Co-authored-by: majin0824 <majin15@huawei.com>
+
+[33mcommit d56114953fcfe412822a3f2c1446c6fc2161d4e7[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Feb 26 19:23:03 2026 +0800
+
+    Refactor: clarify no-copy semantics in tensor and param docstrings (#120)
+    
+    Clarify that make_tensor only records dtype/shape/size without allocating
+    memory, and pto2_submit_task copies only tensor descriptors (metadata),
+    never buffer content. Add OUTPUT param assert in orchestrator.
+
+[33mcommit eb347e5ced475cd60d4286b12b659f3641efd7eb[m
+Author: chenshengxin2026 <hw_chenshengxin@163.com>
+Date:   Thu Feb 26 19:09:00 2026 +0800
+
+    Fix: replace dcci no-op with acquire fence in a2a3sim (#119)
+
+[33mcommit cda844814d6d40fca2a384cc6e03daf8e7f4584e[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Thu Feb 26 16:12:03 2026 +0800
+
+    Fix: compute heap_tail as offset from heap base instead of absolute pointer cast (#114)
+    
+    The scheduler's heap_tail must be an offset into the heap ring buffer, but
+    it was being set by casting an absolute pointer to an integer. This produces
+    a garbage value that breaks heap reclamation when the ring wraps around.
+    
+    Store heap_base in PTO2SchedulerState and compute the offset correctly as
+    (packed_buffer_end - heap_base).
+
+[33mcommit de75b1d52d672853861cf3cc0aebf76212eda5a1[m
+Author: yanghaoran29 <yanghaoran29@huawei.com>
+Date:   Thu Feb 26 15:30:51 2026 +0800
+
+    Refactor: widen TensorMap heap_size and related fields to uint64_t (#92)
+    
+    On 64-bit devices, TensorMap's heap_size was int32_t, capping the
+    addressable on-device heap at 2 GB. Widen it—and all coupled size,
+    capacity, and offset fields—to uint64_t.
+    
+    - Widen core size fields in TensorMap-related structs to uint64_t
+    - Fix int32_t/uint64_t and size_t/uint64_t mixed-type comparisons
+    - Add explicit casts at API boundaries to suppress macOS CI warnings
+    - Reorder PTO2SharedMemoryHeader to eliminate struct padding risk
+    - Propagate uint64_t to aicpu_build_graph and host_build_graph
+    - Use PRIx64 for portable uint64_t formatting
+    - Fix PTO2 task count read to use struct member access
+
+[33mcommit 7e9f479e46cf06e2fbcdb20221a4dcc78f404e1d[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Feb 25 20:55:00 2026 +0800
+
+    Refactor: register-based dispatch with dcci fix and CI runtime filter
+    
+    Replace shared-memory polling (Handshake.task_status/task/control) with
+    hardware SPR register reads/writes for task dispatch, completion detection,
+    and exit signaling. Pass per-core payload addresses through hank->task
+    during handshake instead of adding a dispatch_payloads_base field to Runtime.
+    
+    Fix dcci cache operations in AICore executor:
+    - Use 2-arg dcci (invalidate) for read-side operations instead of
+      3-arg CACHELINE_OUT (flush) when reading data written by AICPU
+    - Use SINGLE_CACHE_LINE instead of ENTIRE_DATA_CACHE for handshake struct
+    
+    Add -r/--runtime flag to ci.sh to run tests for a single runtime
+    (host_build_graph, aicpu_build_graph, tensormap_and_ringbuffer),
+    defaulting to all runtimes when omitted.
+
+[33mcommit 6a069378bf4edca8dc7a0aaf73983dc9245532ca[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Thu Feb 26 09:20:38 2026 +0800
+
+    Refactor: replace auto-generated scalar args with explicit ctypes scalars in golden files (#108)
+    
+    The framework no longer silently appends scalar arguments (tensor byte
+    sizes + element count). Golden authors now specify the full args layout
+    explicitly via a list of (name, value) pairs, using ctypes for typed
+    scalars. This makes the args array transparent and gives golden authors
+    full control over what gets passed to orchestration functions.
+
+[33mcommit c875955b22483f96597d30dc743f2472cc723fad[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Tue Feb 24 21:54:53 2026 +0800
+
+    Refactor: modularize performance collector into platform host/aicpu/aicore components (#94)
+    
+    Separate performance profiling logic from executors into dedicated modules:
+    - Add performance_collector_aicore.h for AICore-side recording interface
+    - Add performance_collector_aicpu.h/.cpp for AICPU-side buffer management
+    - Move performance_collector.cpp to host/ directory for host-side collection
+    - Add get_sys_cnt_aicore() to unify timestamp access across platforms
+    - Simplify aicpu/aicore executors by removing duplicated profiling code
+    - Update swimlane_converter.py to support new performance data structure
+    
+    This refactoring reduces code duplication and avoids lock contention,
+    minimizing the performance overhead of profiling on task scheduling.
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 89f4f9eab2df79eb9540e06da8364968f10e027f[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Feb 24 17:18:42 2026 +0800
+
+    Refactor: replace physical_core_id argument with platform getter (#107)
+    
+    Remove physical_core_id from the aicore_execute() signature and
+    provide get_physical_core_id() in each platform's inner_kernel.h
+    instead.  This keeps platform-specific details out of the runtime
+    interface — only host_build_graph actually uses the value, while the
+    other two runtimes ignored the parameter entirely.
+    
+    Platform layer:
+    - a2a3: add get_physical_core_id() reading hardware via get_coreid()
+    - a2a3sim: add thread_local g_sim_physical_core_id set by the
+      wrapper before calling aicore_execute(); getter reads it
+    
+    Runtime layer:
+    - host_build_graph: use get_physical_core_id() for handshake
+    - aicpu_build_graph / tensormap_and_ringbuffer: drop unused param
+
+[33mcommit a1a491c95b4b05b07392e09e59be7fa8baae10cd[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Feb 24 16:25:19 2026 +0800
+
+    Refactor: unify register access with generic read_reg/write_reg API (#93)
+    
+    Replace purpose-specific register functions (read_task_id_by_reg,
+    set_aicore_busy/idle, enable/disable_aicore_register, etc.) with a
+    generic read_reg/write_reg interface parameterized by RegId enum.
+    
+    Platform layer:
+    - Add RegId enum and reg_offset() mapping in platform_config.h
+    - Consolidate AICoreStatus enum into platform_config.h
+    - Implement read_reg/write_reg for a2a3 (MMIO) and a2a3sim (host memory)
+    - Rewrite inner_kernel.h for both platforms to use the new interface
+    - Introduce set_platform_regs()/get_platform_regs() to decouple
+      runtime from KernelArgs
+    - Move shared aicpu sources (platform_regs, unified_log_device) into
+      common src/aicpu/ directory
+    
+    Runtime layer:
+    - Replace all register helper calls with read_reg/write_reg
+    - Add physical_core_id to Handshake struct for simulation support
+    - Pre-set COND=BUSY before task dispatch to prevent false completion
+      detection from stale IDLE state
+    
+    Simulation runner:
+    - Allocate per-core simulated register blocks in DeviceRunner::run()
+    - Pass physical_core_id through aicore_execute_wrapper for thread-local
+      register base setup
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 6f34547041f1bdb7efea3da3c5a23c34f4097978[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Tue Feb 24 16:08:51 2026 +0800
+
+    Refactor: use cycle counters for profiling and free-list for tensormap (#102)
+
+[33mcommit fe64a5fabc761914a70709c36b51f651e6ac7ebf[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Tue Feb 24 16:07:18 2026 +0800
+
+    Refactor: remove pinned pto-isa commit and fix torch CPU-only install in CI (#106)
+    
+    - `code_runner.py` now pulls pto-isa main branch.
+    - CI will try installing torch-cpu rather than default torch.
+
+[33mcommit ab31f8b52af4260d5e2e5605050adb566ca0f9b6[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Feb 24 15:23:27 2026 +0800
+
+    docs: add AI-assisted development guides, commands, and architecture reference (#103)
+    
+    Add architecture quick reference and testing guide under .ai-instructions/,
+    Claude Code slash commands for common CI workflows, and expand CLAUDE.md
+    with architecture overview and common commands. Track .claude/ directory
+    by removing it from .gitignore.
+
+[33mcommit 633b35b219cdbbc647d73ab1112d09f2f7d4758e[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Tue Feb 24 15:01:20 2026 +0800
+
+    Add: pass unified logging to orchestration via ops table (#104)
+    
+    Extend PTO2RuntimeOps with log function pointers so orchestration
+    .so files can use LOG_* macros instead of printf, with zero new
+    link dependencies. Migrate existing printf calls in examples.
+
+[33mcommit 57c2a2abb1237893a5058a17d42b22d4b2fe4618[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Feb 24 11:19:29 2026 +0800
+
+    Refactor: move get_sys_cnt_aicpu() to platform/include/aicpu/device_time.h (#100)
+    
+    Replace inline inner_aicpu.h headers with a proper public interface
+    following the device_malloc.h/device_log.h pattern: declaration in
+    platform/include/, platform-specific .cpp implementations in a2a3/
+    and a2a3sim/.
+
+[33mcommit 4717440f1e35fabc1298035b974fc4df3925c542[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Tue Feb 24 11:18:46 2026 +0800
+
+    Refactor: remove unused func_name parameter from pto2_rt_submit_task (#101)
+    
+    The func_name parameter was originally intended for debugging but was
+    stored in PTO2TaskDescriptor and never consumed by the runtime. Remove
+    it from the entire call chain and replace the string literals at call
+    sites with trailing comments to preserve readability.
+    
+    Changes:
+    - Drop const char* func_name from PTO2RuntimeOps.submit_task, the
+      pto2_rt_submit_task inline wrapper, pto2_submit_task, and
+      submit_task_impl throughout the tensormap_and_ringbuffer runtime
+    - Remove PTO2TaskDescriptor::func_name field and the assignment in
+      pto2_submit_task
+    - Delete the now-dead non-inline pto2_rt_submit_task exported function
+      from pto_runtime2.cpp/.h (all callers use the inline in
+      pto_orchestration_api.h)
+    - Update all call sites in examples/ and tests/ to drop the string
+      argument and add it as a // comment
+    - Fix stale signature in pto_types.h doc comment
+
+[33mcommit 06d788e0e628fee9c0e4df7f599639537e3d20b3[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Feb 24 10:37:56 2026 +0800
+
+    CI: replace static round-robin HW scheduling with dynamic work-stealing (#99)
+    
+    Refactor parallel HW task execution to use a flock-based shared queue
+    instead of statically partitioning tasks across devices. Each device
+    worker now atomically pops tasks from a shared queue file, so faster
+    devices naturally pick up more work and overall utilization improves.
+    
+    - Extract single-run `run_hw_task` from `run_hw_task_with_retry`, move
+      retry orchestration into callers (sequential loop / per-round dispatch)
+    - Run retries in rounds: after each round, only re-queue failed tasks
+    - Track elapsed time per task and include it in result lines
+    - Deduplicate results in summary to report only the final outcome
+
+[33mcommit f7893d073603c945b867070ba808ef8a3474ab05[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Sat Feb 14 16:37:17 2026 +0800
+
+    Refactor: move inline implementations to .cpp and parallelize full build pipeline (#98)
+    
+    - Move get_stacktrace, AssertionError ctor, and assert_impl from
+      common.h inline definitions to common.cpp to reduce header bloat
+    - Parallelize runtime build, orchestration compile, and kernel compile
+      in code_runner using ThreadPoolExecutor
+    - Move <chrono> and <optional> includes from performance_collector.h
+      to performance_collector.cpp (only needed in implementation)
+
+[33mcommit 7f2ddfe8cad890056530d241fd520bab567cc718[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 14 16:34:52 2026 +0800
+
+    feat(ci): parallelize example and device test execution across multiple NPU devices (#97)
+    
+    Add --parallel flag and device range support (-d 5-8) to ci.sh so
+    hardware tasks are distributed round-robin across available devices
+    and simulation tasks run concurrently. Results are collected and
+    printed as a summary table at the end.
+    
+    Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit 624bacb55530c09e7595a7c1ecaadd56d09978b6[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Sat Feb 14 15:42:36 2026 +0800
+
+    Update: parallelize compilation pipeline to speed up builds (#96)
+    
+    - Use ThreadPoolExecutor to compile multiple kernels in parallel
+    - Compile AICore/AICPU/Host targets concurrently in runtime_builder
+    - Add -j flag to make for multi-core build acceleration
+    - Trim redundant docstring in kernel_compiler
+
+[33mcommit a0bd37d2ae064375e9134c2000815b0660c4c180[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Sat Feb 14 15:20:51 2026 +0800
+
+    Refactor aicpu logical (#95)
+    
+    * 修复64batch卡死的问题，暂时将window大小改成65536，后面再支持task ring的环形分配
+    
+    * Update: optimize PTO2 scheduler and orchestrator performance
+    
+    - Replace std::mutex with spinlocks and bitmask circular queues in
+      AICPU scheduler ready queues; remove redundant atomic counters
+    - Add orchestrator ready queue (SPSC ring) to push early-return ready
+      tasks directly, replacing O(N) readiness scan in scheduler
+    - Stack-allocate tensormap lookup results (PTO2LookupResult) to avoid
+      per-lookup heap allocation from std::vector
+    - Inline Tensor copy ctor/operator= into header; skip memset on task
+      ring slot allocation; bulk memcpy params in submit_task
+    - Add PTO2_SPIN_PAUSE_LIGHT() (yield without sched_yield) for
+      tight spinloops on aarch64/x86_64
+    - Add DEV_ALWAYS log level for diagnostics; change diagnostic reports
+      from DEV_ERROR to DEV_ALWAYS, per-task logs from DEV_INFO to DEV_DEBUG
+    - Add profiling instrumentation to scheduler, orchestrator, and host
+      runtime init
+    - Vectorize paged attention golden computation across batch dimension
+
+[33mcommit fbca018f3305475915c819c09a90e2aec72a3be9[m
+Author: chenshengxin2026 <hw_chenshengxin@163.com>
+Date:   Sat Feb 14 11:09:12 2026 +0800
+
+    Add: BGEMM example for tensormap_and_ringbuffer runtime (#89)
+
+[33mcommit c453f6b980d9d20f2b0fadcb12fe553faed535f8[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 13 21:41:56 2026 +0800
+
+    Fix: add partial block masking to paged attention softmax (#91)
+    
+    Add -inf masking for invalid key positions in partial blocks by using
+    TFILLPAD_INPLACE + scalar SetValue workaround for a hardware bug in
+    TFILLPAD's vcopy broadcast path at small tile width (N=16). Pass
+    valid_len through sij tensor view so softmax_prepare can apply the mask.
+    
+    - Templatize M/N/K in AIC/AIV kernels replacing module-level constexpr
+    - Always load full block_size K/V tiles; convey valid_len via sij view
+    - Add pipe_barrier calls between dependent vector ops in softmax_prepare
+    - Update golden.py test cases to exercise partial blocks (context_len=33,128)
+    - Add TFILLPAD_INPLACE_BUG.md documenting the hardware bug and workaround
+
+[33mcommit 4e96d4e12da316531f26d42d670fac07a5f1a469[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 13 17:44:16 2026 +0800
+
+    Fix tensormap_and_ringbuffer PA to support partial blocks (#87)
+    
+    Use full block_size for kj/vj views and sij/pij allocations, then pass
+    a sij view with valid_len to softmax_prepare so sij->repeats[1] carries
+    the mask boundary for TFILLPAD. Update Case1 context_len to 8193 to
+    exercise the partial-block path.
+
+[33mcommit c4170e37d6834517af7f57e64f46fd46ade95d0c[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Fri Feb 13 15:09:08 2026 +0800
+
+    Refactor: pipeline AICPU dispatch with incremental task scanning (#82)
+    
+    Replace batch ready-queue init with incremental scan driven by
+    current_task_index, add readiness scan for orchestrator early-return
+    path, and wire aicpu_fanin_refcount/task_completed into orchestrator
+    so producer completion is visible across threads. Scale PA Case1 to
+    production parameters.
+
+[33mcommit 611b8d8a028854ff6a1d62c717e04b0688d15bd9[m
+Author: JohnWang <68219492+Crystal-wzy@users.noreply.github.com>
+Date:   Fri Feb 13 15:05:56 2026 +0800
+
+    Add: BGEMM example for aicpu_build_graph and host_build_graph runtimes (#80)
+    
+    Add BGEMM (Batched General Matrix Multiplication) example demonstrating
+    Cube (AIC) and Vector (AIV) core cooperation with tile-based computation.
+    
+    Add examples/aicpu_build_graph/bgemm/
+    
+    Task graph built on AICPU with AicpuBuildApi
+    Supports 4x4x4 grid with 64x64 tiles (256x256 matrices)
+    
+    Add examples/host_build_graph/bgemm/
+    
+    Same computation with host-side graph building
+    
+    Both examples include:
+    
+    golden.py: Test specification with tile-first memory layout
+    kernel_config.py: Runtime and kernel configuration
+    kernels/aic/kernel_gemm_tile.cpp: Cube core matmul kernel
+    kernels/aiv/kernel_tile_add.cpp: Vector core add kernel
+    kernels/orchestration/bgemm_orch.cpp: Task graph builder
+    
+    Co-authored-by: zhywang <wangzhiyong74@huawei.com>
+
+[33mcommit 04831e8e2be13635e0ba436090ed864f96c6b291[m
+Merge: b3ed587 2d60732
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Fri Feb 13 14:32:59 2026 +0800
+
+    Merge pull request #81 from ChaoWao/fp16-paged-attention
+    
+    Add FP16 paged attention example with kernels and golden reference
+
+[33mcommit 2d6073282ec29f9dd58f3103a7c26666ccd77664[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 13 10:29:54 2026 +0800
+
+    Add FP16 paged attention example with online softmax
+    
+    Implement a complete paged attention example under
+    examples/tensormap_and_ringbuffer/paged_attention/ with:
+    
+    - Orchestration (paged_attention_orch.cpp): iterates over batches and
+      query-head tiles, dispatching QK matmul, softmax-prepare, PV matmul,
+      and online-update tasks across AIC (cube) and AIV (vector) workers.
+    - AIC kernels: aic_qk_matmul (Q @ K^T) and aic_pv_matmul (P @ V).
+    - AIV kernels: aiv_softmax_prepare (scale, rowmax, exp, rowsum) and
+      aiv_online_update (running max/sum correction with fused final
+      normalization on the last block).
+    - AIC/AIV hub stubs for future dispatch hooks.
+    - Golden reference (golden.py): PyTorch online-softmax paged attention
+      with GQA support, two test cases (context_len 16 and 64), and
+      configurable case selection via PA_CASE env var.
+    - Kernel config (kernel_config.py): wires up func_ids, source paths,
+      core types, and runtime settings.
+    
+    All tensors use FP16 for Q/K/V with FP32 accumulation for output.
+
+[33mcommit b3ed5878fd0aef153d5359c645ecd0b8947ddf8e[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Fri Feb 13 09:33:17 2026 +0800
+
+    Refactor: move Tensor ops to orch, add PA example, scale pool sizes (#79)
+    
+    - Move view/reshape/transpose/dump/numel from tensor.cpp to
+      tensor_orch.cpp so orchestration .so can link them directly
+    - Add vector overloads for view() and offset_ndim_to_1d()
+    - Add multi-dim make_tensor/make_tensor_external factories
+    - Increase heap (64MB->1GB), task window (16K->64K), tensormap
+      buckets (4K->64K), max args (16->32) for paged attention scale
+    - Improve stacktrace with dladdr and inline chain expansion
+    - Add paged attention orchestration and kernel examples
+
+[33mcommit 8537a39d9cf1bf2ec19af4b3421826f43699ee4a[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Feb 12 16:24:30 2026 +0800
+
+    Support: Add AICPU dispatch/finish timestamps and dual swimlane view
+    
+    Add dispatch_time and finish_time fields to PerfRecord, written by AICPU
+    at task dispatch (before task_status=1) and completion observation
+    (when task_status==0). This captures scheduling overhead and completion
+    latency from the AICPU perspective.
+    
+    Introduce platform-specific inner_aicpu.h (mirroring AICore's
+    inner_kernel.h pattern) with get_sys_cnt_aicpu():
+    - a2a3: reads CNTVCT_EL0 (same physical counter as AICore)
+    - a2a3sim: uses std::chrono time_since_epoch (same epoch as AICore)
+    
+    Fix simulation clock alignment by switching get_sys_cnt() in
+    inner_kernel.h from relative-to-start to time_since_epoch, ensuring
+    AICore and AICPU timestamps share the same epoch.
+    
+    Update performance_collector to export dispatch_time_us and
+    finish_time_us in swimlane JSON. Update swimlane_converter to generate
+    dual-track Perfetto output: "AICore View" (start/end) and "AICPU View"
+    (dispatch/finish).
+
+[33mcommit a467da42fa91b4c3c74d47a9bd607a6e4e9e92d2[m
+Merge: 1c29c2c cfdca07
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Thu Feb 12 16:59:19 2026 +0800
+
+    Merge pull request #77 from jvjhfhg/unify-memory-pool-size
+    
+    Refactor: unify memory pool size configs into pto_runtime2_types.h
+
+[33mcommit cfdca070f5ec368e985d68ba47b3b9c1d73dd7c9[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Thu Feb 12 16:01:56 2026 +0800
+
+    Refactor: unify memory pool size configs into pto_runtime2_types.h
+    
+    - Remove duplicate RT2_GM_HEAP_SIZE macro, use PTO2_HEAP_SIZE everywhere
+    - Remove deprecated PTO2_TASK_SLOT macro (replaced by pto2_task_slot())
+    - Remove memory fields from PTO2OrchestrationConfig, use macros directly
+    - Store GM heap pointer in Runtime instead of passing via args array
+    - Remove redundant pto2_gm_heap_size_ field from Runtime
+
+[33mcommit 1c29c2ca83eead3f5a2c7d0fb75109d8aa015278[m
+Author: wangzihao122 <165546173+indigo1973@users.noreply.github.com>
+Date:   Thu Feb 12 11:30:03 2026 +0800
+
+    feat(tools): converting performance file into merged_swimlane and mermaid formats. (#75)
+
+[33mcommit 4f458414d62808d42bae2e962a6e5ea8175fc567[m
+Author: majin0824 <majin15@huawei.com>
+Date:   Wed Feb 11 20:14:44 2026 +0800
+
+    Refactor: replace numpy with torch
+
+[33mcommit 6e028262d336bef1c6b226a950fa04cc239b6138[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Thu Feb 12 10:12:41 2026 +0800
+
+    Refactor: decouple orchestration .so from runtime link dependencies (#74)
+    
+    * Refactor: decouple orchestration .so from runtime link dependencies
+    
+    Extract orchestration-specific sources into a dedicated orchestration/
+    directory so the .so compiles with zero runtime .cpp dependencies.
+    Tensor constructors and validation methods move to tensor_orch.cpp,
+    pto_orchestration_api.h provides a slim header-only ops-table API,
+    and kernel_compiler auto-discovers extra sources via build_config.py.
+    
+    * Remove unused #include <pto/common/constants.hpp> from all kernel sources
+    
+    * Fix review comments
+    
+    * Avoid compilation error introduced by pto-isa's recent change
+
+[33mcommit b1444ed4b85ff242d818c3c5727e97cc0cadeaa9[m
+Merge: 2dcdfd7 a6709ab
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Wed Feb 11 15:11:01 2026 +0800
+
+    Merge pull request #72 from ChaoWao/feat-paged-attention-mask
+    
+    Handle partial last block in paged attention via TFILLPAD -inf masking
+
+[33mcommit 2dcdfd777b951ed222cca41df7ec1e5bdafc6e4d[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Wed Feb 11 14:45:35 2026 +0800
+
+    Support: Add swimlane data collection, tensormap_and_ringbuffer profiling, and optimize time alignment (#57)
+    
+    - Add swimlane data collection with unified collector and JSON export
+      - Implement unified performance data collector for task execution tracking
+      - Export intermediate JSON format for human readability and tool integration
+      - Enable conversion to swimlane visualization via external tools
+      - Support concurrent task execution analysis across multiple cores
+    
+    - Add performance profiling support for tensormap_and_ringbuffer runtime
+      - Implement AICore performance data recording with double-buffer mechanism
+      - Implement AICPU performance data collection and fanout completion
+      - Support buffer switching and flushing during execution
+    
+    - Optimize performance profiling time alignment
+      - Record kernel_ready_time for cross-core time synchronization
+      - Improve timestamp accuracy for multi-core execution analysis
+    
+    - Support dynamic task count polling in device_runner
+      - Enable Host to read total_tasks from AICPU via shared memory
+      - Add timeout mechanism for task count synchronization
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 5bf26b407767f7341e9e69d8fec5248a98104a96[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Wed Feb 11 14:34:46 2026 +0800
+
+    fix-fuzzy-bug (#73)
+
+[33mcommit a6709abbddaf621453da2d532761126e9b6cee7c[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Feb 11 12:55:49 2026 +0800
+
+    Fix paged attention correctness for partial last blocks
+    
+    Previously the softmax_prepare kernel assumed all blocks were fully
+    populated (valid_len == block_size). When context_len is not a multiple
+    of block_size, the last block contains garbage values in columns
+    [valid_len, block_size), which corrupt the softmax output and produce
+    incorrect attention weights.
+    
+    Changes:
+    - aiv_softmax_prepare: add TFILLPAD_INPLACE masking that fills columns
+      [valid_len, N) with -inf before scaling, so exp(-inf)=0 zeroes out
+      invalid key positions. Uses dynamic-cols TileSijDyn to mark the valid
+      boundary and PadValue::Min TileSijPad for the fill value.
+    - paged_attention_orch: compute valid_len = min(block_size, seq_len -
+      bn * block_size) per block and pass it as an 8th arg to the softmax
+      prepare task.
+    - golden.py: change context_len from 8192 to non-aligned values (8100,
+      8150) so the golden reference exercises partial-block paths.
+    
+    Applied to both aicpu_build_graph and host_build_graph test variants.
+    
+    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit 5334d3dfc14d70274fca54103c9263582c8dcd70[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Feb 11 11:42:01 2026 +0800
+
+    Add paged attention test for aicpu_build_graph runtime (#71)
+    
+    Port paged attention from host_build_graph to aicpu_build_graph where
+    the AICPU device builds the task graph via a dlopen'd orchestration
+    plugin with concurrent build||schedule. Kernels are identical; only the
+    orchestration and kernel_config differ.
+
+[33mcommit 3c4f0b77c0b7d4e97b0d32936c92de0b8b90d83b[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Wed Feb 11 10:53:30 2026 +0800
+
+    Refactor: overlap-aware TensorMap lookup with INOUT chain dependency optimization (#69)
+    
+    - Change Tensor::is_overlap to return OverlapStatus enum (NO_OVERLAP/COVERED/OTHER)
+      with Segment::contains for full-coverage detection
+    - Upgrade TensorMap lookup to return all overlapping entries with overlap status,
+      enabling multi-producer dependency discovery
+    - Merge INOUT into INPUT handling in submit_task; for INOUT params that fully cover
+      a non-alloc entry, remove the covered entry from TensorMap to minimize dependency
+      fan-in and favor chain dependencies
+    - Move sync_tensormap from Orchestrator to TensorMap with back-pointer to orch,
+      and spin-wait on pool exhaustion instead of force-removing entries
+    - Add with_alloc field to TensorMapEntry to distinguish OUTPUT vs INOUT producers
+    - Bump RUNTIME_MAX_ORCH_SO_SIZE to 4MB
+
+[33mcommit a192224c4c85dbaadafbadba8e997921b5cc4466[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Feb 11 10:51:56 2026 +0800
+
+    Add small-scale float16 paged attention example and fix block table generation (#70)
+    
+    Add a sim-compatible paged attention example under examples/host_build_graph/
+    using float16 (half) with 16x16 tiles, runnable on both a2a3 and a2a3sim.
+    
+    Fix block table generation in both golden.py files:
+    - Use ceiling division for cur_valid_blocks
+    - Use total_blocks as randint upper bound (exclusive) to cover all valid indices
+
+[33mcommit b19df590be6d017c28845acd9d433d75e891307b[m
+Author: Jie Xie <40080718+QuteMiao@users.noreply.github.com>
+Date:   Wed Feb 11 10:46:47 2026 +0800
+
+    Update README.md with new file path (#67)
+
+[33mcommit 84f9e40030ae597a437bab184a85461cb9c7c2c3[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Feb 11 10:12:57 2026 +0800
+
+    Fix paged attention: kernels for Ascend NPU and move to device tests (#68)
+    
+    - QK matmul: use DN GlobalB with RowMajor/ColMajor TileMatB for transposed-K pattern
+    - PV matmul: use standard ND GlobalB, remove V pre-transpose from orchestration
+    - Online update: rewrite scalar tiles to (kScalarRows, kScalarCols) RowMajor with
+      GM round-trip for ND↔DN layout conversion; add pipe_barrier(PIPE_V) between
+      dependent vector ops to resolve PIPE_V RAW hazards
+    - Softmax prepare: add __aicore__ to template impl function
+    - Golden: update to production-scale parameters with bfloat16 inputs and GQA support
+    - Moved paged attention from examples/ to tests/device_tests/ for device-only CI
+    - Increased RUNTIME_MAX_TASKS to 131072 and added ml_dtypes CI dependency
+    
+    Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit 06e6bfad8a6d2185e8adfcb3d0116b45e22d9590[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Tue Feb 10 19:16:20 2026 +0800
+
+    Refactor: upgrade TensorMap chains to doubly-linked lists for O(1) removal (#66)
+    
+    Add prev_in_bucket and prev_in_task pointers to PTO2TensorMapEntry,
+    converting both bucket chains and task chains from singly-linked to
+    doubly-linked lists. This eliminates O(n) traversal in
+    remove_from_bucket and adds a new remove_from_task function, both
+    achieving O(1) entry removal during pool wrap-around and cleanup.
+
+[33mcommit b0fe4bd5e22149181c8a0900afbd279217ae29c0[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Tue Feb 10 16:04:54 2026 +0800
+
+    Refactor: add PTO2_ORCHESTRATION RAII guard to hide orchestration entry/exit boilerplate (#65)
+    
+    Add PTO2OrchestrationBeginInfo config struct, PTO2OrchestrationGuard RAII
+    class, and PTO2_ORCHESTRATION macro to pto_runtime2.h. The macro handles
+    validation, shared memory creation, GM heap extraction, runtime lifecycle,
+    and orchestrator_done signaling — collapsing ~60 lines of ceremony into a
+    single scoped block. Also fix the nested scope example so no inner-scope
+    tensor escapes to the outer scope (moved t4 into the inner scope).
+    
+    Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit 7dd67fa36cc9ab929b83810dd299b7a1bcc6f3f4[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Feb 10 15:22:29 2026 +0800
+
+    Refactor: unify toolchain compiler_path to cxx_path and simplify orchestration compilation (#64)
+    
+    Rename compiler_path to cxx_path across all toolchains for consistency,
+    hoist toolchain resolution in compile_orchestration, and remove unused
+    toolchain methods (get_include_flags, get_device_link_flags, aicpu flags).
+    Remove outdated tests that relied on the old API.
+
+[33mcommit bfe612aa9de4d178565592cb2009d4d6b486a556[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Tue Feb 10 14:11:17 2026 +0800
+
+    Refactor: direct-owner scope model with nested scope example (#63)
+    
+    Replace the old scope model (every enclosing scope holds a reference via
+    scope_depth) with direct-owner-only: each task belongs to the scope at
+    stack top when submitted, fanout_count initializes to 1 for the owning
+    scope. Use a contiguous flat buffer for scope task tracking with minimal
+    allocations. Update the vector example to demonstrate nested scopes with
+    cross-boundary data flow.
+    
+    Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit b7b3138567f11bebc1f26b27e6b7a726baee6ac5[m
+Author: poursoul <poursoul@126.com>
+Date:   Tue Feb 10 09:27:21 2026 +0800
+
+    Refactor: rename TensorDescriptor to Tensor and restore debug validation
+    
+    - Rename TensorDescriptor struct to Tensor across all kernel, runtime,
+      and orchestrator files; rename source files accordingly
+    - Remove remove_redundant_dims() from optimize() pipeline
+    - Restore validate_memory_access_preserved and collect_all_offsets
+      debug implementations using std::vector
+    - Apply consistent code formatting (include order, parameter alignment)
+
+[33mcommit db632ed8ff981afbd37adf093b561ed891aaa4b8[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Mon Feb 9 20:45:38 2026 +0800
+
+    Refactor: replace PTOBufferHandle with TensorDescriptor and remove buffer pointer
+    
+    - Remove PTOBufferHandle* buffer from PTOParam; use value-copy TensorDescriptor
+      with post-submit sync pattern (td = params[i].tensor) for address writeback
+    - Delete deprecated PTO2TaskParam, PTO2ParamType, PTO2_INPUT/OUTPUT/INOUT macros,
+      and pto2_param_set_* functions
+    - Redesign param helpers to accept const TensorDescriptor& instead of
+      PTOBufferHandle& with size/version
+    - Add TensorDescriptor::make_1d_contiguous static member; replace
+      make_external_handle/make_output_handle/make_tensor_bbox with
+      make_tensor_external and make_tensor free functions
+    - Update example_orchestration.cpp: ext_td_ prefix for external tensors,
+      td_ prefix for intermediates, post-submit sync after each output
+    
+    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit 2b87860c7db1f80a6e00466de843665cedcae15a[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Feb 9 20:59:51 2026 +0800
+
+    Refactor: extract compilation infrastructure and streamline kernel/runtime building
+    
+    - Introduce TensorDescriptor to replace raw pointer parameter passing
+    - Extract KernelCompiler/RuntimeCompiler and streamline compilation infrastructure
+    - Extract per-runtime CodeRunner subclasses and add factory function
+    - Simplify AicpuBuildGraphRunner and clean up compilation infrastructure
+    - Remove hardcoded tensormap_and_ringbuffer sources from KernelCompiler
+    - BuildTarget.gen_cmake_args() returns List instead of string
+    - Unify orchestration include path construction via KernelCompiler
+    - Unify temp file creation in KernelCompiler via _make_temp_path()
+    - Remove unused RuntimeBuilder params and parametrize integration tests
+    - Unify orchestration compilation dispatch in KernelCompiler
+    - Thread PTO_ISA_ROOT as return value instead of env var side-effect
+    - Merge _compile_aicpu_orchestration_plugin into _compile_orchestration_shared_lib
+
+[33mcommit 9e9ed0b0b8dff9785aa97f7ada7a99ead595b73c[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Mon Feb 9 19:49:39 2026 +0800
+
+    Refactor: remove intermediate tensors from args and distinguish naming
+    
+    Intermediate tensors (c, d, e) were passed through the full argument
+    chain but never used from args — the orchestration allocates them from
+    the runtime heap via make_output_handle. Remove them from TENSOR_ORDER
+    and generate_inputs() to avoid unnecessary device memory allocation.
+    
+    Rename buffer handles to clarify provenance:
+    - arg_* for I/O tensors from external args (make_external_handle)
+    - buf_* for intermediates allocated by runtime heap (make_output_handle)
+    
+    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit c0bb24fda66c30c315d33d34794a2067dc033a7f[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Mon Feb 9 19:26:56 2026 +0800
+
+    Refactor: implement OUTPUT dual-mode allocation and promote make_* helpers
+    
+    - OUTPUT params now support dual-mode: NULL addr triggers runtime
+      ring-buffer allocation; non-NULL addr is used as-is (external memory)
+    - Promote make_*_param/make_*_handle factory helpers from example into
+      runtime headers (tensor_descriptor.h, pto_types.h) with NULL assertions
+    - Remove pto2_rt_get_output / pto2_task_get_output APIs; submit returns void
+    - Clarify INOUT semantics as "modifier" (read-then-write) vs OUTPUT "producer"
+    - Reorder PTOParamType enum: INOUT=2, SCALAR=3
+    
+    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+
+[33mcommit b11ae4fbc49ca7fa5fab788489d10d0ce2f09293[m
+Author: zhywang <wangzhiyong74@huawei.com>
+Date:   Mon Feb 9 17:21:48 2026 +0800
+
+      Fix: Compute golden values before hardware execution in CodeRunner
+    
+      Problem:
+      - outputs and tensors shared the same numpy array references
+      - Hardware execution overwrote original values before golden comparison
+      - _compare_with_golden() compared hardware output with itself
+      - Tests always passed, masking real failures
+    
+      Solution:
+      - Copy outputs and compute golden BEFORE launch_runtime()
+      - Simplify _compare_with_golden() to use pre-computed expected values
+    
+      Co-authored-by: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 671a41513d4294b5c76eab9337eb095a36494c9d[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Mon Feb 9 15:58:14 2026 +0800
+
+    Refactor: use PTO2SharedMemoryHeader for sm_ptr access in orchestration
+    
+    Replace hardcoded pointer arithmetic (char*)sm_ptr + 8 with proper struct
+    member access via PTO2SharedMemoryHeader->orchestrator_done. This follows
+    codestyle rule #4 (avoid hardcoded offsets) and rule #3 (prefer volatile
+    on struct members).
+    
+    Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+[33mcommit c4cd211a3e0f5e1ec45495c4848c9ff28f3052bb[m
+Author: poursoul <poursoul@126.com>
+Date:   Mon Feb 9 15:22:44 2026 +0800
+
+    Refactor: introduce TensorDescriptor to replace raw pointer parameter passing
+    
+    Replace the legacy PTO2TensorRegion and PTO2TaskParam types with a new
+    TensorDescriptor-based parameter system (PTOParam/PTOBufferHandle).
+    Kernels now receive TensorDescriptor pointers instead of raw buffer
+    addresses, enabling strided multi-dimensional tensor descriptions and
+    overlap-based automatic dependency detection.
+    
+    Key changes:
+    - Add TensorDescriptor with strided access patterns, view/reshape/transpose
+    - Add PTOParam (INPUT/OUTPUT/SCALAR/INOUT) as unified task parameter type
+    - Migrate runtime sources from C to C++ (.c -> .cpp)
+    - Remove PTO2LogicalTensor, PTO2TensorRegion, and extended TensorMap code
+    - Simplify build_pto2_payload to iterate PTOParam array directly
+    - Update kernels (add, mul, add_scalar) to unpack TensorDescriptor
+    - Update compiler toolchain to pass runtime include dirs to kernels
+
+[33mcommit 25500df10710d34bce57d683dba5db23010d6f4f[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Mon Feb 9 14:15:37 2026 +0800
+
+    Refactor: auto-manage I/O tensors in framework and move intermediate allocation to AICPU
+    
+    Remove the host-side orchestration function (example_orch.cpp) entirely.
+    init_runtime_impl now uses arg_types/arg_sizes to automatically allocate
+    device memory for I/O tensors, copy inputs, record outputs for copy-back,
+    and marshal orch_args[] — eliminating boilerplate from every example.
+    
+    Intermediate tensor allocation moves from host to AICPU: add a
+    device_malloc/device_free platform abstraction (HBM via halMemAlloc on
+    a2a3, plain malloc on a2a3sim) and expose it through AicpuBuildApi so
+    the orchestration plugin can allocate on device.
+    
+    Merge the separate AICPU_ORCHESTRATION config into ORCHESTRATION and
+    rename the plugin entry point from build_graph_aicpu to orchestration.
+
+[33mcommit fe3a50832e1f6ec769b06193bc7b2cc7edcc9bce[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Mon Feb 9 10:56:04 2026 +0800
+
+    Refactor: remove corruption guards from pto2_submit_task (#51)
+    
+    Remove 16MB size validation and recovery logic that was likely
+    unnecessary paranoia. Parameters are stack-allocated in single-threaded
+    context with no concurrent access at creation time.
+    
+    Changes:
+    - Remove PTO2_PARAM_SIZE volatile macro, use direct p->size access
+    - Remove proactive size propagation workaround
+    - Remove corruption detection/recovery in OUTPUT and INOUT handling
+    - Simplify pto2_param_set to use direct field assignment
+    - Remove pto2_param_fix_sizes function
+    - Clean up example code (~40 lines of error checks removed)
+    - Add coding standards for volatile usage and pointer arithmetic
+
+[33mcommit dbfa18511ad614dd7f9a7b6c221eba30a832e117[m
+Author: XIAO YOUWEI <shallwe@pku.edu.cn>
+Date:   Mon Feb 9 09:08:42 2026 +0800
+
+    Refactor: align aicpu_build_graph example layout (#50)
+    
+    - Move example to examples/aicpu_build_graph/vector_example
+
+[33mcommit 8348c7bd68c7458db4146acd8c23a176f63ce330[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Mon Feb 9 09:07:51 2026 +0800
+
+    Support: Add performance profiling system for a2a3 and a2a3sim platforms (#49)
+    
+    Implement comprehensive performance profiling infrastructure for both
+    a2a3 (hardware) and a2a3sim (simulation) platforms with unified interface
+    and complete platform/runtime separation.
+    
+    Key features:
+    - Performance data collection using double-buffering (Ping-Pong buffers)
+    - Lock-free ready queue for buffer coordination between cores
+    - Detailed task execution records (cycles, timestamps, fanouts)
+    - Simulated 1850 MHz system counter for consistent timing across platforms
+    - Unified output format with Unicode tables showing task execution details
+    
+    Architecture:
+    - Shared data structures in platform/include/common/perf_profiling.h
+    - Platform-specific implementations in respective device_runner.cpp
+    - get_sys_cnt() abstraction: hardware counter (a2a3) vs chrono (a2a3sim)
+    
+    This enables developers to profile task execution timing on both hardware
+    and simulation platforms with identical interface and data format.
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 2fb22d59af88d263a6d6e8638925e3c4b3c511de[m
+Author: XIAO YOUWEI <shallwe@pku.edu.cn>
+Date:   Sun Feb 8 18:34:50 2026 +0800
+
+    Add `aicpu_build_graph` runtime (AICPU builds graph, AICPU schedules) (#36)
+    
+    ## Summary
+    
+    This PR adds a new runtime `aicpu_build_graph` where the task graph is **built on AICPU** (thread 0) and then scheduled/executed by **3 AICPU scheduler threads** (total 4 AICPU threads). The corresponding issue is #31 .
+    
+    Key idea: the graph-building logic is **example-provided** as a device-side function `build_graph_aicpu(Runtime*)`, compiled into the AICPU binary (no device-side `dlopen`).
+    
+    ## What’s included
+    - New runtime: `src/runtime/aicpu_build_graph/`
+      - Concurrent build∥schedule implementation with a correct-first `graph_mutex_` strategy.
+      - AICPU build APIs for examples:
+        - `aicpu_runtime_add_task(..., function_bin_addr)`
+        - `aicpu_runtime_add_successor_conditional(...)`
+        - `aicpu_runtime_publish_task(...)`
+      - Mode selection via `Runtime::build_mode`:
+        - `PTO_AICPU_BUILD_GRAPH_BUILD_MODE=1` (default concurrent)
+        - `PTO_AICPU_BUILD_GRAPH_BUILD_MODE=0` (sequential barrier)
+    - Example: `examples/aicpu_build_graph_example/`
+      - Host orchestration only prepares tensors and writes `runtime->orch_args[]`.
+      - AICPU builder in `examples/aicpu_build_graph_example/kernels/aicpu/build_graph_aicpu.cpp` builds/publishes tasks.
+      - `RUNTIME_ENV` in `kernel_config.py` sets `PTO_AICPU_BUILD_GRAPH_BUILD_MODE`.
+    - Runner updates: `examples/scripts/code_runner.py`
+      - Exposes `PTO_KERNELS_DIR` for runtime compilation.
+      - Applies `RUNTIME_ENV` during both runtime compilation and `Runtime.initialize()`.
+    
+    ## Perhaps DANGEROUS!
+    
+    I did some minor updates on [src/platform/a2a3/host/device_runner.cpp](https://github.com/ChaoWao/simpler/compare/main...uv-xiao:pto-runtime:uv/aicpu_build_graph?expand=1#diff-21f08da688161ac42c58a054fabcf0f5e11efa2b76fc81852eab0310661a4db0) and  [src/platform/a2a3sim/host/device_runner.cpp](https://github.com/ChaoWao/simpler/compare/main...uv-xiao:pto-runtime:uv/aicpu_build_graph?expand=1#diff-f33b8a83aa5eaa891aebcd18ee216a395ed70ff6058fe40662bb0af1e20490a6). The purpose is to provide a runtime-visible table of func_id -> kernel code address so the builder can set `Task::function_bin_addr`.
+    
+    ## How it differs from `host_build_graph`
+    - `host_build_graph`: host orchestration builds tasks/edges and host fills `Task::function_bin_addr` before launch.
+    - `aicpu_build_graph`: orchestration only marshals inputs; AICPU builds tasks/edges and publishes them while schedulers may already be dispatching tasks (concurrent build∥schedule).
+    
+    ## Validation
+    
+    ```bash
+    
+    # AICPU build graph (default concurrent)
+    python examples/scripts/run_example.py \
+      -k examples/aicpu_build_graph_example/kernels \
+      -g examples/aicpu_build_graph_example/golden.py \
+      -p a2a3sim \
+      -r aicpu_build_graph
+    ```
+    
+    ## Questions
+    
+    I've added some logging about AICPU's building graph, but I'm still not sure about the functionality correctness since I failed to find and use the swimlane figure generation API. This needs more assistance.  Besides, for on-board testing, I need more help from guys with A2/A3 platform access.
+
+[33mcommit b42babd32a1542f7686841d3f1ac9a7d1cfa8f0f[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Feb 7 09:42:36 2026 +0800
+
+    Add: Paged Attention example implemented with CCE codegen (#47)
+    
+    Add a new paged_attention_cce example demonstrating Paged Attention
+    implementation using CCE code generation, with AIC matmul kernels and
+    AIV vector kernels using PTO Tile API.
+    
+    This example validates the CCE codegen output for attention workloads
+    and serves as a reference for tile-based kernel development.
+    
+    Changes:
+    
+    - Add AIC kernels (Cube unit matmul):
+      - aic_qk_matmul.cpp: Q @ K^T using TLOAD/TMOV/TMATMUL/TSTORE
+      - aic_pv_matmul.cpp: P @ V using same tile-based matmul pattern
+      - Memory hierarchy: GM -> L1 -> L0A/L0B -> L0C -> GM
+      - Pipeline sync with set_flag/wait_flag for MTE2/MTE1/M/FIX stages
+    
+    - Add AIV kernels (Vector unit operations):
+      - aiv_softmax_prepare.cpp: TMULS/TROWMAX/TROWEXPANDSUB/TEXP/TROWSUM
+        - DN layout (ColMajor, 16x1) for row reduction results
+        - TRESHAPE for DN->ND conversion before store
+      - aiv_online_update.cpp: Online Softmax with TTRANS+TCOLEXPAND+TMUL
+        - Transpose matrix, expand scalar to columns, multiply, transpose back
+        - Handles is_first/is_last flags for accumulation and normalization
+    
+    - Add orchestration (paged_attention_orch.cpp):
+      - Fixed 16x16 tile dimensions (256 elements, 1024 bytes)
+      - Task graph: parallel QK->SF->PV chains, serialized UP within batch
+      - Simplified args (QK/PV: 3 args, SF: 5 args, UP: 9 args)
+    
+    - Add golden reference (golden.py):
+      - 16x16 test cases (Case1: single block, Case2: 4 blocks)
+      - K stored as K^T for direct matmul compatibility
+      - Online Softmax algorithm implementation
+    
+    - Add kernel_config.py and README.md documentation
+    
+    Co-authored-by: zhywang <wangzhiyong74@huawei.com>
+
+[33mcommit 441f52a6707572b60355d4c20f9b2b9f7142b38e[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 6 23:27:38 2026 +0800
+
+    Update block_dim default to 24 and increase AICPU idle timeout thresholds (#46)
+    
+    - Increase block_dim from 3 to 24 in kernel_config and code_runner defaults
+      to better match actual hardware parallelism
+    - Raise MAX_IDLE_ITERATIONS to 50M across both runtimes to reduce false
+      timeout errors under heavier workloads
+    - Align WARN_INTERVAL to 1M in tensormap_and_ringbuffer runtime
+
+[33mcommit cde0ffa8a424e018fb1ab159de92ee773ff64193[m
+Author: jvjhfhg <jvjhfhg@outlook.com>
+Date:   Fri Feb 6 23:26:56 2026 +0800
+
+    Refactor: Better SCOPE api and remove redundant code (#42)
+    
+    * RAII pto scope
+    
+    * Remove unused RT2 runtime functions and func_ptr field
+    
+    - Remove unused execution functions (pto2_runtime_execute, pto2_rt_task_complete, etc.)
+    - Remove unused debug functions (pto2_runtime_print_stats, pto2_runtime_dump_graph, etc.)
+    - Remove func_ptr field from PTO2TaskDescriptor
+    - Remove func_ptr parameter from submit functions
+    - Update example orchestration to match new API
+
+[33mcommit 59054173f850b7d4bbc5596fe6cf8b7cb1c4864c[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 6 15:19:59 2026 +0800
+
+    Refactor: Convert pto_logical_tensor from C to C++ and fix CI/build config
+    
+    - Rename pto_logical_tensor.c to pto_logical_tensor.cpp for C++ compilation
+    - Add extern "C" linkage guards in pto_logical_tensor.h for mixed C/C++ usage
+    - Use CXX_STANDARD target property instead of -std=c++17 compile flag in
+      CMakeLists (applies C++ standard only to C++ files, avoids warnings for C)
+    - Update pto_compiler.py source reference to .cpp
+    - Restrict pytest in CI to Linux/a2a3 platform only
+    
+    Co-authored-by: Cursor <cursoragent@cursor.com>
+
+[33mcommit 0659b93b8743bd26557c39d8fa9a23385a6f5090[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 6 14:52:06 2026 +0800
+
+    Refactor: Rename rt2 to tensormap_and_ringbuffer and reorganize examples
+    
+    Restructure the codebase to use more descriptive naming and better
+    directory organization:
+    
+    - Rename rt2 runtime to tensormap_and_ringbuffer throughout
+    - Move examples into organized subdirectories:
+      - host_build_graph/matmul, host_build_graph/paged_attention,
+        host_build_graph/vector_example
+      - tensormap_and_ringbuffer/vector_example
+    - Update ci.sh to recursively discover examples in nested directories
+    - Simplify CI workflow by removing redundant environment variables
+    - Update all documentation and code references
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit c3eb7b0da45bd8499f21c668794c513e23d0fc01[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Fri Feb 6 14:08:47 2026 +0800
+
+    Refactor: Unified kernel registration API and RT2 device orchestration
+    
+    - Update platform and host_build_graph for kernel registration API
+    - Add RT2 runtime with device orchestration support
+    - Remove dead multi-threaded runtime code and orphaned files
+    - Remove runtime argument, load from kernel_config.py
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 9c932a2370dd2ef69291fdd9e3fb9e2b87a62f03[m
+Author: luohuan19 <luohuan1019@163.com>
+Date:   Thu Feb 5 09:33:18 2026 +0800
+
+    feat: Implement unified logging system and integrate across all platforms
+    
+    - Add unified logging interface (unified_log.h) using link-time polymorphism
+    - Implement Host and Device logging adapters (unified_log_host.cpp, unified_log_device.cpp)
+    - Integrate unified logging into a2a3/a2a3sim platforms (host/aicpu modules)
+    - Apply unified logging in runtime modules (aicpu_executor, runtime_maker)
+    - Provide convenient macros: LOG_ERROR/WARN/INFO/DEBUG with automatic function name capture
+    - Update CMakeLists.txt to include new logging source files
+
+[33mcommit 7330294b8658f7ebaba456ed8432a48fb41121ec[m
+Author: ChaoZheng109 <zhengchao47@huawei.com>
+Date:   Thu Feb 5 17:21:26 2026 +0800
+
+    Refactor: Replace preprocessor platform detection with build-system selection
+    
+    Remove __PLATFORM_A2A3__ compile-time macro and refactor platform abstraction
+    to use build system directory structure for platform selection. This improves
+    code maintainability and reduces preprocessor complexity.
+    
+    Key changes:
+    - Remove __PLATFORM_A2A3__ definitions from all CMakeLists.txt files
+    - Add platform-specific inner_kernel.h headers for AICore definitions
+    - Refactor logging from macro-based to function-based implementation
+    - Split device_log.cpp into platform-specific implementations (a2a3/a2a3sim)
+    - Unify public headers (aicore.h, device_log.h) to be platform-agnostic
+    - Update include paths to support platform-specific header inclusion
+    
+    Benefits:
+    - Cleaner separation between platform-specific and common code
+    - Build system selects correct implementation based on directory structure
+    - Eliminates complex #ifdef blocks in public headers
+    - Easier to add new platform support in the future
+
+[33mcommit 30937c98e58a7c9596064e485ed275a2ccce9c9e[m
+Author: zhangqi-chen <wshchzhq@gmail.com>
+Date:   Thu Feb 5 16:58:52 2026 +0800
+
+    Fix: Remove unused constants.hpp include from kernel files
+
+[33mcommit af5e309bfc33d1c3bd5c65d3a039ea87185e88b0[m
+Author: zhywang <wangzhiyong74@huawei.com>
+Date:   Tue Feb 3 17:00:50 2026 +0800
+
+    Support: Enable paged_attention kernels for hardware deployment
+    
+    Add ccec compiler compatibility to paged_attention kernels, allowing the
+    same source code to compile with both g++ (simulation) and ccec (hardware).
+    
+    Changes:
+    
+    Rename entry functions to unified kernel_entry for runtime dispatch
+    Include <pto/pto-inst.hpp> for PTO ISA compatibility
+    Add aicore attribute to kernel functions (required by ccec)
+    Add gm qualifier to global memory pointers
+    Define fallback macros for ccec when not provided by PTO headers
+    The __CPU_SIM macro (passed by g++) triggers cpu_stub.hpp inclusion which
+    defines aicore and gm as empty. For ccec, the #ifndef fallbacks
+    define aicore as [aicore] attribute.
+    
+    Co-authored-by: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit d07191fa791d00e201ac260139310fc587169c3a[m
+Author: Zhangqi Chen <wshchzhq@gmail.com>
+Date:   Tue Feb 3 14:35:02 2026 +0800
+
+    Sim: Use dlopen for kernel loading and add matmul example (#34)
+    
+    Sim kernel loading refactor:
+    - Replace mmap .text section with dlopen for complete .so loading
+    - Enables external symbol resolution (std::exp, std::log) via PLT/GOT
+    - Unify all kernel entry points to "kernel_entry" function name
+    - Supports more pto-isa instructions (TLOG, TSQRT, TEXP, TMATMUL)
+    
+    Matmul example (diamond topology):
+    - Task graph: t0→t1→t3, t0→t2→t3
+    - Mixed core types: AIV (vector) and AIC (cube) kernels
+    - Computes F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)
+    - Half precision matmul: half×half→float
+
+[33mcommit 9f4294d3f12da18e7a20d32a48e6896519d7a029[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Tue Feb 3 12:43:41 2026 +0800
+
+    Fix: Convert AICPU ready queues from LIFO stack to FIFO circular queue (#32)
+    
+    Changes:
+    - Replace index-based queue operations with circular queue using head/tail pointers
+    - Fix task scheduling order: change from LIFO (last-in-first-out) to FIFO (first-in-first-out)
+    - Add head/tail indices for both AIC and AIV ready queues
+    - Initialize and reset circular queue indices in init() and deinit()
+    - Update enqueue operations to use tail position with modulo wrapping
+    - Update dequeue operations to use head position for proper FIFO behavior
+    - Enhance debug logging to show queue head/tail positions
+    
+    Impact:
+    - Tasks are now executed in the order they become ready (FIFO)
+    - Prevents potential queue overflow with circular buffer implementation
+    - Improves task scheduling fairness and predictability
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 4a2b5b538e41fcd46eb366169ec7c32959bea9ea[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Feb 3 11:41:14 2026 +0800
+
+    CI: Add on-device testing job and rename simulation job
+    
+    Rename run-example to run-example-on-sim for clarity and add a new
+    run-example-on-device job that runs examples on self-hosted hardware
+    with Ascend toolkit environment.
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 88fec7363d5b4f88555c077e41ee095bafa9edaa[m
+Author: JohnWang <68219492+Crystal-wzy@users.noreply.github.com>
+Date:   Tue Feb 3 09:29:05 2026 +0800
+
+    Add: Paged Attention example with AIC/AIV kernel splitting (#30)
+    
+    Implement Paged Attention algorithm on a2a3sim platform with manual AIC/AIV
+    kernel splitting and parallel task orchestration.
+    
+    Kernels:
+    - aic_qk_matmul: Q @ K^T matrix multiplication (Cube unit)
+    - aiv_softmax_prepare: scale, rowmax, exp, rowsum (Vector unit)
+    - aic_pv_matmul: P @ V matrix multiplication (Cube unit)
+    - aiv_online_update: Online Softmax accumulation + fused normalize (Vector unit)
+    
+    Orchestration:
+    - QK/SF/PV chains run in parallel across blocks
+    - UP tasks serialized within batch due to accumulator dependency
+    - Support for GQA (Grouped Query Attention) with configurable kv_head_num
+    
+    Test cases:
+    - Case1: batch=256, num_heads=16, block_size=128
+    - Case2: batch=64, num_heads=64, block_size=64 (default)
+    - Select via PA_CASE env var, e.g. PA_CASE=Case1
+    
+    Other:
+    - Increase RUNTIME_MAX_TASKS to 4096 for larger batch sizes
+    - Add kernel 'name' field to kernel_config.py for graph generation
+    
+    Co-authored-by: zhywang <wangzhiyong74@huawei.com>
+
+[33mcommit c94e72d2d3dc376c7442bbd749a8c2fa82d5a73b[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Mon Feb 2 20:49:43 2026 +0800
+
+    Refactor: Introduce platform config system and dynamic core discovery (#29)
+    
+    This commit introduces a unified platform configuration system and refactors
+    the core allocation mechanism to support dynamic core type discovery.
+    
+    Key changes:
+    - Add platform_config.h with centralized platform constants
+      (MAX_AICPU_THREADS, MAX_BLOCKDIM, CORES_PER_BLOCKDIM, etc.)
+    - Implement dynamic core discovery in AICPU executor
+      * Handshake with all cores to discover their types (AIC/AIV)
+      * Assign cores to threads based on discovered types
+      * Remove hardcoded block-based assignment assumptions
+    - Add parameter validation in device_runner
+      * Validate launch_aicpu_num and block_dim ranges
+      * Ensure block_dim is evenly divisible by launch_aicpu_num
+    - Remove redundant block_dim field from Runtime struct
+    - Update AICore executor to report core type during handshake
+    - Replace hardcoded magic numbers with platform config constants
+    
+    This refactoring improves code maintainability, enables better platform
+    abstraction, and prepares for future multi-platform support.
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit 094c08b4be0d54aff567eec1fd6aab95f05136a0[m
+Author: MagicDoge <36667074+luohuan19@users.noreply.github.com>
+Date:   Mon Feb 2 16:30:19 2026 +0800
+
+    Optimize CI workflow and remove git submodules (#28)
+    
+    - Replace git submodules with automatic pto-isa cloning in test framework
+    - Remove third_party/pto-isa submodule and .gitmodules
+    - Add automatic clone logic in code_runner.py with fallback to manual setup
+    - Update CI workflow to directly clone pto-isa instead of submodule init
+    - Add CI optimizations: concurrency control, pip caching, timeout settings
+    - Unify C++ compiler setup for Ubuntu and macOS
+    - Add error diagnostics for test failures
+    - Consolidate simulation examples into unified host_build_graph_example
+    - Update test framework to support both hardware and simulation platforms
+    
+    Co-authored-by: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+[33mcommit a9a64e18c93748b9ed10ff62f5ba24a18841c6b8[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Mon Feb 2 10:56:40 2026 +0800
+
+    Refactor: Introduce CoreType enum and unify platform include structure (#24)
+    
+    - Replace integer-based core type (0/1) with strongly-typed CoreType enum (AIC/AIV)
+    - Consolidate platform headers from distributed locations (a2a3/*/aicore.h,
+      device_log.h, etc.) to unified src/platform/include/ directory structure
+    - Update all include paths from local relative paths to platform include paths
+    - Remove redundant common/ source compilation from CMakeLists (header-only now)
+    - Add __PLATFORM_A2A3__ platform definition macro
+    - Update function signatures across runtime, platform, and examples to use CoreType
+    - Update pto_compiler.py to include new platform include directory
+    
+    This improves type safety, code maintainability, and clarifies the separation
+    between platform-specific and runtime code.
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit c8741db8cf6a80fd795b53597934f023ba2097ec[m
+Author: Zhangqi Chen <wshchzhq@gmail.com>
+Date:   Mon Feb 2 10:52:01 2026 +0800
+
+    Add: PTO ISA kernel support for simulation platform (#23)
+    
+    - Rewrite sim kernels using PTO ISA instructions (TLOAD/TADD/TSTORE/TMUL)
+    - Compile sim kernels to .dylib/.so using g++-15 with C++23 standard
+    - Use -shared + -fvisibility=hidden to ensure BL/B instructions have correct offsets
+    - Use -ffunction-sections + dynamically generated linker layout to place kernel
+      entry function at .text+0x0 (order file for macOS, linker script for Linux)
+    - Configure PTO_ISA_ROOT and g++-15 in GitHub CI workflow
+
+[33mcommit 85c4aa544e3fbf6652308a5613ecea3dada49642[m
+Author: MagicDoge <36667074+luohuan19@users.noreply.github.com>
+Date:   Mon Feb 2 10:00:59 2026 +0800
+
+    Fix: Update ci.sh to use new run_example.py entry point (#26)
+    
+    The old main.py files no longer exist. Update example commands to use
+    the unified run_example.py script with appropriate arguments.
+
+[33mcommit f6e2e31d3baf880a24bee79b204e2afc8015bf92[m
+Author: luohuan19 <luohuan1019@163.com>
+Date:   Sat Jan 31 17:13:35 2026 +0800
+
+    Add automated test framework with simulation platform support
+    
+    - Add CodeRunner class for automated PTO runtime testing
+      - Handles kernel compilation, runtime initialization, and result validation
+      - Supports both a2a3 (hardware) and a2a3sim (simulation) platforms
+      - Includes environment checks and improved error handling
+    
+    - Add CLI interface (run_example.py) for running tests
+    
+    - Add golden test examples for host_build_graph and host_build_graph_sim
+    
+    - Reorganize scripts into examples/scripts/ directory
+    
+    - Add comprehensive documentation in scripts/README.md
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 305298cec2940f6cd893c6d22d85f8d19f729bee[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Sat Jan 31 15:49:11 2026 +0800
+
+    Add: GitHub CI workflow for simulation example
+    
+    Runs python examples/host_build_graph_sim_example/main.py on both
+    Linux and macOS via GitHub Actions.
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 0db0ea4bd84e1078d0a3a66ceba205b6c5224c33[m
+Author: ChaoZheng109 <zhengchao47@huawei.com>
+Date:   Fri Jan 30 15:04:59 2026 +0800
+
+    Refactor: Extract shared PTO Runtime C API to common header
+    
+    Consolidate duplicate pto_runtime_c_api.h headers from a2a3 and a2a3sim
+    platforms into a single shared header, ensuring interface consistency
+    across platforms.
+    
+    Changes:
+    - Add src/platform/include/host/pto_runtime_c_api.h as common header
+    - Remove src/platform/a2a3/host/pto_runtime_c_api.h
+    - Remove src/platform/a2a3sim/host/pto_runtime_c_api.h
+    - Update a2a3 and a2a3sim CMakeLists.txt to include platform/include
+    - Update include paths in both platform implementations
+
+[33mcommit e0be4211cbdf3556e9d317e39ff956e0c1773499[m
+Author: ChaoZheng109 <zhengchao47@huawei.com>
+Date:   Fri Jan 30 11:21:45 2026 +0800
+
+    Fix: Ensure timeout detection executes when all cores busy
+    
+    Problem:
+    - When cur_thread_tasks_in_flight >= core_num, continue statement skipped Phase 2
+    - This also skipped timeout detection code after Phase 2
+    - If a task hung (infinite loop/livelock), idle_iterations never incremented
+    - Timeout mechanism completely failed, system hung with no diagnostic output
+    
+    Root Cause:
+    - continue jumps to next iteration, bypassing all code after it
+    - Timeout detection placed after the continue statement
+    
+    Solution:
+    - Change: if (busy) { continue } Phase2 Timeout
+    - To:     if (!busy) { Phase2 } Timeout (always runs)
+    - Phase 2 now conditionally executed instead of skipped
+    - Timeout detection always runs in every loop iteration
+    
+    Impact:
+    - Timeout can now detect hung tasks even when cores fully loaded
+    - Diagnostic reports will trigger correctly for livelock scenarios
+    
+    Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+[33mcommit 24c27d005e1d65ac7392bafd2e01ec0c87786bdd[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Jan 29 22:11:29 2026 +0800
+
+    Fix: Add macOS compatibility for a2a3sim platform (#18)
+    
+    - Force .so suffix in CMake for a2a3sim targets (macOS defaults to .dylib)
+    - Replace Linux-only memfd_create with cross-platform temp file approach
+    - Add Mach-O object file parsing support in elf_parser.py
+    - Add -undefined dynamic_lookup flag for orchestration SO on macOS
+    - Add MAP_JIT and W^X memory handling for Apple Silicon executable memory
+    - Fix unused variable warning in aicore_executor.cpp
+    
+    Co-authored-by: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 92e77c093b71c1774c65ea06265f7a532a2fedeb[m
+Author: Chao Wang <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Jan 29 21:32:07 2026 +0800
+
+    Add a2a3sim platform for host-based simulation (#17)
+    
+    Add thread-based simulation platform (a2a3sim) that emulates AICPU/AICore
+    execution on host, enabling development and testing without Ascend hardware.
+    
+    Platform changes:
+    - Add a2a3sim platform with host/aicore/aicpu/common modules
+    - Implement device_runner, memory_allocator, function_cache, and C API
+    - Use snake_case naming convention throughout the platform
+    
+    Tooling and build:
+    - Update binary_compiler and pto_compiler to support multi-platform builds
+    - Add ASCEND_HOME_PATH environment variable validation in binary_compiler
+    - Add toolchain module for platform-aware compilation
+    - Rename runtime_bindings.py to bindings.py for clarity
+    
+    Examples and docs:
+    - Add host_build_graph_sim_example demonstrating simulation usage
+    - Update README with platform comparison table
+    - Update host_build_graph_example for API consistency
+    
+    Co-authored-by: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 66649496daabcb169ffd58f1a199ebe7134325b6[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Thu Jan 29 21:20:38 2026 +0800
+
+    Fix task duplicate detection and add robust exit verification (#16)
+    
+    Prevent duplicate task completion detection by clearing h->task immediately
+    after reading, reducing race condition window from ~500μs to ~50ns. Add
+    timeout detection using idle iteration counting and double verification
+    that integrates into main dispatch loop. When counter reaches task_count
+    but cores are still working, continue full Phase 1&2 processing instead
+    of separate handling. Add diagnostic function for detailed state reporting
+    on timeout or anomaly detection.
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+    Co-authored-by: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+[33mcommit 102e18c6f39615c15609e9c16f312030acc732d2[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Thu Jan 29 19:53:26 2026 +0800
+
+    Fix: Add task_status check to prevent duplicate task execution (#15)
+    
+    Add task_status verification before executing tasks in aicore_executor.
+    This check was lost during a previous rebase and could cause tasks to
+    be executed multiple times.
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit d2548f44d14bd43350f442ba1f998977680da374[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Thu Jan 29 18:56:55 2026 +0800
+
+    Refactor: Unify naming convention to snake_case (#14)
+    
+    Standardize function names, variable names, and file names to snake_case.
+    
+    - Renamed 6 source files
+    - Updated function/method names
+    - Fixed related undefined symbol errors
+    - Updated all references (#include, CMakeLists.txt, configs)
+    
+    Tested: Compilation successful, no naming inconsistencies remain.
+    
+    Co-authored-by: ChaoZheng109 <zhengchao47@huawei.com>
+
+[33mcommit f82839e14439382d5e1682a42ed3eace8b63d9b1[m
+Author: zhangqi-chen <wshchzhq@gmail.com>
+Date:   Thu Jan 29 15:09:58 2026 +0800
+
+    Rewrite kernels to use PTO tile-based operations
+    
+    - Update kernel_add to use 128x128 tile size (from 64x64) and replace
+      Event-based synchronization with explicit set_flag/wait_flag calls
+    - Refactor kernel_mul from loop-based to tile-based implementation
+      using TMUL instruction with 128x128 tiles
+    - Refactor kernel_add_scalar from loop-based to tile-based implementation
+      using TADDS instruction with 128x128 tiles
+    
+    All kernels now follow consistent PTO tile-based patterns with unified
+    tile configuration and pipeline synchronization.
+
+[33mcommit 056f0e6f02332f867285f1dae4b805da25f84157[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Jan 29 14:35:07 2026 +0800
+
+    Reorganize project structure and update documentation
+    
+    - Rename example/ to examples/host_build_graph_example/
+    - Add CLAUDE.md with developer role directory assignments
+    - Update README.md to reflect current code structure:
+      - Update architecture diagram paths
+      - Update directory structure section with platform/runtime hierarchy
+      - Update all file references to correct paths (src/platform/a2a3/*)
+      - Add references to src/runtime/host_build_graph/
+      - Add new python modules to directory listing
+    - Update ci.sh for new example path
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 887720695a864c0af3b2b1b04a6718b940912dc3[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Jan 29 14:22:58 2026 +0800
+
+    Refactor kernel_add to use PTO tile-based operations
+    
+    Replace simple for-loop implementation with tile-based approach using
+    GlobalTensor, Tile, and synchronization events for optimized tensor
+    addition on AI accelerators.
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 499ba1a01b633b7b90664037acaf3ebfcc73e9ae[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Thu Jan 29 12:26:34 2026 +0800
+
+    Rename compile_kernel to compile_incore and add integration tests
+    
+    - Rename PTOCompiler.compile_kernel() to compile_incore() for clarity
+    - Update example/main.py to use the new method name
+    - Add integration tests for RuntimeBuilder with real Ascend compilation
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 62b68917d23d6c42a9a14b0a7f581df685c330f2[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Jan 28 21:32:06 2026 +0800
+
+    Add RuntimeBuilder and reorganize runtime code structure
+    
+    - Add python/runtime_builder.py for building runtime from orchestration functions
+    - Add orchestration example (example_orch.cpp/h) demonstrating task graph building
+    - Reorganize runtime code into src/runtime/host_build_graph/ directory
+    - Update CI script to run pytest tests before examples
+    - Add tests/test_runtime_builder.py for RuntimeBuilder testing
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 3efb77c6b6bd9b06c09c508edcedf3df3c8ebee7[m
+Author: poursoul <49787929+poursoul@users.noreply.github.com>
+Date:   Wed Jan 28 20:32:23 2026 +0800
+
+    add .clang-format and format code (#10)
+
+[33mcommit fc6752cdf4593d08100632865d28cfddc8c6ebaf[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Wed Jan 28 14:55:23 2026 +0800
+
+    Simplify AicpuExecutor API and unify naming conventions (#8)
+    
+    ## Summary
+    This PR simplifies the AICPU executor interface and improves code consistency through refactoring and renaming.
+    
+    ## Changes
+    - **Rename**: `runtimeexecutor.cpp` → `aicpu_executor.cpp`, `RuntimeExecutor` → `AicpuExecutor`
+    - **Remove redundant parameter**: Removed `runtimeCtx` from `KernelArgs` structure
+    - **Simplify API**: Reduced redundant input parameters in executor methods
+    - **Unify naming**: Changed global variable `g_executor` → `g_aicpu_executor` for better clarity
+    
+    ## Files Changed
+    - `src/runtime/aicpu/runtimeexecutor.cpp` → `src/runtime/aicpu/aicpu_executor.cpp`
+    - `src/platform/a2a3/aicpu/kernel.cpp`
+    - `src/platform/a2a3/common/kernel_args.h`
+    - `src/platform/a2a3/host/devicerunner.cpp`
+    - `example/main.py`
+    
+    ## Impact
+    - Cleaner and more consistent naming convention
+    - Simplified function signatures with fewer parameters
+    - No functional behavior changes
+    
+    Co-authored-by: ChaoZheng <zhengchao47@huawei.com>
+
+[33mcommit 8a6bf0b4acb75c779b546b0a857abf5e5879f8fe[m
+Author: poursoul <poursoul@126.com>
+Date:   Wed Jan 28 11:19:28 2026 +0800
+
+    support extern func define in aicore
+
+[33mcommit 368678b6d8c1fdcfbd20a5e9457d0e7ede83dd02[m[33m ([m[1;31mcp/main[m[33m)[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Wed Jan 28 11:11:22 2026 +0800
+
+    Refactor: Complete Graph to Runtime renaming and API simplification
+    
+    Complete the renaming from "Graph" to "Runtime" across all components to better reflect the system's purpose as a task execution runtime rather than just a graph data structure. Simplify the Python API by consolidating device initialization and execution into a single launch_runtime() function.
+    
+    Changes:
+    - Rename Graph class to Runtime throughout C++ codebase
+    - Update all function names: InitGraph → InitRuntime, ValidateGraph → FinalizeRuntime, launch_graph → launch_runtime
+    - Rename GraphHandle to RuntimeHandle in C API
+    - Simplify Python API: remove DeviceRunner from public interface, consolidate initialization into launch_runtime()
+    - Update all documentation, comments, and examples to reflect new terminology
+    - Update terminology in README and example documentation
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 44b551d501c8a76a7c9cd7e9aba6c90d1e69caac[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Jan 27 23:06:26 2026 +0800
+
+    Migrate AICore kernel compilation from C++ to Python and simplify DeviceRunner API
+    
+    This commit fundamentally restructures how AICore kernels are compiled and
+    loaded, moving kernel compilation responsibility from C++ to Python and
+    simplifying the device runtime API.
+    
+    Key changes:
+    
+    **Kernel Compilation Migration:**
+    - Extract kernel compilation from C++ (kernel_compiler.cpp/h) to Python
+    - Add PTOCompiler class for Python-side kernel compilation using ccec
+    - Add elf_parser.py for extracting .text sections from ELF object files
+    - Remove binary_loader.cpp/h and kernel_compiler.cpp/h (replaced by Python)
+    - Kernels now compiled and registered at Python layer before runtime execution
+    
+    **DeviceRunner API Simplification:**
+    - Replace DeviceRunner Init/Run/Finalize with set_device() and launch_graph()
+    - Remove pto_isa_root parameter (no longer needed after moving compilation to Python)
+    - Add RegisterKernel() API for kernel binary registration
+    - DeviceRunner now auto-finalizes via destructor (no manual Finalize needed)
+    - Device initialization split into set_device() (early) and lazy binary loading (in launch_graph)
+    
+    **Runtime API Changes:**
+    - Change Runtime allocation from C++ new/delete to placement new pattern
+    - Add GetGraphSize() for user-side buffer allocation
+    - Rename ValidateGraph() to FinalizeGraph() to better reflect responsibility
+    - Remove function_cache.h (kernel lookup now uses direct registration)
+    
+    **AICore Executor Abstraction:**
+    - Extract aicore_executor.h with core type and device args abstraction
+    - Add DeviceArgs struct to replace uint64_t kernel parameters
+    - Refactor kernel.cpp to use new executor pattern
+    
+    **Documentation and Testing:**
+    - Update example/main.py to demonstrate new Python-first workflow
+    - Simplify README testing instructions (use ./ci.sh)
+    - Add ci.sh for streamlined testing
+    
+    Net result: -270 lines, cleaner separation of concerns, Python has full control
+    over kernel compilation and registration lifecycle.
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+
+[33mcommit 48991fadf3a70c471ed95be6537eabc7e56b7a15[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Tue Jan 27 22:50:01 2026 +0800
+
+    完善rename细节 (#4)
+    
+    This PR enhances type safety in the AICPU executor with the following improvements:
+    
+    Enhanced Type Safety: Changed AicpuExecute function parameter from void* arg to Runtime* runtime, eliminating unsafe void pointer usage
+    Code Cleanup: Removed unnecessary type casting code auto runtime = (Runtime *)arg;
+    Naming Consistency: Renamed GraphExecutor to RuntimeExecutor for consistency with previous refactoring efforts
+    Simplified Dependencies: Removed unnecessary kernel_args.h include
+
+[33mcommit 28fae3f0fba8a2031260bff347c4e8764ab32974[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Tue Jan 27 22:26:31 2026 +0800
+
+    efactor: Rename Graph to Runtime to Better Reflect Its Responsibility (#3)
+    
+    This PR performs a comprehensive renaming refactoring across the codebase, unifying all Graph-related naming to Runtime to more accurately reflect the module's actual responsibility—managing the task runtime execution environment, rather than merely representing a task dependency graph.
+    
+    Major Changes
+    
+    File and Directory Renaming
+    src/runtime/graph/ → src/runtime/runtime/
+    graph.h/cpp → runtime.h/cpp
+    graphexecutor.cpp → runtimeexecutor.cpp
+    graphmaker.cpp → runtimemaker.cpp
+    2. Class and Type Renaming
+    
+    class Graph → class Runtime
+    GraphExecutor → RuntimeExecutor (struct name unchanged, but responsibilities updated)
+    3. Macro Definition Renaming
+    
+    GRAPH_MAX_TASKS → RUNTIME_MAX_TASKS
+    GRAPH_MAX_ARGS → RUNTIME_MAX_ARGS
+    GRAPH_MAX_FANOUT → RUNTIME_MAX_FANOUT
+    GRAPH_MAX_WORKER → RUNTIME_MAX_WORKER
+    4. Variable and Field Renaming
+    
+    KernelArgs.graphArgs → KernelArgs.runtimeArgs
+    KernelArgs.runtime → KernelArgs.runtimeCtx (to avoid naming conflict)
+    All local variables renamed from graph-related names to runtime
+    5. Method Renaming
+    
+    print_graph() → print_runtime()
+    InitGraphArgs() → InitGraphArgs() (kept unchanged, parameter types updated)
+
+[33mcommit 56b31919bb956a8f32eac582531934f13b76da37[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Tue Jan 27 21:19:15 2026 +0800
+
+    Refactor AICPU core assignment to support dynamic block distribution (#2)
+    
+    # Summary
+    Improved the GraphExecutor core assignment logic to properly distribute AICore resources across multiple threads based on block_dim configuration.
+    
+    # Key Changes
+    - Changed core limit validation from per-thread to total cores check
+    - Implemented block-based core assignment: each thread now manages blocks_per_thread blocks (each block = 1 AIC + 2 AIV cores)
+    - Added validation to ensure block_dim is divisible by thread_num
+    - Fixed core utilization issue where only 33% of cores were assigned
+    
+    # Example
+    With 6 blocks and 3 threads, each thread manages 2 blocks:
+    
+    - Thread 0: AIC[0,1] + AIV[6,7,8,9]
+    - Thread 1: AIC[2,3] + AIV[10,11,12,13]
+    - Thread 2: AIC[4,5] + AIV[14,15,16,17]
+
+[33mcommit 3bee0c151f6c4a4c09c35d224f3ef3e34c0e4262[m
+Author: ChaoZheng109 <82073877+ChaoZheng109@users.noreply.github.com>
+Date:   Tue Jan 27 20:22:49 2026 +0800
+
+    Multi-threaded AICPU Scheduler with Parallel Task Dispatch
+    
+    Multi-threaded AICPU Scheduler with Parallel Task Dispatch
+    
+    # Summary
+    Implements multi-threaded parallel task scheduling for AICPU, enabling concurrent task dispatch to AICore Cube and AICore Vector cores. Also corrects documentation inconsistencies to match the current API.
+    
+    ## Key Changes
+    Multi-threading Architecture
+    
+    - Multiple AICPU threads dispatch tasks in parallel (configurable via launch_aicpu_num)
+    - Each thread manages a dedicated set of cores (1 AICore Cube + 2 AICore Vector)
+    - Shared task queues with thread-safe atomic operations for load balancing
+    
+    Core Implementation
+    
+    - New GraphExecutor class with thread-safe task queue management
+    - Atomic fanin counter for dependency tracking across threads
+    - Separate ready queues for AICore Cube (AIC) and AICore Vector (AIV) tasks
+    - Parallel handshake and shutdown across all threads
+
+[33mcommit a233dbf9945ed5f14fbc9606db09104e3b3a63d3[m
+Author: wcwxy <26245345+ChaoWao@users.noreply.github.com>
+Date:   Tue Jan 27 11:28:42 2026 +0800
+
+    Initial commit: PTO Runtime task graph execution framework
+    
+    Add modular runtime for building and executing task dependency graphs
+    on Ascend devices with coordinated AICPU and AICore execution.
+    
+    Components:
+    - Host runtime (src/platform/a2a3/host/): Device management, memory
+      allocation, kernel compilation, and C API for Python bindings
+    - AICPU kernel (src/platform/a2a3/aicpu/): Task scheduler for device
+    - AICore kernel (src/platform/a2a3/aicore/): Computation kernel entry
+    - Runtime layer (src/runtime/): Graph structures and executors
+    - Python bindings (python/): ctypes wrapper, binary compiler, toolchain
+    - Example (example/): Demo with add/mul kernels showing graph execution
+    
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>

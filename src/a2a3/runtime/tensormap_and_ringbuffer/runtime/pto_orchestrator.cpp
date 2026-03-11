@@ -74,11 +74,12 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 #endif
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid) do { \
-    _t1 = get_sys_cnt_aicpu(); \
-    acc += (_t1 - _t0); \
-    _t0 = _t1; \
-} while(0)
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                    \
+    do {                                                                              \
+        _t1 = get_sys_cnt_aicpu();                                                    \
+        acc += (_t1 - _t0);                                                           \
+        _t0 = _t1;                                                                    \
+    } while (0)
 #else
 #define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc)
@@ -242,13 +243,21 @@ void pto2_submit_task(
     task.task_id = task_id;
     task.kernel_id = kernel_id;
     task.worker_type = worker_type;
-    task.fanin_count = 0;
-    task.fanout_head = nullptr;
-    task.fanout_lock.store(0, std::memory_order_relaxed);
-    // Initial fanout_count = 1 (the owning scope holds one reference)
-    task.fanout_count = 1;
     task.packed_buffer_base = NULL;
     task.packed_buffer_end = NULL;
+
+    // Initialize slot state (scheduler-private)
+    PTO2SchedulerState* sched = orch->scheduler;
+    if (sched) {
+        PTO2TaskSlotState& slot_state = sched->slot_states[slot];
+        slot_state.fanin_count = 0;
+        slot_state.fanout_head = nullptr;
+        slot_state.fanout_lock.store(0, std::memory_order_relaxed);
+        // Initial fanout_count = 1 (the owning scope holds one reference)
+        slot_state.fanout_count = 1;
+        slot_state.fanout_refcount.store(0, std::memory_order_release);
+        slot_state.fanin_refcount.store(0, std::memory_order_release);
+    }
 
     // Register this task in its owning scope
     scope_tasks_push(orch, task_id);
@@ -264,6 +273,7 @@ void pto2_submit_task(
         payload->is_tensor[i] = params[i].type != PTOParamType::SCALAR;
         if (payload->is_tensor[i]) {
             payload->tensors[i].copy(*params[i].tensor);
+            payload->tensors[i].update_start_offset();
         } else {
             payload->scalar_value[i] = params[i].scalar_value;
         }
@@ -373,13 +383,12 @@ void pto2_submit_task(
 
     // === STEP 5: Finalize fanin list ===
     // First build the fanin list
-    if (orch->scheduler) {
-        PTO2SchedulerState* sched = orch->scheduler;
-
+    if (sched) {
+        PTO2TaskSlotState& cur_slot_state = sched->slot_states[slot];
         // Initialize scheduler state BEFORE adding to producer fanout lists,
         // so concurrent on_task_complete can safely access task_state/fanout_refcount.
-        sched->task_state[slot].store(PTO2_TASK_PENDING, std::memory_order_relaxed);
-        sched->fanout_refcount[slot].store(0, std::memory_order_relaxed);
+        cur_slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+        cur_slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
 
         auto& dep_pool = orch->dep_pool;
         if (orch->dep_pool_cur_entry == nullptr) {
@@ -387,7 +396,7 @@ void pto2_submit_task(
         }
 
         int32_t early_finished = 0;
-        task.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
+        cur_slot_state.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
         payload->fanin_actual_count = fanin_count;
         for (int i = 0; i < fanin_count; i++) {
             payload->fanin_tasks[i] = fanin_temp[i];
@@ -396,33 +405,33 @@ void pto2_submit_task(
             int32_t producer_task_id = fanin_temp[i];
             // Add this task to producer's fanout list (with spinlock)
             int32_t prod_slot = task_ring.get_task_slot(producer_task_id);
-            PTO2TaskDescriptor& producer = task_ring.get_task_by_slot(prod_slot);
+            PTO2TaskSlotState& producer_slot_state = sched->slot_states[prod_slot];
+            orch->dep_pool_cur_entry->task_id = task_id;
+            orch->dep_pool_cur_entry->next = producer_slot_state.fanout_head;
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-            pto2_fanout_lock(producer, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
+            pto2_fanout_lock(producer_slot_state, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
 #else
-            pto2_fanout_lock(producer);
+            pto2_fanout_lock(producer_slot_state);
 #endif
             // Normal path: prepend consumer to producer's fanout list
-            producer.fanout_count += 1;
-            int32_t prod_state = sched->task_state[prod_slot].load(std::memory_order_acquire);
+            producer_slot_state.fanout_count += 1;
+            int32_t prod_state = producer_slot_state.task_state.load(std::memory_order_acquire);
             if (prod_state >= PTO2_TASK_COMPLETED) {
                 // Early return optimization: if producer already completed, we can skip adding dependency and directly
                 // decrement fanin_count
                 early_finished++;
             } else {
-                orch->dep_pool_cur_entry->task_id = task_id;
-                orch->dep_pool_cur_entry->next = producer.fanout_head;
-                producer.fanout_head = orch->dep_pool_cur_entry;
+                producer_slot_state.fanout_head = orch->dep_pool_cur_entry;
             }
-            pto2_fanout_unlock(producer);
-            if (producer.fanout_head == orch->dep_pool_cur_entry) {
+            pto2_fanout_unlock(producer_slot_state);
+            if (producer_slot_state.fanout_head == orch->dep_pool_cur_entry) {
                 orch->dep_pool_cur_entry = &dep_pool.alloc();
             }
         }
         // Combined release: merge early_finished batch + init_task's +1 release
         // into a single atomic fetch_add (saves one acq_rel cache-line bounce per task).
         int32_t initial_refcount = early_finished + 1;  // +1 for the init release
-        int32_t new_rc = sched->fanin_refcount[slot].fetch_add(initial_refcount, std::memory_order_acq_rel)
+        int32_t new_rc = cur_slot_state.fanin_refcount.fetch_add(initial_refcount, std::memory_order_acq_rel)
                          + initial_refcount;
         if (new_rc >= fanin_count + 1) {
             sched->ready_queues[task.worker_type].push(task_id);

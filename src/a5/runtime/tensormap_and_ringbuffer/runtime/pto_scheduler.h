@@ -455,7 +455,7 @@ struct PTO2SchedulerState {
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     bool release_fanin_and_check_ready(int32_t task_id, PTO2TaskDescriptor* task,
                                         uint64_t& atomic_count, uint64_t& push_wait,
-                                        PTO2LocalReadyBuffer* local_buf = nullptr) {
+                                        PTO2LocalReadyBuffer* local_buf) {
         int32_t slot = pto2_task_slot(task_id);
 
         int32_t new_refcount = fanin_refcount[slot].fetch_add(1, std::memory_order_acq_rel) + 1;

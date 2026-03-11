@@ -198,18 +198,16 @@ struct AicpuExecutor {
         out->kernel_id = task->kernel_id;
         out->core_type = CT;
         out->function_bin_addr = runtime->get_function_bin_addr(task->kernel_id);
-        int32_t n = 0;
+        out->num_args = task_payload->param_count;
 
         for (int32_t i = 0; i < task_payload->param_count; i++) {
             if (!task_payload->is_tensor[i]) {
-                out->args[n++] = task_payload->scalar_value[i];
+                out->args[i] = task_payload->scalar_value[i];
             } else {
-                out->args[n++] = reinterpret_cast<uint64_t>(&task_payload->tensors[i]);
-                task_payload->tensors[i].update_start_offset();
+                out->args[i] = reinterpret_cast<uint64_t>(&task_payload->tensors[i]);
+                // task_payload->tensors[i].update_start_offset();
             }
         }
-
-        out->num_args = n;
     }
 
     // Template methods for Phase 1 and Phase 2

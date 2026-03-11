@@ -355,8 +355,8 @@ struct PTO2TaskRing {
         int32_t active_count = task_id - last_alive;
 
         // Check if there's room (leave at least 1 slot empty)
-        if (active_count < window_size - 1) {
-            int32_t slot = task_id & (window_size - 1);
+        if (active_count < PTO2_TASK_WINDOW_MASK) {
+            int32_t slot = task_id & PTO2_TASK_WINDOW_MASK;
             PTO2TaskDescriptor* task = &descriptors[slot];
             task->task_id = task_id;
             return task_id;
@@ -367,12 +367,12 @@ struct PTO2TaskRing {
         return -1;
     }
 
-    int32_t get_task_slot(int32_t task_id) const { return task_id & (window_size - 1); }
+    int32_t get_task_slot(int32_t task_id) const { return task_id & PTO2_TASK_WINDOW_MASK; }
 
     /**
     * Get task descriptor by ID
     */
-    PTO2TaskDescriptor& get_task(int32_t task_id) { return descriptors[task_id & (window_size - 1)]; }
+    PTO2TaskDescriptor& get_task(int32_t task_id) { return descriptors[task_id & PTO2_TASK_WINDOW_MASK]; }
 
     /**
     * Get task descriptor by task slot

@@ -234,8 +234,23 @@ struct PTO2OrchProfilingData {
 /**
  * Get and reset orchestrator profiling data.
  * Returns accumulated profiling data and resets counters.
+ * Thread-local: returns data for the calling thread only.
  */
 PTO2OrchProfilingData pto2_orchestrator_get_profiling();
+
+/**
+ * Thread-local profiling counter accessors.
+ * Used by ring buffers and scheduler (other translation units) to accumulate
+ * per-thread profiling data without extern thread_local (avoids TLS relocation
+ * issues on aarch64 shared libraries).
+ */
+uint64_t& pto2_orch_alloc_wait_cycle();
+uint64_t& pto2_orch_heap_wait_cycle();
+uint64_t& pto2_orch_alloc_atomic_count();
+uint64_t& pto2_orch_heap_atomic_count();
+uint64_t& pto2_orch_scope_end_atomic_count();
+uint64_t& pto2_orch_fanin_wait_cycle();
+uint64_t& pto2_orch_fanin_atomic_count();
 #endif
 
 #endif  // PTO_ORCHESTRATOR_H

@@ -33,6 +33,17 @@
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
 
+// Thread-local profiling counter accessors (defined in pto_orchestrator.cpp)
+#if PTO2_ORCH_PROFILING
+uint64_t& pto2_orch_alloc_wait_cycle();
+uint64_t& pto2_orch_heap_wait_cycle();
+uint64_t& pto2_orch_alloc_atomic_count();
+uint64_t& pto2_orch_heap_atomic_count();
+uint64_t& pto2_orch_scope_end_atomic_count();
+uint64_t& pto2_orch_fanin_wait_cycle();
+uint64_t& pto2_orch_fanin_atomic_count();
+#endif
+
 // Set to 1 to enable periodic BLOCKED/Unblocked messages during spin-wait.
 #ifndef PTO2_SPIN_VERBOSE_LOGGING
 #define PTO2_SPIN_VERBOSE_LOGGING 1
@@ -102,12 +113,10 @@ struct PTO2HeapRing {
 #endif
 #if PTO2_ORCH_PROFILING
                 if (waiting) {
-                    extern uint64_t g_orch_heap_wait_cycle;
-                    g_orch_heap_wait_cycle += (get_sys_cnt_aicpu() - wait_start);
+                    pto2_orch_heap_wait_cycle() += (get_sys_cnt_aicpu() - wait_start);
                 }
                 {
-                    extern uint64_t g_orch_heap_atomic_count;
-                    g_orch_heap_atomic_count += spin_count + 1;  // spin_count retries + 1 success (each try_alloc = 1 load)
+                    pto2_orch_heap_atomic_count() += spin_count + 1;  // spin_count retries + 1 success (each try_alloc = 1 load)
                 }
 #endif
                 return ptr;
@@ -294,12 +303,10 @@ struct PTO2TaskRing {
 #endif
 #if PTO2_ORCH_PROFILING
                 if (waiting) {
-                    extern uint64_t g_orch_alloc_wait_cycle;
-                    g_orch_alloc_wait_cycle += (get_sys_cnt_aicpu() - wait_start);
+                    pto2_orch_alloc_wait_cycle() += (get_sys_cnt_aicpu() - wait_start);
                 }
                 {
-                    extern uint64_t g_orch_alloc_atomic_count;
-                    g_orch_alloc_atomic_count += spin_count + 1;  // spin_count retries + 1 success (each try_alloc = 1 load)
+                    pto2_orch_alloc_atomic_count() += spin_count + 1;  // spin_count retries + 1 success (each try_alloc = 1 load)
                 }
 #endif
                 return task_id;

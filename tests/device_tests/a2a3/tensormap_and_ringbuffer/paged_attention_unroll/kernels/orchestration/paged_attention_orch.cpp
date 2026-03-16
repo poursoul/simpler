@@ -127,7 +127,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
     CYCLE_COUNT_LAP(prof_ext_tensor);
 
-    for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+    for (uint64_t b_idx = orch_thread_index; b_idx < batch; b_idx += orch_thread_num) {
         uint64_t cur_seq = host_context_lens[b_idx];
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
@@ -164,6 +164,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 CYCLE_COUNT_LAP(prof_submit_task);
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
+                    PTO2_SCOPE_GUARD(rt);
                     uint64_t n_blocks = std::min((uint64_t)N_UNROLL, bn_this_batch - bn);
 
                     // Prepare block indices for this group

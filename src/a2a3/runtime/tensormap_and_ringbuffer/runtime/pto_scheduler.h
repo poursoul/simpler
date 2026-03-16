@@ -509,9 +509,9 @@ struct PTO2SchedulerState {
 
     void on_scope_end(PTO2TaskSlotState** task_slot_states, int32_t count) {
 #if PTO2_ORCH_PROFILING
-        extern uint64_t g_orch_scope_end_atomic_count;
+        uint64_t& scope_end_cnt = pto2_orch_scope_end_atomic_count();
         for (int32_t i = 0; i < count; i++) {
-            release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
+            release_producer(*task_slot_states[i], scope_end_cnt);
         }
 #else
         for (int32_t i = 0; i < count; i++) {

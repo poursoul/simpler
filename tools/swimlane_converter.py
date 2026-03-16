@@ -290,7 +290,8 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
 
 def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose=False,
                                 scheduler_phases=None, orchestrator_data=None,
-                                orchestrator_phases=None, core_to_thread=None):
+                                orchestrator_phases=None, core_to_thread=None,
+                                orchestrator_list=None):
     """Generate Chrome Trace Event Format JSON from task data.
 
     Args:
@@ -608,7 +609,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 events.append(event)
 
     # AICPU Orchestrator event (version 2)
-    if orchestrator_phases or orchestrator_data:
+    if orchestrator_phases or orchestrator_data or orchestrator_list:
         # Process metadata
         events.append({
             "args": {"name": "AICPU Orchestrator"},
@@ -641,7 +642,18 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 "pid": 4,
                 "tid": tid
             })
-        if not orch_threads and orchestrator_data:
+        if not orch_threads and orchestrator_list:
+            for orch_idx in range(len(orchestrator_list)):
+                tid = 4000 + orch_idx
+                events.append({
+                    "args": {"name": f"Orch_{orch_idx}"},
+                    "cat": "__metadata",
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": 4,
+                    "tid": tid
+                })
+        elif not orch_threads and orchestrator_data:
             events.append({
                 "args": {"name": "Orchestrator"},
                 "cat": "__metadata",
@@ -700,6 +712,39 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                     "dur": dur
                 }
                 events.append(event)
+
+    elif orchestrator_list and len(orchestrator_list) > 1:
+        # Multiple orchestrators: one bar per orchestrator thread
+        for orch in orchestrator_list:
+            orch_idx = orch.get("orch_idx", 0)
+            tid = 4000 + orch_idx
+            orch_start = orch["start_time_us"]
+            orch_end = orch["end_time_us"]
+            orch_dur = orch_end - orch_start
+            phase_us = orch.get("phase_us", {})
+
+            orch_args = {
+                "orch_idx": orch_idx,
+                "submit_count": orch.get("submit_count", 0),
+            }
+            total_phase_us = sum(phase_us.values())
+            if total_phase_us > 0:
+                for phase_name, dur in phase_us.items():
+                    if dur > 0:
+                        pct = dur / total_phase_us * 100
+                        orch_args[f"{phase_name}_us"] = round(dur, 3)
+                        orch_args[f"{phase_name}_%"] = round(pct, 1)
+
+            events.append({
+                "args": orch_args,
+                "cat": "orchestrator",
+                "name": f"Orch_{orch_idx}({orch.get('submit_count', 0)} tasks)",
+                "ph": "X",
+                "pid": 4,
+                "tid": tid,
+                "ts": orch_start,
+                "dur": orch_dur
+            })
 
     elif orchestrator_data:
         # Fallback: cumulative summary as single bar
@@ -1046,6 +1091,12 @@ Examples:
         # Extract version 2 data if available
         scheduler_phases = data.get('aicpu_scheduler_phases')
         orchestrator_data = data.get('aicpu_orchestrator')
+        # Support new per-orchestrator array format (aicpu_orchestrators)
+        # and convert to legacy single-object format for backwards compatibility
+        orchestrator_list = data.get('aicpu_orchestrators')
+        if orchestrator_list and not orchestrator_data:
+            # Use first orchestrator as the legacy single-object fallback
+            orchestrator_data = orchestrator_list[0] if len(orchestrator_list) == 1 else None
         orchestrator_phases = data.get('aicpu_orchestrator_phases')
         core_to_thread = data.get('core_to_thread')
 
@@ -1054,7 +1105,10 @@ Examples:
                 total_phase_records = sum(len(t) for t in scheduler_phases)
                 print(f"  Scheduler threads: {len(scheduler_phases)}")
                 print(f"  Total phase records: {total_phase_records}")
-            if orchestrator_data:
+            if orchestrator_list:
+                for orch in orchestrator_list:
+                    print(f"  Orchestrator[{orch.get('orch_idx', '?')}]: {orch.get('submit_count', 0)} tasks")
+            elif orchestrator_data:
                 print(f"  Orchestrator: {orchestrator_data.get('submit_count', 0)} tasks")
             if orchestrator_phases:
                 total_orch = sum(len(t) for t in orchestrator_phases)
@@ -1068,7 +1122,8 @@ Examples:
                                    scheduler_phases=scheduler_phases,
                                    orchestrator_data=orchestrator_data,
                                    orchestrator_phases=orchestrator_phases,
-                                   core_to_thread=core_to_thread)
+                                   core_to_thread=core_to_thread,
+                                   orchestrator_list=orchestrator_list)
 
         print(f"\n✓ Conversion complete")
         print(f"  Input:  {input_path}")

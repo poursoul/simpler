@@ -44,25 +44,36 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
     AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
-static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
-static uint64_t g_orch_alloc_cycle = 0;      // task ring alloc
-static uint64_t g_orch_params_cycle = 0;     // param copy
-static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
-static uint64_t g_orch_heap_cycle = 0;       // heap alloc + output assign
-static uint64_t g_orch_insert_cycle = 0;     // tensormap insert
-static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
-static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
-static int64_t  g_orch_submit_count = 0;
-static uint32_t g_orch_submit_idx = 0;
-uint64_t g_orch_alloc_wait_cycle = 0;
-uint64_t g_orch_heap_wait_cycle = 0;
-uint64_t g_orch_fanin_wait_cycle = 0;
-uint64_t g_orch_alloc_atomic_count = 0;
-uint64_t g_orch_params_atomic_count = 0;
-uint64_t g_orch_heap_atomic_count = 0;
-uint64_t g_orch_fanin_atomic_count = 0;
-uint64_t g_orch_finalize_atomic_count = 0;
-uint64_t g_orch_scope_end_atomic_count = 0;
+// thread_local: each orchestrator thread accumulates its own profiling data
+static thread_local uint64_t g_orch_sync_cycle = 0;       // tensormap sync
+static thread_local uint64_t g_orch_alloc_cycle = 0;      // task ring alloc
+static thread_local uint64_t g_orch_params_cycle = 0;     // param copy
+static thread_local uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
+static thread_local uint64_t g_orch_heap_cycle = 0;       // heap alloc + output assign
+static thread_local uint64_t g_orch_insert_cycle = 0;     // tensormap insert
+static thread_local uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
+static thread_local uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
+static thread_local int64_t  g_orch_submit_count = 0;
+static thread_local uint32_t g_orch_submit_idx = 0;
+static thread_local uint64_t g_orch_alloc_wait_cycle = 0;
+static thread_local uint64_t g_orch_heap_wait_cycle = 0;
+static thread_local uint64_t g_orch_fanin_wait_cycle = 0;
+static thread_local uint64_t g_orch_alloc_atomic_count = 0;
+static thread_local uint64_t g_orch_params_atomic_count = 0;
+static thread_local uint64_t g_orch_heap_atomic_count = 0;
+static thread_local uint64_t g_orch_fanin_atomic_count = 0;
+static thread_local uint64_t g_orch_finalize_atomic_count = 0;
+static thread_local uint64_t g_orch_scope_end_atomic_count = 0;
+
+// Accessor functions for thread_local counters used from other translation units
+// (ring buffers, scheduler). Using functions avoids TLS relocation issues on aarch64.
+uint64_t& pto2_orch_alloc_wait_cycle() { return g_orch_alloc_wait_cycle; }
+uint64_t& pto2_orch_heap_wait_cycle() { return g_orch_heap_wait_cycle; }
+uint64_t& pto2_orch_alloc_atomic_count() { return g_orch_alloc_atomic_count; }
+uint64_t& pto2_orch_heap_atomic_count() { return g_orch_heap_atomic_count; }
+uint64_t& pto2_orch_scope_end_atomic_count() { return g_orch_scope_end_atomic_count; }
+uint64_t& pto2_orch_fanin_wait_cycle() { return g_orch_fanin_wait_cycle; }
+uint64_t& pto2_orch_fanin_atomic_count() { return g_orch_fanin_atomic_count; }
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
 #define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                    \
@@ -79,7 +90,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
     AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
-static uint32_t g_orch_submit_idx = 0;
+static thread_local uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_START()                                                           \
     bool _prof_active = orch->enable_profiling;                                       \
     uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0

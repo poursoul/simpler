@@ -279,7 +279,8 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
     s_phase_header->num_cores = 0;
 
     memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
-    memset(&s_phase_header->orch_summary, 0, sizeof(AicpuOrchSummary));
+    s_phase_header->num_orch_threads = num_orch_threads;
+    memset(s_phase_header->orch_summaries, 0, sizeof(s_phase_header->orch_summaries));
 
     // Cache per-thread record pointers and clear buffers
     // Include all threads: scheduler + orchestrator (orchestrators may become schedulers)
@@ -446,12 +447,17 @@ void perf_aicpu_record_phase(int thread_idx,
     buf->count = idx + 1;
 }
 
-void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src) {
+void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src, int orch_idx) {
     if (s_phase_header == nullptr) {
         return;
     }
 
-    AicpuOrchSummary* dst = &s_phase_header->orch_summary;
+    if (orch_idx < 0 || orch_idx >= PLATFORM_MAX_AICPU_THREADS) {
+        LOG_ERROR("perf_aicpu_write_orch_summary: orch_idx=%d out of range", orch_idx);
+        return;
+    }
+
+    AicpuOrchSummary* dst = &s_phase_header->orch_summaries[orch_idx];
 
     memcpy(dst, src, sizeof(AicpuOrchSummary));
     dst->magic = AICPU_PHASE_MAGIC;

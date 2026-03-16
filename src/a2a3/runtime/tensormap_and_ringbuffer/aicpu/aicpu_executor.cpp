@@ -1752,7 +1752,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 orch_summary.fanin_cycle = p.fanin_cycle;
                 orch_summary.scope_end_cycle = p.scope_end_cycle;
                 orch_summary.submit_count = p.submit_count;
-                perf_aicpu_write_orch_summary(&orch_summary);
+                perf_aicpu_write_orch_summary(&orch_summary, orch_idx);
             }
 #endif
 #endif

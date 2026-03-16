@@ -843,15 +843,23 @@ void PerformanceCollector::collect_phase_data() {
         }
     }
 
-    // Read orchestrator summary
-    collected_orch_summary_ = phase_header->orch_summary;
-    bool orch_valid = (collected_orch_summary_.magic == AICPU_PHASE_MAGIC);
+    // Read per-orchestrator summaries
+    num_orch_threads_ = static_cast<int>(phase_header->num_orch_threads);
+    if (num_orch_threads_ > PLATFORM_MAX_AICPU_THREADS) {
+        num_orch_threads_ = PLATFORM_MAX_AICPU_THREADS;
+    }
+    bool orch_valid = false;
+    for (int i = 0; i < num_orch_threads_; i++) {
+        collected_orch_summaries_[i] = phase_header->orch_summaries[i];
+        if (collected_orch_summaries_[i].magic == AICPU_PHASE_MAGIC) {
+            orch_valid = true;
+            LOG_INFO("  Orchestrator[%d]: %lld tasks, %.3fus",
+                     i, (long long)collected_orch_summaries_[i].submit_count,
+                     cycles_to_us(collected_orch_summaries_[i].end_time - collected_orch_summaries_[i].start_time));
+        }
+    }
 
-    if (orch_valid) {
-        LOG_INFO("  Orchestrator: %lld tasks, %.3fus",
-                 (long long)collected_orch_summary_.submit_count,
-                 cycles_to_us(collected_orch_summary_.end_time - collected_orch_summary_.start_time));
-    } else {
+    if (!orch_valid) {
         LOG_INFO("  Orchestrator: no summary data");
     }
 
@@ -944,10 +952,12 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                 }
             }
         }
-        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC &&
-            collected_orch_summary_.start_time > 0 &&
-            collected_orch_summary_.start_time < base_time_cycles) {
-            base_time_cycles = collected_orch_summary_.start_time;
+        for (int oi = 0; oi < num_orch_threads_; oi++) {
+            if (collected_orch_summaries_[oi].magic == AICPU_PHASE_MAGIC &&
+                collected_orch_summaries_[oi].start_time > 0 &&
+                collected_orch_summaries_[oi].start_time < base_time_cycles) {
+                base_time_cycles = collected_orch_summaries_[oi].start_time;
+            }
         }
     }
 
@@ -1068,26 +1078,44 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         }
         outfile << "  ]";
 
-        // AICPU orchestrator summary
-        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC) {
-            double orch_start_us = cycles_to_us(collected_orch_summary_.start_time - base_time_cycles);
-            double orch_end_us = cycles_to_us(collected_orch_summary_.end_time - base_time_cycles);
+        // AICPU orchestrator summaries (per-orchestrator thread)
+        bool has_any_orch = false;
+        for (int oi = 0; oi < num_orch_threads_; oi++) {
+            if (collected_orch_summaries_[oi].magic == AICPU_PHASE_MAGIC) {
+                has_any_orch = true;
+                break;
+            }
+        }
+        if (has_any_orch) {
+            outfile << ",\n  \"aicpu_orchestrators\": [\n";
+            bool first_orch = true;
+            for (int oi = 0; oi < num_orch_threads_; oi++) {
+                const auto& s = collected_orch_summaries_[oi];
+                if (s.magic != AICPU_PHASE_MAGIC) continue;
+                if (!first_orch) outfile << ",\n";
+                first_orch = false;
 
-            outfile << ",\n  \"aicpu_orchestrator\": {\n";
-            outfile << "    \"start_time_us\": " << std::fixed << std::setprecision(3) << orch_start_us << ",\n";
-            outfile << "    \"end_time_us\": " << std::fixed << std::setprecision(3) << orch_end_us << ",\n";
-            outfile << "    \"submit_count\": " << collected_orch_summary_.submit_count << ",\n";
-            outfile << "    \"phase_us\": {\n";
-            outfile << "      \"sync\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.sync_cycle) << ",\n";
-            outfile << "      \"alloc\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.alloc_cycle) << ",\n";
-            outfile << "      \"params\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.params_cycle) << ",\n";
-            outfile << "      \"lookup\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.lookup_cycle) << ",\n";
-            outfile << "      \"heap\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.heap_cycle) << ",\n";
-            outfile << "      \"insert\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.insert_cycle) << ",\n";
-            outfile << "      \"fanin\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.fanin_cycle) << ",\n";
-            outfile << "      \"scope_end\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.scope_end_cycle) << "\n";
-            outfile << "    }\n";
-            outfile << "  }";
+                double orch_start_us = cycles_to_us(s.start_time - base_time_cycles);
+                double orch_end_us = cycles_to_us(s.end_time - base_time_cycles);
+
+                outfile << "    {\n";
+                outfile << "      \"orch_idx\": " << oi << ",\n";
+                outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << orch_start_us << ",\n";
+                outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << orch_end_us << ",\n";
+                outfile << "      \"submit_count\": " << s.submit_count << ",\n";
+                outfile << "      \"phase_us\": {\n";
+                outfile << "        \"sync\": " << std::fixed << std::setprecision(3) << cycles_to_us(s.sync_cycle) << ",\n";
+                outfile << "        \"alloc\": " << std::fixed << std::setprecision(3) << cycles_to_us(s.alloc_cycle) << ",\n";
+                outfile << "        \"params\": " << std::fixed << std::setprecision(3) << cycles_to_us(s.params_cycle) << ",\n";
+                outfile << "        \"lookup\": " << std::fixed << std::setprecision(3) << cycles_to_us(s.lookup_cycle) << ",\n";
+                outfile << "        \"heap\": " << std::fixed << std::setprecision(3) << cycles_to_us(s.heap_cycle) << ",\n";
+                outfile << "        \"insert\": " << std::fixed << std::setprecision(3) << cycles_to_us(s.insert_cycle) << ",\n";
+                outfile << "        \"fanin\": " << std::fixed << std::setprecision(3) << cycles_to_us(s.fanin_cycle) << ",\n";
+                outfile << "        \"scope_end\": " << std::fixed << std::setprecision(3) << cycles_to_us(s.scope_end_cycle) << "\n";
+                outfile << "      }\n";
+                outfile << "    }";
+            }
+            outfile << "\n  ]";
         }
 
         // Per-task orchestrator phase records (filtered from unified collected_phase_records_)

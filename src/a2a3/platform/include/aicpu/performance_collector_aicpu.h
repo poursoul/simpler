@@ -115,8 +115,9 @@ void perf_aicpu_record_phase(int thread_idx,
  * for host-side collection.
  *
  * @param src Pointer to populated AicpuOrchSummary (magic field is set internally)
+ * @param orch_idx Orchestrator thread index (0 to num_orch_threads-1)
  */
-void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src);
+void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src, int orch_idx);
 
 /**
  * Set orchestrator thread index for per-task phase recording

@@ -362,7 +362,8 @@ private:
 
     // AICPU phase profiling data (per-thread, mixed sched + orch records)
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
-    AicpuOrchSummary collected_orch_summary_{};
+    int num_orch_threads_{0};
+    AicpuOrchSummary collected_orch_summaries_[PLATFORM_MAX_AICPU_THREADS]{};
     bool has_phase_data_{false};
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)

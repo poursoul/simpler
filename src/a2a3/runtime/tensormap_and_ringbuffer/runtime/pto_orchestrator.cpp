@@ -384,6 +384,21 @@ void pto2_submit_mixed_task(
     PTO2TaskDescriptor& task = task_ring.get_task_by_slot(slot);
     PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[slot];
 
+    // Early write-prefetch payload GM cache lines to issue RFO in background.
+    // ~130 lines of computation (output_size, lookup, insert) follow before
+    // param_copy writes, giving ample time for prefetch to complete.
+    for (int32_t i = 0; i < params.tensor_count; i++) {
+        __builtin_prefetch(&payload->tensors[i], 1, 0);
+        __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 0);
+    }
+    for (int32_t j = 0; j < params.scalar_count; j += 8) {
+        __builtin_prefetch(&payload->scalars[j], 1, 0);
+    }
+    // Metadata area: tensor_count, scalar_count, fanin_slot_states[], fanin_actual_count
+    __builtin_prefetch(&payload->tensor_count, 1, 0);
+    __builtin_prefetch(&payload->fanin_slot_states[0], 1, 0);
+    __builtin_prefetch(&payload->fanin_slot_states[8], 1, 0);
+
     // Initialize mixed-task descriptor
     task.mixed_task_id = task_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
@@ -509,9 +524,18 @@ void pto2_submit_mixed_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, task_id);
 
+    // Prefetch all producer slot_states (1 cache line each, random access).
+    // param_copy below provides hide time for these RFOs to complete.
+    if (sched) {
+        for (int i = 0; i < fanin_count; i++) {
+            __builtin_prefetch(&sched->slot_states[fanin_slots[i]], 1, 0);
+        }
+    }
+
     payload->tensor_count = params.tensor_count;
     payload->scalar_count = params.scalar_count;
     // === Copy tensors + scalars to GM payload ===
+    // dst cache lines already prefetched after slot allocation (early prefetch).
     auto dst_tensors = payload->tensors;
     auto src_tensors = params.tensors;
     for (int32_t i = 0; i < params.tensor_count; i++) {

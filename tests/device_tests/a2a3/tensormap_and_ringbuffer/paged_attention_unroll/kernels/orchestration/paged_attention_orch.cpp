@@ -153,13 +153,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 
-                PTOParam params_inplace[] = {
-                    make_output_param(oi),
-                    make_output_param(li_update),
-                    make_output_param(mi_update),
-                };
+                PTOParam params_inplace;
+                params_inplace.add_output(oi);
+                params_inplace.add_output(li_update);
+                params_inplace.add_output(mi_update);
                 CYCLE_COUNT_LAP(prof_param_setup);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace, 3);
+                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -184,15 +183,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
 
-                    PTOParam params_qk[4 + N_UNROLL];
-                    params_qk[0] = make_input_param(qi);
-                    params_qk[1] = make_input_param(key_cache);
-                    params_qk[2] = make_output_param(sij_buf);
-                    params_qk[3] = make_scalar_param(n_blocks);
-                    for (int i = 0; i < N_UNROLL; i++)
-                        params_qk[4 + i] = make_scalar_param(block_indices[i]);
+                    PTOParam params_qk;
+                    params_qk.add_input(qi);
+                    params_qk.add_input(key_cache);
+                    params_qk.add_output(sij_buf);
+                    params_qk.add_scalar(n_blocks);
+                    params_qk.add_scalars(block_indices, N_UNROLL);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk, 4 + N_UNROLL);
+                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -204,17 +202,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     prof_make_count += 3;
                     CYCLE_COUNT_LAP(prof_make_tensor);
 
-                    PTOParam params_sf[] = {
-                        make_input_param(sij_buf),
-                        make_scalar_param(float_to_u64(scale_value)),
-                        make_output_param(pij_buf),
-                        make_output_param(mi),
-                        make_output_param(li),
-                        make_scalar_param(n_blocks),
-                        make_scalar_param(valid_len_last),
-                    };
+                    PTOParam params_sf;
+                    params_sf.add_input(sij_buf);
+                    params_sf.add_scalar(float_to_u64(scale_value));
+                    params_sf.add_output(pij_buf);
+                    params_sf.add_output(mi);
+                    params_sf.add_output(li);
+                    params_sf.add_scalar(n_blocks);
+                    params_sf.add_scalar(valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf, 7);
+                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -224,15 +221,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
 
-                    PTOParam params_pv[4 + N_UNROLL];
-                    params_pv[0] = make_input_param(pij_buf);
-                    params_pv[1] = make_input_param(value_cache);
-                    params_pv[2] = make_output_param(oi_new);
-                    params_pv[3] = make_scalar_param(n_blocks);
-                    for (int i = 0; i < N_UNROLL; i++)
-                        params_pv[4 + i] = make_scalar_param(block_indices[i]);
+                    PTOParam params_pv;
+                    params_pv.add_input(pij_buf);
+                    params_pv.add_input(value_cache);
+                    params_pv.add_output(oi_new);
+                    params_pv.add_scalar(n_blocks);
+                    params_pv.add_scalars(block_indices, N_UNROLL);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv, 4 + N_UNROLL);
+                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -241,19 +237,18 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    PTOParam params_up[] = {
-                        make_input_param(mi),
-                        make_input_param(li),
-                        make_input_param(oi_new),
-                        make_inout_param(mi_update),
-                        make_inout_param(li_update),
-                        make_inout_param(oi),
-                        make_output_param(out_view),
-                        make_scalar_param(is_first),
-                        make_scalar_param(is_last),
-                    };
+                    PTOParam params_up;
+                    params_up.add_input(mi);
+                    params_up.add_input(li);
+                    params_up.add_input(oi_new);
+                    params_up.add_inout(mi_update);
+                    params_up.add_inout(li_update);
+                    params_up.add_inout(oi);
+                    params_up.add_output(out_view);
+                    params_up.add_scalar(is_first);
+                    params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up, 9);
+                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
                 }

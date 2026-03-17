@@ -80,7 +80,6 @@ uint64_t& pto2_orch_fanin_atomic_count() { return g_orch_fanin_atomic_count; }
     do {                                                                              \
         _t1 = get_sys_cnt_aicpu();                                                    \
         acc += (_t1 - _t0);                                                           \
-        perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
         _t0 = _t1;                                                                    \
     } while (0)
 #elif PTO2_PROFILING
@@ -312,13 +311,12 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // Task Submission
 // =============================================================================
 void pto2_submit_mixed_task(
-    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, PTOParam* params, int32_t num_params) {
+    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const PTOParam& params) {
     CYCLE_COUNT_START();
 
     // === Validate submit inputs ===
     uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
     always_assert(active_mask != 0 && "MixedKernels must have at least one active slot");
-    always_assert((params != nullptr || num_params == 0) && "params must not be null when num_params > 0");
 
     // Normalize single-AIV tasks: if only aiv1 is set, move it to the aiv0 slot.
     // This guarantees the dispatch path can always use PTO2SubtaskSlot::AIV0 for
@@ -415,38 +413,20 @@ void pto2_submit_mixed_task(
     }
 
     // Register this task in its owning scope
-    
+
+
+    // Temporary storage for fanin (stores slot indices, not task_ids)
+    int32_t fanin_slots[PTO2_MAX_INPUTS];
+    int32_t fanin_count = 0;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id);
 
-    // Temporary storage for fanin
-    int32_t fanin_temp[PTO2_MAX_INPUTS];
-    int32_t fanin_count = 0;
-
-    payload->param_count = num_params;
-    for (int i = 0; i < num_params; i++) {
-        payload->is_tensor[i] = params[i].type != PTOParamType::SCALAR;
-        if (payload->is_tensor[i]) {
-            payload->tensors[i].copy(*params[i].tensor);
-        } else {
-            payload->scalar_value[i] = params[i].scalar_value;
-        }
-    }
-
-    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id);
-#if PTO2_ORCH_PROFILING
-    g_orch_params_atomic_count += 2;  // fanout_lock.store + fanout_count.store
-#endif
-
-    // Temporary storage for collecting output sizes
+    // === Calculate output size + heap alloc (read from params only, no GM access) ===
     int32_t total_output_size = 0;
-    for (int i = 0; i < num_params; i++) {
-        if (params[i].type != PTOParamType::OUTPUT) {
-            continue;
-        }
-        // Only allocate from ring buffer when caller did not provide an address
-        if (payload->tensors[i].buffer.addr == 0) {
-            total_output_size += PTO2_ALIGN_UP(payload->tensors[i].buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+    for (int i = 0; i < params.tensor_count; i++) {
+        if (params.tensor_types[i] == PTOParamType::OUTPUT
+            && params.tensors[i]->buffer.addr == 0) {
+            total_output_size += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
 
@@ -461,26 +441,26 @@ void pto2_submit_mixed_task(
     }
 #endif
 
-    // === STEP 2: First pass - set output addr and process tensor ===
+    // === Lookup inputs + assign output addrs (all from params, no GM) ===
     int32_t offset = 0;
-    for (int i = 0; i < num_params; i++) {
-        PTOParamType ptype = params[i].type;
+    for (int i = 0; i < params.tensor_count; i++) {
+        PTOParamType ptype = params.tensor_types[i];
 
         switch (ptype) {
             case PTOParamType::INOUT:
             case PTOParamType::INPUT: {
-                // Look up producer via TensorMap
+                // Look up producer via TensorMap (reads from cached stack tensor)
                 PTO2LookupResult lookup_result;
-                orch->tensor_map.lookup(payload->tensors[i], lookup_result);
+                orch->tensor_map.lookup(*params.tensors[i], lookup_result);
 
                 for (int r = 0; r < lookup_result.count; r++) {
                     PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
                     auto overlap_status = lookup_result.entries[r].overlap_status;
                     // Check if this producer is already in fanin list (avoid duplicates)
-                    int producer_task_id = entry.producer_task_id;
+                    int32_t prod_slot = task_ring.get_task_slot(entry.producer_task_id);
                     bool already_added = false;
                     for (int j = 0; j < fanin_count; j++) {
-                        if (fanin_temp[j] == producer_task_id) {
+                        if (fanin_slots[j] == prod_slot) {
                             already_added = true;
                             break;
                         }
@@ -489,7 +469,7 @@ void pto2_submit_mixed_task(
                     if (!already_added) {
                         // Add to fanin list (this task depends on producer)
                         if (fanin_count < PTO2_MAX_INPUTS) {
-                            fanin_temp[fanin_count++] = producer_task_id;
+                            fanin_slots[fanin_count++] = prod_slot;
                         }
                     }
                     if (ptype == PTOParamType::INOUT && overlap_status == OverlapStatus::COVERED) {
@@ -506,34 +486,47 @@ void pto2_submit_mixed_task(
             }
 
             case PTOParamType::OUTPUT: {
-                auto& tensor = payload->tensors[i];
+                Tensor& tensor = *params.tensors[i];
                 if (tensor.buffer.addr == 0) {
                     uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)task.packed_buffer_base + offset);
                     tensor.buffer.addr = alloc_addr;
-                    // Write back allocated address to caller's original Tensor
-                    params[i].tensor->buffer.addr = alloc_addr;
                     offset += PTO2_ALIGN_UP(tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
                 break;
             }
-            default:
-                break;
         }
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id);
 
-
-    // === STEP 4: Second pass - register outputs in TensorMap ===
-    for (int i = 0; i < num_params; i++) {
-        PTOParamType ptype = params[i].type;
+    // === Register outputs/inouts in TensorMap (must be separate from lookup) ===
+    for (int i = 0; i < params.tensor_count; i++) {
+        PTOParamType ptype = params.tensor_types[i];
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
-            // Register in TensorMap: this tensor is produced by task_id (mixed_task_id)
-            orch->tensor_map.insert(payload->tensors[i], task_id, ptype == PTOParamType::OUTPUT);
+            orch->tensor_map.insert(*params.tensors[i], task_id, ptype == PTOParamType::OUTPUT);
         }
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, task_id);
+
+    payload->tensor_count = params.tensor_count;
+    payload->scalar_count = params.scalar_count;
+    // === Copy tensors + scalars to GM payload ===
+    auto dst_tensors = payload->tensors;
+    auto src_tensors = params.tensors;
+    for (int32_t i = 0; i < params.tensor_count; i++) {
+        dst_tensors[i] = *src_tensors[i];
+    }
+    auto dst_scalars = payload->scalars;
+    auto src_scalars = params.scalars;
+    for (int32_t i = 0; i < params.scalar_count; i++) {
+        dst_scalars[i] = src_scalars[i];
+    }
+
+    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id);
+#if PTO2_ORCH_PROFILING
+    g_orch_params_atomic_count += 2;  // fanout_lock.store + fanout_count.store
+#endif
 
     // === STEP 5: Finalize fanin list ===
     // First build the fanin list
@@ -556,12 +549,10 @@ void pto2_submit_mixed_task(
         cur_slot_state.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
         payload->fanin_actual_count = fanin_count;
         for (int i = 0; i < fanin_count; i++) {
-            payload->fanin_slot_states[i] = &sched->get_slot_state_by_slot(task_ring.get_task_slot(fanin_temp[i]));
+            payload->fanin_slot_states[i] = &sched->slot_states[fanin_slots[i]];
         }
         for (int i = 0; i < fanin_count; i++) {
-            int32_t producer_task_id = fanin_temp[i];
-            // Add this task to producer's fanout list (with spinlock)
-            int32_t prod_slot = task_ring.get_task_slot(producer_task_id);
+            int32_t prod_slot = fanin_slots[i];
             PTO2TaskSlotState& producer_slot_state = sched->slot_states[prod_slot];
             orch->dep_pool_cur_entry->slot_state = &cur_slot_state;
             orch->dep_pool_cur_entry->next = producer_slot_state.fanout_head;

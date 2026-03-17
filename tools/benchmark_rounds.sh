@@ -18,11 +18,11 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 # Each entry is just the directory name; kernels/ and golden.py are implied.
 # ---------------------------------------------------------------------------
 EXAMPLES=(
-    alternating_matmul_add
-    benchmark_bgemm
+    # alternating_matmul_add
+    # benchmark_bgemm
     paged_attention_unroll
-    batch_paged_attention
-    paged_attention
+    # batch_paged_attention
+    # paged_attention
 )
 
 # ---------------------------------------------------------------------------

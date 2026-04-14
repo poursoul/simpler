@@ -186,6 +186,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 Arg params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
+                    PTO2_SCOPE_GUARD();
                     uint64_t n_blocks = std::min(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
 
                     // Valid length for last block in this group

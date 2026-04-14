@@ -85,6 +85,29 @@ const char *pto2_task_state_name(PTO2TaskState state) {
 }
 
 // =============================================================================
+// SPSC Queue Implementation
+// =============================================================================
+
+bool pto2_spsc_queue_init(PTO2SpscQueue *queue, uint64_t capacity) {
+    queue->slots = (PTO2TaskSlotState **)malloc(capacity * sizeof(PTO2TaskSlotState *));
+    if (!queue->slots) {
+        return false;
+    }
+    queue->capacity = capacity;
+    queue->mask = capacity - 1;
+    queue->head.store(0, std::memory_order_relaxed);
+    queue->tail.store(0, std::memory_order_relaxed);
+    return true;
+}
+
+void pto2_spsc_queue_destroy(PTO2SpscQueue *queue) {
+    if (queue->slots) {
+        free(queue->slots);
+        queue->slots = nullptr;
+    }
+}
+
+// =============================================================================
 // Ready Queue Implementation
 // =============================================================================
 
@@ -148,9 +171,6 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHandle *sm_handle,
         slot_states[i].ring_id = 0;
     }
 
-    wiring_batch_count = 0;
-    wiring_batch_index = 0;
-
     return true;
 }
 
@@ -191,29 +211,29 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
         }
     }
 
-    // Initialize per-ring wiring queues and dep pools (exclusively managed by scheduler thread 0)
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (!pto2_ready_queue_init(&sched->ring_sched_states[r].wiring_queue, PTO2_WRIRING_QUEUE_SIZE)) {
-            for (int j = 0; j < r; j++) {
-                pto2_ready_queue_destroy(&sched->ring_sched_states[j].wiring_queue);
-                free(sched->ring_sched_states[j].dep_pool.base);
-            }
-            for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-                pto2_ready_queue_destroy(&sched->ready_queues[i]);
-            }
-            for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
-                sched->ring_sched_states[rr].destroy();
-            }
-            return false;
+    // Initialize global wiring queue (exclusively consumed by scheduler thread 0)
+    if (!pto2_spsc_queue_init(&sched->wiring_queue, PTO2_WRIRING_QUEUE_SIZE)) {
+        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+            pto2_ready_queue_destroy(&sched->ready_queues[i]);
         }
+        for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
+            sched->ring_sched_states[rr].destroy();
+        }
+        return false;
+    }
+    sched->wiring_batch_count = 0;
+    sched->wiring_batch_index = 0;
+    sched->wiring_finished = false;
+
+    // Initialize per-ring dep pools (exclusively managed by scheduler thread 0)
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         PTO2DepListEntry *dep_entries =
             reinterpret_cast<PTO2DepListEntry *>(calloc(dep_pool_capacity, sizeof(PTO2DepListEntry)));
         if (!dep_entries) {
-            pto2_ready_queue_destroy(&sched->ring_sched_states[r].wiring_queue);
             for (int j = 0; j < r; j++) {
-                pto2_ready_queue_destroy(&sched->ring_sched_states[j].wiring_queue);
                 free(sched->ring_sched_states[j].dep_pool.base);
             }
+            pto2_spsc_queue_destroy(&sched->wiring_queue);
             for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
                 pto2_ready_queue_destroy(&sched->ready_queues[i]);
             }
@@ -233,8 +253,9 @@ void pto2_scheduler_destroy(PTO2SchedulerState *sched) {
         sched->ring_sched_states[r].destroy();
         free(sched->ring_sched_states[r].dep_pool.base);
         sched->ring_sched_states[r].dep_pool.base = nullptr;
-        pto2_ready_queue_destroy(&sched->ring_sched_states[r].wiring_queue);
     }
+
+    pto2_spsc_queue_destroy(&sched->wiring_queue);
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);

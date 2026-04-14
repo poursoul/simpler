@@ -97,7 +97,7 @@
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
 
 // Wiring queue
-#define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
+#define PTO2_WRIRING_QUEUE_SIZE 1024  // Global wiring queue size
 
 // Memory alignment
 #define PTO2_ALIGN_SIZE 64             // Cache line alignment

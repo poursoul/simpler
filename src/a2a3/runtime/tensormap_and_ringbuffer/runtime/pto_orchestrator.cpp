@@ -345,23 +345,24 @@ static bool pto2_prepare_task(
         auto &rs = out->sched->ring_sched_states[ring_id];
         out->slot_state = &rs.get_slot_state_by_slot(out->alloc_result.slot);
         PTO2TaskSlotState &slot_state = *out->slot_state;
-        slot_state.fanout_head = nullptr;
-        slot_state.fanout_lock.store(0, std::memory_order_relaxed);
+
+        // Bulk-zero the entire cache line, then set the few non-zero fields.
+        // Most fields init to 0: fanout_lock, fanout_head(nullptr), task_state(PENDING=0),
+        // fanin_refcount, fanout_refcount, subtask_done_mask, completed_subtasks, next_block_idx.
+        // On ARM64 this compiles to a pair of stp xzr instructions (2 stores for 64 bytes),
+        // much cheaper than 11 individual stores + 6 atomic stores.
+        memset(&slot_state, 0, sizeof(PTO2TaskSlotState));
+
+        // Non-zero fields (7 stores vs 18 in the field-by-field path)
         slot_state.fanout_count = 1;
-        slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
-        slot_state.fanin_refcount.store(0, std::memory_order_relaxed);
-        slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
-        slot_state.completed_subtasks.store(0, std::memory_order_relaxed);
-        slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
-        int16_t block_num = args.launch_spec.block_num();
-        slot_state.total_required_subtasks =
-            static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
-        slot_state.logical_block_num = block_num;
-        slot_state.next_block_idx = 0;
         slot_state.payload = out->payload;
         slot_state.task = out->task;
         slot_state.active_mask = active_mask;
         slot_state.ring_id = ring_id;
+        int16_t block_num = args.launch_spec.block_num();
+        slot_state.total_required_subtasks =
+            static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
+        slot_state.logical_block_num = block_num;
         // fanin_count is set by scheduler during wiring
         scope_tasks_push(orch, &slot_state);
     } else {
@@ -734,8 +735,8 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
             producer->fanout_count += 1;
         });
 
-        // Push to per-ring wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-        while (!sched->ring_sched_states[ring_id].wiring_queue.push(&cur_slot_state)) {
+        // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
+        while (!sched->wiring_queue.push(&cur_slot_state)) {
             SPIN_WAIT_HINT();
         }
 #if PTO2_ORCH_PROFILING

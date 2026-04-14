@@ -129,7 +129,8 @@ struct alignas(64) CoreExecState {
 #if PTO2_PROFILING
     // --- Profiling fields (dispatch path, compile-time gated) ---
     uint32_t dispatch_count;              // offset 40: dispatched task count (buffer mgmt)
-    uint32_t pad1_;                       // offset 44: alignment padding for timestamp
+    uint16_t poll_miss_count;             // offset 44: consecutive poll misses (backoff)
+    uint16_t next_poll_at;                // offset 46: next miss count to poll at
     uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
     uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
 #else
@@ -424,6 +425,27 @@ struct AicpuExecutor {
         Runtime *runtime, int32_t thread_idx, const int32_t *cur_thread_cores, int32_t core_num, Handshake *hank
     );
 
+    // Idle-path checks (fatal error, stall diagnostics, timeout).
+    // Returns: 0 = continue, 1 = fatal error (break), -1 = timeout.
+    __attribute__((noinline)) int handle_idle_checks(
+        int32_t idle_iterations, PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t task_count,
+        int32_t last_progress_count, PTO2Runtime *rt, void *sm_base, Runtime *runtime, CoreTracker &tracker,
+        int32_t core_num
+#if PTO2_PROFILING
+        ,
+        uint64_t sched_start_ts
+#endif
+    );
+
+    // Exit check: orchestrator fatal error or normal completion.
+    // Returns: 0 = not done, 1 = fatal error (break), 2 = completed (break).
+    __attribute__((noinline)) int
+    check_exit_condition(Runtime *runtime, PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t &task_count);
+
+    // Core transition: wait for reassignment after orchestrator→scheduler handoff.
+    // Returns true if the caller should break out of the main loop.
+    __attribute__((noinline)) bool handle_core_transition(int32_t thread_idx);
+
     // --- Dual-slot state machine helpers ---
 
     // SlotTransition: pure event signals from a single register poll.
@@ -473,7 +495,7 @@ struct AicpuExecutor {
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
         PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
-        PTO2LocalReadyBuffer *local_bufs, CoreType ct
+        PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
         ,
         bool profiling_enabled, uint32_t &phase_complete_count, uint64_t dispatch_ts
@@ -485,8 +507,7 @@ struct AicpuExecutor {
 #endif
     ) {
 #if !PTO2_PROFILING
-        (void)hank;
-        (void)ct;
+        (void)hank;  // NOLINT(readability/casting)
 #endif
         bool mixed_complete = rt->scheduler.on_subtask_complete(slot_state);
         if (mixed_complete) {
@@ -511,13 +532,10 @@ struct AicpuExecutor {
                     int32_t fe = rt->scheduler.on_task_release(
                         *deferred_release_slot_states[--deferred_release_count], thread_idx
                     );
-#else
-                    int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-                    (void)fe;
-#if PTO2_SCHED_PROFILING
                     fanin_edges_total += fe;
                     if (fe > fanin_max_degree) fanin_max_degree = fe;
+#else
+                    rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
                 }
                 deferred_release_slot_states[deferred_release_count++] = &slot_state;
@@ -527,37 +545,75 @@ struct AicpuExecutor {
 
 #if PTO2_PROFILING
         if (profiling_enabled) {
+            record_completion_perf(
+                slot_state, expected_reg_task_id, subslot, core_id, hank, dispatch_ts
 #if PTO2_SCHED_PROFILING
-            uint64_t t_perf_start = get_sys_cnt_aicpu();
+                ,
+                sched_complete_perf_cycle
 #endif
-            Handshake *h = &hank[core_id];
-            uint64_t finish_ts = get_sys_cnt_aicpu();
-            PerfBuffer *perf_buf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
-
-            uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-            int32_t fanout_n = 0;
-            PTO2DepListEntry *cur = slot_state.fanout_head;
-            while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
-                fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
-                cur = cur->next;
-            }
-
-            int32_t perf_slot_idx = static_cast<int32_t>(subslot);
-            if (perf_aicpu_complete_record(
-                    perf_buf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                    slot_state.task->kernel_id[perf_slot_idx], ct, dispatch_ts, finish_ts, fanout_arr, fanout_n
-                ) != 0) {
-                DEV_ERROR(
-                    "Core %d: perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
-                    static_cast<uint64_t>(slot_state.task->task_id.raw)
-                );
-            }
-#if PTO2_SCHED_PROFILING
-            sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
-#endif
+            );
         }
 #endif
     }
+
+#if PTO2_PROFILING
+    // --- Profiling cold-path helpers (noinline to keep hot loops compact) ---
+
+    __attribute__((noinline)) void record_completion_perf(
+        PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t core_id,
+        Handshake *hank, uint64_t dispatch_ts
+#if PTO2_SCHED_PROFILING
+        ,
+        uint64_t &sched_complete_perf_cycle
+#endif
+    ) {
+#if PTO2_SCHED_PROFILING
+        uint64_t t_perf_start = get_sys_cnt_aicpu();
+#endif
+        Handshake *h = &hank[core_id];
+        uint64_t finish_ts = get_sys_cnt_aicpu();
+        PerfBuffer *perf_buf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
+
+        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
+        int32_t fanout_n = 0;
+        PTO2DepListEntry *cur = slot_state.fanout_head;
+        while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
+            fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
+            cur = cur->next;
+        }
+
+        int32_t perf_slot_idx = static_cast<int32_t>(subslot);
+        if (perf_aicpu_complete_record(
+                perf_buf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+                slot_state.task->kernel_id[perf_slot_idx], h->core_type, dispatch_ts, finish_ts, fanout_arr, fanout_n
+            ) != 0) {
+            DEV_ERROR(
+                "Core %d: perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
+                static_cast<uint64_t>(slot_state.task->task_id.raw)
+            );
+        }
+#if PTO2_SCHED_PROFILING
+        sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
+#endif
+    }
+
+    __attribute__((noinline)) void record_dispatch_perf(Runtime *runtime, int32_t core_id) {
+        CoreExecState &core_exec_state = core_exec_states_[core_id];
+        if (core_exec_state.dispatch_count >= PLATFORM_PROF_BUFFER_SIZE) {
+            perf_aicpu_switch_buffer(runtime, core_id, 0);
+            core_exec_state.dispatch_count = 0;
+        }
+        core_exec_state.dispatch_count++;
+    }
+
+    __attribute__((noinline)) static void record_phase_perf(
+        int32_t thread_idx, AicpuPhaseId phase, uint64_t &t0_phase, uint64_t t1, uint64_t loop_count, uint32_t &count
+    ) {
+        perf_aicpu_record_phase(thread_idx, phase, t0_phase, t1, loop_count, count);
+        t0_phase = t1;
+        count = 0;
+    }
+#endif  // PTO2_PROFILING
 
     // Promote pending slot data to running slot. Clears pending fields.
     static void promote_pending_to_running(CoreExecState &core) {
@@ -577,7 +633,6 @@ struct AicpuExecutor {
         core.running_reg_task_id = AICPU_TASK_INVALID;
     }
 
-    template <CoreType CT>
     void check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
         bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
@@ -594,11 +649,20 @@ struct AicpuExecutor {
 #endif
     ) {
         CoreTracker &tracker = core_trackers_[thread_idx];
-        auto running_core_states = tracker.get_running_cores<CT>();
+        auto running_core_states = tracker.get_all_running_cores();
         while (running_core_states.has_value()) {
             int32_t bit_pos = running_core_states.pop_first();
             int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
             CoreExecState &core = core_exec_states_[core_id];
+
+            // Per-core exponential backoff: skip polling cores unlikely to have
+            // finished. next_poll_at doubles each miss (2,4,8,8,8,...), so newly
+            // dispatched cores poll densely while long-running ones are checked
+            // less often. Dispatch resets both counters to zero.
+            if (core.poll_miss_count < core.next_poll_at) {
+                core.poll_miss_count++;
+                continue;
+            }
 
             // --- Judgment phase: read register, derive transition ---
             uint64_t reg_val = read_reg(core.reg_addr, RegId::COND);
@@ -613,7 +677,16 @@ struct AicpuExecutor {
 
             SlotTransition t =
                 decide_slot_transition(reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id);
-            if (!t.matched) continue;
+            if (!t.matched) {
+                // Advance backoff: next poll after doubling the interval, capped at 8.
+                core.poll_miss_count = 0;
+                core.next_poll_at <<= 1;
+                continue;
+            }
+
+            // Completion detected — reset backoff for this core.
+            core.poll_miss_count = 0;
+            core.next_poll_at = 1;
 
 #if PTO2_SCHED_PROFILING
             if (profiling_enabled && (t.running_done || t.pending_done)) {
@@ -627,7 +700,7 @@ struct AicpuExecutor {
             if (t.pending_done) {
                 complete_slot_task(
                     *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs, CT
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                     ,
                     profiling_enabled, phase_complete_count, core.pending_dispatch_timestamp
@@ -643,7 +716,7 @@ struct AicpuExecutor {
             if (t.running_done) {
                 complete_slot_task(
                     *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs, CT
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                     ,
                     profiling_enabled, phase_complete_count, core.running_dispatch_timestamp
@@ -851,11 +924,7 @@ struct AicpuExecutor {
         }
 #if PTO2_PROFILING
         if (profiling_enabled) {
-            if (core_exec_state.dispatch_count >= PLATFORM_PROF_BUFFER_SIZE) {
-                perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
-                core_exec_state.dispatch_count = 0;
-            }
-            core_exec_state.dispatch_count++;
+            record_dispatch_perf(runtime, core_id);
         }
 #endif
 
@@ -1049,7 +1118,7 @@ struct AicpuExecutor {
     //   3. Dispatch: elected thread dispatches all blocks (one pass, resources guaranteed).
     //      Non-elected threads spin-wait until sync_start_pending == 0.
     //      During dispatch the elected thread has exclusive tracker access.
-    void handle_drain_mode(
+    __attribute__((noinline)) void handle_drain_mode(
         Runtime *runtime, int32_t thread_idx
 #if PTO2_PROFILING
         ,
@@ -1187,6 +1256,8 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         CoreType type = hank->core_type;
 
         core_exec_states_[i].reg_addr = reg_addr;
+        core_exec_states_[i].poll_miss_count = 0;
+        core_exec_states_[i].next_poll_at = 1;
 #if !PTO2_PROFILING
         core_exec_states_[i].worker_id = i;
         core_exec_states_[i].physical_core_id = physical_core_id;
@@ -1471,6 +1542,169 @@ int32_t AicpuExecutor::shutdown_aicore(
     return 0;
 }
 
+int AicpuExecutor::check_exit_condition(
+    Runtime *runtime, PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t &task_count
+) {
+    bool orch_done = orchestrator_done_;
+    if (!orch_done) return 0;
+
+    // Check for orchestrator fatal error — exit immediately
+    int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
+    if (orch_err != PTO2_ERROR_NONE) {
+        DEV_ERROR(
+            "Thread %d: Fatal error (code=%d), sending EXIT_SIGNAL to all cores. "
+            "completed_tasks=%d, total_tasks=%d",
+            thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
+        );
+        emergency_shutdown(runtime);
+        completed_.store(true, std::memory_order_release);
+        return 1;  // fatal error
+    }
+
+    // Normal exit: all tasks complete
+    task_count = total_tasks_;
+    if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
+        completed_.store(true, std::memory_order_release);
+        DEV_INFO(
+            "Thread %d: PTO2 completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed),
+            task_count
+        );
+        return 2;  // completed
+    }
+    return 0;
+}
+
+bool AicpuExecutor::handle_core_transition(int32_t thread_idx) {
+    (void)thread_idx;
+    if (!reassigned_.load(std::memory_order_acquire)) {
+        wait_reassign_.fetch_add(1, std::memory_order_release);
+        while (!reassigned_.load(std::memory_order_acquire)) {
+            if (completed_.load(std::memory_order_acquire)) {
+                break;
+            }
+            SPIN_WAIT_HINT();
+        }
+        if (completed_.load(std::memory_order_acquire)) {
+            return true;  // break
+        }
+    }
+    return false;
+}
+
+int AicpuExecutor::handle_idle_checks(
+    int32_t idle_iterations, PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t task_count,
+    int32_t last_progress_count, PTO2Runtime *rt, void *sm_base, Runtime *runtime, CoreTracker &tracker,
+    int32_t core_num
+#if PTO2_PROFILING
+    ,
+    uint64_t sched_start_ts
+#endif
+) {
+    // Check for orchestrator fatal error (every 1024 iterations)
+    if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
+        int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
+        if (orch_err != PTO2_ERROR_NONE) {
+            DEV_ERROR(
+                "Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores", thread_idx, orch_err
+            );
+            emergency_shutdown(runtime);
+            completed_.store(true, std::memory_order_release);
+            return 1;  // break
+        }
+    }
+
+    if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {
+        int32_t c = completed_tasks_.load(std::memory_order_relaxed);
+        DEV_ALWAYS(
+            "PTO2 stall: no progress for %d iterations, completed=%d total=%d (last progress at %d)", idle_iterations,
+            c, task_count, last_progress_count
+        );
+        PTO2SchedulerState *sched = &rt->scheduler;
+        PTO2SharedMemoryHeader *sm_header_diag = static_cast<PTO2SharedMemoryHeader *>(sm_base);
+        int32_t cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            int32_t ring_task_count = sm_header_diag->rings[r].fc.current_task_index.load(std::memory_order_relaxed);
+            for (int32_t si = 0; si < ring_task_count; si++) {
+                PTO2TaskSlotState &slot_state = sched->get_slot_state(r, si);
+                PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
+                int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
+                int32_t fi = slot_state.fanin_count;
+                int32_t kid = slot_state.task->kernel_id[0];
+                if (st >= PTO2_TASK_COMPLETED) continue;
+                if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) {
+                    cnt_inflight++;
+                    continue;
+                }
+                if (rc >= fi) {
+                    cnt_ready++;
+                    if (cnt_ready <= STALL_DUMP_READY_MAX) {
+                        DEV_ALWAYS(
+                            "  STUCK-READY  ring=%d task_id=%" PRId64 " kernel_id=%d refcount=%d fanin=%d state=%d", r,
+                            static_cast<int64_t>(slot_state.task->task_id.raw), kid, rc, fi, static_cast<int32_t>(st)
+                        );
+                    }
+                } else {
+                    cnt_waiting++;
+                    if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
+                        DEV_ALWAYS(
+                            "  STUCK-WAIT   ring=%d task_id=%" PRId64 " kernel_id=%d refcount=%d fanin=%d state=%d", r,
+                            static_cast<int64_t>(slot_state.task->task_id.raw), kid, rc, fi, static_cast<int32_t>(st)
+                        );
+                    }
+                }
+            }
+        }
+        DEV_ALWAYS("  scan result: stuck_ready=%d stuck_waiting=%d in_flight=%d", cnt_ready, cnt_waiting, cnt_inflight);
+        int32_t aic_running = tracker.get_running_count<CoreType::AIC>();
+        int32_t aiv_running = tracker.get_running_count<CoreType::AIV>();
+        int32_t total_running = aic_running + aiv_running;
+        DEV_ALWAYS(
+            "  thread=%d running_cores=%d (AIC=%d AIV=%d) core_num=%d", thread_idx, total_running, aic_running,
+            aiv_running, core_num
+        );
+        auto all_running = tracker.get_all_running_cores();
+        int32_t dump_count = 0;
+        int32_t bp;
+        while (dump_count < STALL_DUMP_CORE_MAX && (bp = all_running.pop_first()) >= 0) {
+            dump_count++;
+            int32_t cid = tracker.get_core_id_by_offset(bp);
+            int32_t sw_tid = core_exec_states_[cid].running_reg_task_id;
+            int32_t hw_kernel = -1;
+            if (sw_tid >= 0 && core_exec_states_[cid].running_slot_state) {
+                int32_t diag_slot = static_cast<int32_t>(core_exec_states_[cid].running_subslot);
+                hw_kernel = core_exec_states_[cid].running_slot_state->task->kernel_id[diag_slot];
+            }
+            uint64_t cond_reg = read_reg(core_exec_states_[cid].reg_addr, RegId::COND);
+            DEV_ALWAYS(
+                "    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d kernel=%d", cid, static_cast<unsigned>(cond_reg),
+                EXTRACT_TASK_STATE(cond_reg), EXTRACT_TASK_ID(cond_reg), sw_tid, hw_kernel
+            );
+        }
+        for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
+            int32_t offset = cli * 3;
+            DEV_ALWAYS(
+                "    cluster[%d] aic=%d(%s) aiv0=%d(%s) aiv1=%d(%s)", cli, tracker.get_aic_core_id(offset),
+                tracker.is_aic_core_idle(offset) ? "idle" : "busy", tracker.get_aiv0_core_id(offset),
+                tracker.is_aiv0_core_idle(offset) ? "idle" : "busy", tracker.get_aiv1_core_id(offset),
+                tracker.is_aiv1_core_idle(offset) ? "idle" : "busy"
+            );
+        }
+    }
+    if (idle_iterations > MAX_IDLE_ITERATIONS) {
+        DEV_ERROR("Thread %d: PTO2 timeout after %d idle iterations", thread_idx, idle_iterations);
+#if PTO2_PROFILING
+        uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
+        DEV_ALWAYS(
+            "Thread %d: sched_start=%" PRIu64 " sched_end(timeout)=%" PRIu64 " sched_cost=%.3fus", thread_idx,
+            static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts),
+            cycles_to_us(sched_timeout_ts - sched_start_ts)
+        );
+#endif
+        return -1;  // timeout
+    }
+    return 0;  // continue
+}
+
 int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t thread_idx) {
     int32_t &core_num = core_count_per_thread_[thread_idx];
     CoreTracker &tracker = core_trackers_[thread_idx];
@@ -1538,6 +1772,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     uint32_t phase_complete_count = 0;
     uint32_t phase_dispatch_count = 0;
 #if PTO2_SCHED_PROFILING
+    uint32_t sched_idle_count = 0;
     uint32_t phase_wiring_count = 0;
     uint64_t complete_probe_count = 0;
     uint64_t complete_hit_count = 0;
@@ -1567,6 +1802,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     PTO2TaskSlotState *deferred_release_slot_states[256];
     int32_t deferred_release_count = 0;
 
+    // Enqueue-position tracking: skip pop when queue hasn't changed since last empty result.
+    uint64_t last_empty_enqueue[PTO2_NUM_RESOURCE_SHAPES] = {};
+
     bool cores_released = false;
 
 #if PTO2_PROFILING
@@ -1582,48 +1820,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #endif
         int32_t task_count = 0;
         if (!tracker.has_any_running_cores()) {
-            bool orch_done = orchestrator_done_;
-            if (orch_done) {
-                // Check for orchestrator fatal error — exit immediately
-                int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
-                if (orch_err != PTO2_ERROR_NONE) {
-                    DEV_ERROR(
-                        "Thread %d: Fatal error (code=%d), sending EXIT_SIGNAL to all cores. "
-                        "completed_tasks=%d, total_tasks=%d",
-                        thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
-                    );
-                    emergency_shutdown(runtime);
-                    completed_.store(true, std::memory_order_release);
-                    break;
-                }
-
-                // Normal exit: all tasks complete
-                task_count = total_tasks_;
-                if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
-                    completed_.store(true, std::memory_order_release);
-                    DEV_INFO(
-                        "Thread %d: PTO2 completed tasks %d/%d", thread_idx,
-                        completed_tasks_.load(std::memory_order_relaxed), task_count
-                    );
-                    break;
-                }
-            }
+            int exit_rc = check_exit_condition(runtime, header, thread_idx, task_count);
+            if (exit_rc != 0) break;  // 1 = fatal error, 2 = completed
         }
 
         // Check for core transition request (execute once per thread)
         if (!cores_released && orch_to_sched_ && transition_requested_.load(std::memory_order_acquire)) {
-            if (!reassigned_.load(std::memory_order_acquire)) {
-                wait_reassign_.fetch_add(1, std::memory_order_release);
-                while (!reassigned_.load(std::memory_order_acquire)) {
-                    if (completed_.load(std::memory_order_acquire)) {
-                        break;
-                    }
-                    SPIN_WAIT_HINT();
-                }
-                if (completed_.load(std::memory_order_acquire)) {
-                    break;
-                }
-            }
+            if (handle_core_transition(thread_idx)) break;
             cores_released = true;
         }
 
@@ -1638,29 +1841,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         // Phase 1: Check running cores for completion, process and move to idle
         int32_t completed_this_turn = 0;
 
-        // Check AIC running cores
+        // Check all running cores
         bool try_completed = false;
-        if (tracker.has_running_cores<CoreType::AIC>()) {
+        if (tracker.has_any_running_cores()) {
             try_completed = true;
-            check_running_cores_for_completion<CoreType::AIC>(
-                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count, local_bufs
-#if PTO2_PROFILING
-                ,
-                profiling_enabled, phase_complete_count
-#endif
-#if PTO2_SCHED_PROFILING
-                ,
-                complete_probe_count, complete_hit_count, notify_edges_total, notify_max_degree, notify_tasks_enqueued,
-                fanin_edges_total, fanin_max_degree, sched_complete_perf_cycle
-#endif
-            );
-        }
-
-        // Check AIV running cores
-        if (tracker.has_running_cores<CoreType::AIV>()) {
-            try_completed = true;
-            check_running_cores_for_completion<CoreType::AIV>(
+            check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
@@ -1698,16 +1883,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         } else {
             CYCLE_COUNT_LAP(sched_complete_cycle);
             if (profiling_enabled && phase_complete_count > 0) {
-                perf_aicpu_record_phase(
+                record_phase_perf(
                     thread_idx, AicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, sched_loop_count, phase_complete_count
                 );
-                _t0_phase = _t1;
-                phase_complete_count = 0;
             }
         }
 #endif
-
-        bool try_pushed = false;
 
         // Phase 2 drain check: if a sync_start task is waiting for resources,
         // pause normal dispatch and let the drain protocol run.
@@ -1725,12 +1906,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         // Phase 3: Drain wiring queue — wire fanout edges for newly submitted tasks.
         // Only thread 0 does wiring to keep dep_pool single-threaded.
         if (thread_idx == 0) {
-            int wired = rt->scheduler.drain_wiring_queue();
-            if (wired > 0) {
-                made_progress = true;
+            if (orchestrator_done_ || rt->scheduler.wiring_queue.size() >= 16) {
+                int wired = rt->scheduler.drain_wiring_queue();
+                if (wired > 0) {
+                    made_progress = true;
 #if PTO2_SCHED_PROFILING
-                phase_wiring_count += wired;
+                    phase_wiring_count += wired;
 #endif
+                }
             }
         }
 #if PTO2_PROFILING
@@ -1739,113 +1922,50 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 
         // Phase 4: Dispatch
         const PTO2ResourceShape *dispatch_order = get_dispatch_order(thread_idx);
+        PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS];
         bool entered_drain = false;
+        bool try_pushed = false;
 
-        // === Idle dispatch: assign tasks to cores with both slots free ===
-        for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES && !entered_drain; si++) {
-            PTO2ResourceShape shape = dispatch_order[si];
-            auto valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
-            if (!valid_cluster_states.has_value()) {
-                continue;
+        // Fast-path: skip entire dispatch phase when no new tasks could be ready.
+        // All local buffers empty AND all global queues unchanged since last empty pop.
+        bool has_new_ready = false;
+        for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
+            if (local_bufs[si].count > 0) {
+                has_new_ready = true;
+                break;
             }
-            auto &local_buf = local_bufs[static_cast<int32_t>(shape)];
-
-            while (valid_cluster_states.has_value() && !entered_drain) {
-                int want = valid_cluster_states.count();
-                PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS];
-                int got = pop_ready_tasks_batch(
-                    shape, thread_idx, local_buf, batch, want
-#if PTO2_SCHED_PROFILING
-                    ,
-                    pop_hit, pop_miss, local_dispatch_count, sched_dispatch_pop_cycle
-#endif
-                );
-                if (got == 0) break;
-
-                for (int bi = 0; bi < got; bi++) {
-                    PTO2TaskSlotState *slot_state = batch[bi];
-                    try_pushed = true;
-#if PTO2_SCHED_PROFILING
-                    uint64_t t_setup_start = get_sys_cnt_aicpu();
-#endif
-                    // sync_start: all blocks must dispatch atomically.
-                    // Fast path  — enough local slots: fall through to normal dispatch loop below.
-                    // Slow path  — not enough: enter drain mode, then re-push all remaining
-                    //              tasks in the batch so nothing is lost.
-                    // For AIV, one cluster can serve 2 blocks (AIV0 + AIV1), so compare against
-                    // idle AIV core count rather than cluster count.
-                    if (pto2_requires_sync_start(slot_state->active_mask)) {
-                        int32_t available = (shape == PTO2ResourceShape::AIV) ? tracker.count_idle_aiv_cores() :
-                                                                                valid_cluster_states.count();
-                        if (available < slot_state->logical_block_num) {
-                            if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                                // CAS lost: drain already active for another task; re-push and wait.
-                                rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
-                            }
-                            // Re-push all unprocessed tasks remaining in this batch.
-                            for (int rem = bi + 1; rem < got; rem++) {
-                                rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
-                            }
-                            entered_drain = true;
-                            break;
-                        }
-                        // Fast path: enough local resources, fall through to normal dispatch.
-                    }
-
-                    // Dispatch as many blocks as possible for this task using available clusters.
-                    // For block_num=1 the inner body executes exactly once (no overhead).
-                    do {
-                        auto current_valid_cluster_offset = valid_cluster_states.pop_first();
-                        dispatch_block_to_cluster(
-                            runtime, thread_idx, current_valid_cluster_offset, *slot_state, shape
-#if PTO2_PROFILING
-                            ,
-                            profiling_enabled, phase_dispatch_count
-#endif
-                        );
-                        slot_state->next_block_idx++;
-                        // For AIV, refresh cluster states so the do-while can pick up the
-                        // other AIV core in the same cluster on the next iteration.
-                        if (shape == PTO2ResourceShape::AIV &&
-                            slot_state->next_block_idx < slot_state->logical_block_num) {
-                            valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
-                        }
-                        DEV_DEBUG(
-                            "Thread %d: Dispatched %s task %" PRId64 " block %d/%d to cluster_offset %d", thread_idx,
-                            shape_name(shape), static_cast<int64_t>(slot_state->task->task_id.raw),
-                            slot_state->next_block_idx - 1, slot_state->logical_block_num, current_valid_cluster_offset
-                        );
-                    } while (slot_state->next_block_idx < slot_state->logical_block_num &&
-                             valid_cluster_states.has_value());
-
-                    // Re-enqueue only if blocks remain after exhausting local clusters
-                    if (slot_state->next_block_idx < slot_state->logical_block_num) {
-                        rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
-                    }
-                    made_progress = true;
-#if PTO2_SCHED_PROFILING
-                    sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
-#endif
-                }
-
-                // lazy update valid_cluster_states
-                if (!valid_cluster_states.has_value()) {
-                    valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
-                }
+            uint64_t cur_eq = rt->scheduler.ready_queues[si].enqueue_pos.load(std::memory_order_relaxed);
+            if (cur_eq != last_empty_enqueue[si]) {
+                has_new_ready = true;
+                break;
             }
         }
 
-        // === Pending dispatch: assign AIC tasks to pending slots (core running, pending free) ===
-        // Only AIC tasks support pending dispatch; sync_start tasks are excluded.
-        if (!entered_drain) {
-            auto pending_clusters = tracker.get_pending_only_cluster_offset_states(PTO2ResourceShape::AIC);
-            if (pending_clusters.has_value()) {
-                auto &local_buf = local_bufs[static_cast<int32_t>(PTO2ResourceShape::AIC)];
-                while (pending_clusters.has_value()) {
-                    int want = pending_clusters.count();
-                    PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS];
+        if (has_new_ready) {
+            // === Idle dispatch: assign tasks to cores with both slots free ===
+            for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES && !entered_drain; si++) {
+                PTO2ResourceShape shape = dispatch_order[si];
+                auto valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
+                if (!valid_cluster_states.has_value()) {
+                    continue;
+                }
+                auto &local_buf = local_bufs[static_cast<int32_t>(shape)];
+
+                while (valid_cluster_states.has_value() && !entered_drain) {
+                    // Skip pop if local_buf is empty and queue hasn't changed since last empty result.
+                    if (local_buf.count == 0) {
+                        uint64_t cur_eq = rt->scheduler.ready_queues[static_cast<int32_t>(shape)].enqueue_pos.load(
+                            std::memory_order_relaxed
+                        );
+                        if (cur_eq == last_empty_enqueue[static_cast<int32_t>(shape)]) {
+                            break;
+                        }
+                        last_empty_enqueue[static_cast<int32_t>(shape)] = cur_eq;
+                    }
+                    try_pushed = true;
+                    int want = valid_cluster_states.count();
                     int got = pop_ready_tasks_batch(
-                        PTO2ResourceShape::AIC, thread_idx, local_buf, batch, want
+                        shape, thread_idx, local_buf, batch, want
 #if PTO2_SCHED_PROFILING
                         ,
                         pop_hit, pop_miss, local_dispatch_count, sched_dispatch_pop_cycle
@@ -1855,65 +1975,167 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 
                     for (int bi = 0; bi < got; bi++) {
                         PTO2TaskSlotState *slot_state = batch[bi];
-                        // Skip sync_start tasks for pending dispatch (need all-idle for atomic dispatch)
-                        if (pto2_requires_sync_start(slot_state->active_mask)) {
-                            rt->scheduler.ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].push(slot_state);
-                            continue;
-                        }
-                        try_pushed = true;
 #if PTO2_SCHED_PROFILING
                         uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
-                        auto cluster_offset = pending_clusters.pop_first();
-                        dispatch_subtask_to_core(
-                            runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), *slot_state,
-                            PTO2SubtaskSlot::AIC, true
+                        // sync_start: all blocks must dispatch atomically.
+                        // Fast path  — enough local slots: fall through to normal dispatch loop below.
+                        // Slow path  — not enough: enter drain mode, then re-push all remaining
+                        //              tasks in the batch so nothing is lost.
+                        // For AIV, one cluster can serve 2 blocks (AIV0 + AIV1), so compare against
+                        // idle AIV core count rather than cluster count.
+                        if (pto2_requires_sync_start(slot_state->active_mask)) {
+                            int32_t available = (shape == PTO2ResourceShape::AIV) ? tracker.count_idle_aiv_cores() :
+                                                                                    valid_cluster_states.count();
+                            if (available < slot_state->logical_block_num) {
+                                if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
+                                    // CAS lost: drain already active for another task; re-push and wait.
+                                    rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                                }
+                                // Re-push all unprocessed tasks remaining in this batch.
+                                for (int rem = bi + 1; rem < got; rem++) {
+                                    rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                                }
+                                entered_drain = true;
+                                break;
+                            }
+                            // Fast path: enough local resources, fall through to normal dispatch.
+                        }
+
+                        // Dispatch as many blocks as possible for this task using available clusters.
+                        // For block_num=1 the inner body executes exactly once (no overhead).
+                        do {
+                            auto current_valid_cluster_offset = valid_cluster_states.pop_first();
+                            dispatch_block_to_cluster(
+                                runtime, thread_idx, current_valid_cluster_offset, *slot_state, shape
 #if PTO2_PROFILING
-                            ,
-                            profiling_enabled
+                                ,
+                                profiling_enabled, phase_dispatch_count
 #endif
-                        );
-                        slot_state->next_block_idx++;
+                            );
+                            slot_state->next_block_idx++;
+                            // For AIV, refresh cluster states so the do-while can pick up the
+                            // other AIV core in the same cluster on the next iteration.
+                            if (shape == PTO2ResourceShape::AIV &&
+                                slot_state->next_block_idx < slot_state->logical_block_num) {
+                                valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
+                            }
+                            DEV_DEBUG(
+                                "Thread %d: Dispatched %s task %" PRId64 " block %d/%d to cluster_offset %d",
+                                thread_idx, shape_name(shape), static_cast<int64_t>(slot_state->task->task_id.raw),
+                                slot_state->next_block_idx - 1, slot_state->logical_block_num,
+                                current_valid_cluster_offset
+                            );
+                        } while (slot_state->next_block_idx < slot_state->logical_block_num &&
+                                 valid_cluster_states.has_value());
+
+                        // Re-enqueue only if blocks remain after exhausting local clusters
                         if (slot_state->next_block_idx < slot_state->logical_block_num) {
-                            rt->scheduler.ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].push(slot_state);
+                            rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
                         }
                         made_progress = true;
 #if PTO2_SCHED_PROFILING
                         sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
                     }
-                    if (!pending_clusters.has_value()) {
-                        pending_clusters = tracker.get_pending_only_cluster_offset_states(PTO2ResourceShape::AIC);
+
+                    // lazy update valid_cluster_states
+                    if (!valid_cluster_states.has_value()) {
+                        valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
                     }
                 }
             }
-        }
 
-        // requeue in global ready queue
-        for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
-            PTO2ResourceShape shape = dispatch_order[si];
-            auto &local_buf = local_bufs[static_cast<int32_t>(shape)];
-            auto &ready_queue = rt->scheduler.ready_queues[static_cast<int32_t>(shape)];
+            // === Pending dispatch: assign AIC tasks to pending slots (core running, pending free) ===
+            // Only AIC tasks support pending dispatch; sync_start tasks are excluded.
+            if (!entered_drain) {
+                auto pending_clusters = tracker.get_pending_only_cluster_offset_states(PTO2ResourceShape::AIC);
+                if (pending_clusters.has_value()) {
+                    auto &local_buf = local_bufs[static_cast<int32_t>(PTO2ResourceShape::AIC)];
+                    while (pending_clusters.has_value()) {
+                        // Skip pop if local_buf is empty and queue hasn't changed since last empty result.
+                        if (local_buf.count == 0) {
+                            uint64_t cur_eq = rt->scheduler.ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)]
+                                                  .enqueue_pos.load(std::memory_order_relaxed);
+                            if (cur_eq == last_empty_enqueue[static_cast<int32_t>(PTO2ResourceShape::AIC)]) {
+                                break;
+                            }
+                            last_empty_enqueue[static_cast<int32_t>(PTO2ResourceShape::AIC)] = cur_eq;
+                        }
+                        try_pushed = true;
+                        int want = pending_clusters.count();
+                        int got = pop_ready_tasks_batch(
+                            PTO2ResourceShape::AIC, thread_idx, local_buf, batch, want
 #if PTO2_SCHED_PROFILING
-            local_overflow_count += local_buf.count;
+                            ,
+                            pop_hit, pop_miss, local_dispatch_count, sched_dispatch_pop_cycle
 #endif
-            if (local_buf.count > 0) {
-                ready_queue.push_batch(local_buf.slot_states, local_buf.count);
-                local_buf.count = 0;
+                        );
+                        if (got == 0) break;
+
+                        for (int bi = 0; bi < got; bi++) {
+                            PTO2TaskSlotState *slot_state = batch[bi];
+                            // Skip sync_start tasks for pending dispatch (need all-idle for atomic dispatch)
+                            if (pto2_requires_sync_start(slot_state->active_mask)) {
+                                rt->scheduler.ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].push(
+                                    slot_state
+                                );
+                                continue;
+                            }
+#if PTO2_SCHED_PROFILING
+                            uint64_t t_setup_start = get_sys_cnt_aicpu();
+#endif
+                            auto cluster_offset = pending_clusters.pop_first();
+                            dispatch_subtask_to_core(
+                                runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), *slot_state,
+                                PTO2SubtaskSlot::AIC, true
+#if PTO2_PROFILING
+                                ,
+                                profiling_enabled
+#endif
+                            );
+                            slot_state->next_block_idx++;
+                            if (slot_state->next_block_idx < slot_state->logical_block_num) {
+                                rt->scheduler.ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].push(
+                                    slot_state
+                                );
+                            }
+                            made_progress = true;
+#if PTO2_SCHED_PROFILING
+                            sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+#endif
+                        }
+                        if (!pending_clusters.has_value()) {
+                            pending_clusters = tracker.get_pending_only_cluster_offset_states(PTO2ResourceShape::AIC);
+                        }
+                    }
+                }
             }
-        }
+
+        }  // has_new_ready
 
 #if PTO2_PROFILING
         if (!try_pushed) {
             CYCLE_COUNT_LAP(sched_idle_cycle);
         } else {
+            // requeue in global ready queue
+            for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
+                PTO2ResourceShape shape = dispatch_order[si];
+                auto &local_buf = local_bufs[static_cast<int32_t>(shape)];
+                auto &ready_queue = rt->scheduler.ready_queues[static_cast<int32_t>(shape)];
+#if PTO2_SCHED_PROFILING
+                local_overflow_count += local_buf.count;
+#endif
+                if (local_buf.count > 0) {
+                    ready_queue.push_batch(local_buf.slot_states, local_buf.count);
+                    local_buf.count = 0;
+                }
+            }
             CYCLE_COUNT_LAP(sched_dispatch_cycle);
             if (profiling_enabled && phase_dispatch_count > 0) {
-                perf_aicpu_record_phase(
+                record_phase_perf(
                     thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, sched_loop_count, phase_dispatch_count
                 );
-                _t0_phase = _t1;
-                phase_dispatch_count = 0;
             }
         }
 #endif
@@ -1929,143 +2151,36 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             // Batch deferred fanin releases during idle.
             // Processing all pending releases at once advances the ring faster,
             // freeing heap space for the orchestrator without blocking completion polling.
-            while (deferred_release_count > 0) {
+            int32_t count = 0;
+            while (deferred_release_count > 0 && count < 32) {
+                count++;
 #if PTO2_SCHED_PROFILING
                 int32_t fe =
                     rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-                (void)fe;
-#if PTO2_SCHED_PROFILING
                 fanin_edges_total += fe;
                 if (fe > fanin_max_degree) fanin_max_degree = fe;
+#else
+                rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
             }
             idle_iterations++;
-
-            // Check for orchestrator fatal error during idle (every 1024 iterations)
-            // orch_error_code is set in shared memory by the orchestrator's spin loop
-            // BEFORE orchestrator_done_ is set, so this catches errors earlier.
-            if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
-                int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
-                if (orch_err != PTO2_ERROR_NONE) {
-                    DEV_ERROR(
-                        "Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores", thread_idx,
-                        orch_err
-                    );
-                    emergency_shutdown(runtime);
-                    completed_.store(true, std::memory_order_release);
-                    break;
-                }
-            }
-
-            if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {
-                int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-                DEV_ALWAYS(
-                    "PTO2 stall: no progress for %d iterations, completed=%d total=%d (last progress at %d)",
-                    idle_iterations, c, task_count, last_progress_count
-                );
-                // Scan all task slots to find truly stuck tasks using scheduler state
-                PTO2SchedulerState *sched = &rt->scheduler;
-                PTO2SharedMemoryHeader *sm_header_diag = static_cast<PTO2SharedMemoryHeader *>(sm_base);
-                int32_t cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
-                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-                    int32_t ring_task_count =
-                        sm_header_diag->rings[r].fc.current_task_index.load(std::memory_order_relaxed);
-                    for (int32_t si = 0; si < ring_task_count; si++) {
-                        PTO2TaskSlotState &slot_state = sched->get_slot_state(r, si);
-                        PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
-                        int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
-                        int32_t fi = slot_state.fanin_count;
-                        int32_t kid = slot_state.task->kernel_id[0];
-                        if (st >= PTO2_TASK_COMPLETED) continue;  // Already done
-                        if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) {
-                            cnt_inflight++;
-                            continue;
-                        }
-                        // PENDING
-                        if (rc >= fi) {
-                            // Ready (all deps satisfied) but not enqueued — this is the real bug
-                            cnt_ready++;
-                            if (cnt_ready <= STALL_DUMP_READY_MAX) {
-                                DEV_ALWAYS(
-                                    "  STUCK-READY  ring=%d task_id=%" PRId64
-                                    " kernel_id=%d refcount=%d fanin=%d state=%d",
-                                    r, static_cast<int64_t>(slot_state.task->task_id.raw), kid, rc, fi,
-                                    static_cast<int32_t>(st)
-                                );
-                            }
-                        } else {
-                            cnt_waiting++;
-                            if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
-                                DEV_ALWAYS(
-                                    "  STUCK-WAIT   ring=%d task_id=%" PRId64
-                                    " kernel_id=%d refcount=%d fanin=%d state=%d",
-                                    r, static_cast<int64_t>(slot_state.task->task_id.raw), kid, rc, fi,
-                                    static_cast<int32_t>(st)
-                                );
-                            }
-                        }
-                    }
-                }
-                DEV_ALWAYS(
-                    "  scan result: stuck_ready=%d stuck_waiting=%d in_flight=%d", cnt_ready, cnt_waiting, cnt_inflight
-                );
-                // Log this thread's dispatch state
-                int32_t aic_running = tracker.get_running_count<CoreType::AIC>();
-                int32_t aiv_running = tracker.get_running_count<CoreType::AIV>();
-                int32_t total_running = aic_running + aiv_running;
-                DEV_ALWAYS(
-                    "  thread=%d running_cores=%d (AIC=%d AIV=%d) core_num=%d", thread_idx, total_running, aic_running,
-                    aiv_running, core_num
-                );
-                // Dump running cores
-                auto all_running = tracker.get_all_running_cores();
-                int32_t dump_count = 0;
-                int32_t bp;
-                while (dump_count < STALL_DUMP_CORE_MAX && (bp = all_running.pop_first()) >= 0) {
-                    dump_count++;
-                    int32_t cid = tracker.get_core_id_by_offset(bp);
-                    int32_t sw_tid = core_exec_states_[cid].running_reg_task_id;
-                    int32_t hw_kernel = -1;
-                    if (sw_tid >= 0 && core_exec_states_[cid].running_slot_state) {
-                        int32_t diag_slot = static_cast<int32_t>(core_exec_states_[cid].running_subslot);
-                        hw_kernel = core_exec_states_[cid].running_slot_state->task->kernel_id[diag_slot];
-                    }
-                    uint64_t cond_reg = read_reg(core_exec_states_[cid].reg_addr, RegId::COND);
-                    DEV_ALWAYS(
-                        "    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d kernel=%d", cid,
-                        static_cast<unsigned>(cond_reg), EXTRACT_TASK_STATE(cond_reg), EXTRACT_TASK_ID(cond_reg),
-                        sw_tid, hw_kernel
-                    );
-                }
-                // Dump cluster state
-                for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
-                    int32_t offset = cli * 3;
-                    DEV_ALWAYS(
-                        "    cluster[%d] aic=%d(%s) aiv0=%d(%s) aiv1=%d(%s)", cli, tracker.get_aic_core_id(offset),
-                        tracker.is_aic_core_idle(offset) ? "idle" : "busy", tracker.get_aiv0_core_id(offset),
-                        tracker.is_aiv0_core_idle(offset) ? "idle" : "busy", tracker.get_aiv1_core_id(offset),
-                        tracker.is_aiv1_core_idle(offset) ? "idle" : "busy"
-                    );
-                }
-            }
-            if (idle_iterations > MAX_IDLE_ITERATIONS) {
-                DEV_ERROR("Thread %d: PTO2 timeout after %d idle iterations", thread_idx, idle_iterations);
-#if PTO2_PROFILING
-                // Benchmark: scheduler lifetime end timestamp on timeout path
-                uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
-                DEV_ALWAYS(
-                    "Thread %d: sched_start=%" PRIu64 " sched_end(timeout)=%" PRIu64 " sched_cost=%.3fus", thread_idx,
-                    static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts),
-                    cycles_to_us(sched_timeout_ts - sched_start_ts)
-                );
+#if PTO2_SCHED_PROFILING
+            sched_idle_count++;
 #endif
-                return -1;
-            } else {
-                SPIN_WAIT_HINT();
+
+            {
+                int idle_rc = handle_idle_checks(
+                    idle_iterations, header, thread_idx, task_count, last_progress_count, rt, sm_base, runtime, tracker,
+                    core_num
+#if PTO2_PROFILING
+                    ,
+                    sched_start_ts
+#endif
+                );
+                if (idle_rc == 1) break;       // fatal error
+                if (idle_rc == -1) return -1;  // timeout
             }
+            SPIN_WAIT_HINT();
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(sched_idle_cycle);
             if (profiling_enabled) {
@@ -2214,8 +2329,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 
         // Level 1: idle
         DEV_ALWAYS(
-            "Thread %d:   idle           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(sched_idle_cycle),
-            sched_idle_cycle * 100.0 / sched_total
+            "Thread %d:   idle           : %.3fus (%.1f%%), count: %u", thread_idx, cycles_to_us(sched_idle_cycle),
+            sched_idle_cycle * 100.0 / sched_total, sched_idle_count
         );
 
         // Average per completion

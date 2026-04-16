@@ -179,6 +179,24 @@ typedef enum {
 #define PTO2_MAX_TENSOR_DIM 8
 
 /**
+ * Result of a unified task allocation.
+ */
+struct PTO2TaskAllocResult {
+    int32_t task_id;    // Absolute task ID (not wrapped)
+    int32_t slot;       // task_id & (window_size - 1)
+    void *packed_base;  // Heap allocation result (nullptr if failure)
+    void *packed_end;   // packed_base + aligned output_size
+
+    bool failed() const { return task_id < 0; }
+};
+
+struct PTO2OutputLayout {
+    uint64_t offsets[MAX_TENSOR_ARGS] = {};
+    uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
+    int32_t total_output_size = 0;
+};
+
+/**
  * Maximum depth of layout history for HBB overlap detection
  * Simple (contiguous) tensor has depth=1, non-contiguous has depth>1
  */
@@ -328,7 +346,7 @@ struct PTO2DepListEntry {
  *
  * Fields set by Orchestrator at submission, read by Scheduler for dispatch.
  */
-struct PTO2TaskDescriptor {
+struct alignas(64) PTO2TaskDescriptor {
     // Mixed-task identification (encodes ring_id in upper 32 bits)
     PTO2TaskId task_id;  // raw: (ring_id << 32) | local_id
 
@@ -339,6 +357,8 @@ struct PTO2TaskDescriptor {
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
+
+static_assert(sizeof(PTO2TaskDescriptor) == 64);
 
 // =============================================================================
 // Per-Slot Scheduling State
@@ -378,8 +398,7 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
      */
-    void
-    init(const Arg &args, TaskOutputTensors &result, void *base_addr, uint64_t offsets[], uint64_t buffer_sizes[]) {
+    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
@@ -390,8 +409,10 @@ struct PTO2TaskPayload {
             } else {
                 tensors[i].init_from_create_info(
                     *args.tensor(i).create_info,
-                    reinterpret_cast<void *>(reinterpret_cast<char *>(base_addr) + offsets[i]), buffer_sizes[i]
+                    reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]),
+                    layout.buffer_sizes[i]
                 );
+                tensors[i].owner_task_id = result.task_id();
                 result.materialize_output(tensors[i]);
             }
             tensors[i].update_start_offset();

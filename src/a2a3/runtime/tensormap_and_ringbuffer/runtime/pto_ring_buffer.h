@@ -60,19 +60,6 @@ struct PTO2SchedulerState;  // Forward declaration for dep_pool reclaim
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
 // =============================================================================
-
-/**
- * Result of a unified task allocation.
- */
-struct PTO2TaskAllocResult {
-    int32_t task_id;    // Absolute task ID (not wrapped), -1 on failure
-    int32_t slot;       // task_id & (window_size - 1)
-    void *packed_base;  // Heap allocation result (nullptr if output_size == 0)
-    void *packed_end;   // packed_base + aligned output_size
-
-    bool failed() const { return task_id < 0; }
-};
-
 /**
  * Unified task slot + heap buffer allocator.
  *
@@ -171,12 +158,15 @@ public:
 #endif
                 if (spin_count >= PTO2_ALLOC_SPIN_LIMIT) {
                     report_deadlock(output_size, blocked_on_heap);
-                    return {-1, -1, nullptr, nullptr};
+                    return {0, 0, nullptr, nullptr};
                 }
             }
             SPIN_WAIT_HINT();
         }
     }
+
+    int32_t next_task_id() const { return local_task_id_; }
+    int32_t next_task_slot() const { return local_task_id_ & window_mask_; }
 
     // =========================================================================
     // Task descriptor accessors

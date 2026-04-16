@@ -185,7 +185,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 // Reusable Arg objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
                 Arg params_qk, params_sf, params_pv, params_up;
-
+                PTO2TaskId pre_task_id;
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = std::min(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
 
@@ -277,13 +277,21 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_up.add_inout(li_update);
                     params_up.add_inout(oi);
                     params_up.add_inout(out_view);
-                    params_up.add_dep(alloc_task);
-                    params_up.add_dep(sf_outs.task_id());
                     params_up.add_dep(pv_outs.task_id());
+                    if (is_first) {
+                        params_up.add_dep(alloc_outs.task_id());
+                    }
+                    if (!is_first) {
+                        params_up.add_dep(pre_task_id);
+                        if (is_last) {
+                            params_up.add_dep(alloc_outs.task_id());
+                        }
+                    }
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                    TaskOutputTensors up_outs = pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                    pre_task_id = up_outs.task_id();
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);

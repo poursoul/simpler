@@ -86,12 +86,12 @@ public:
         tensors_[output_count_++] = &tensor;
     }
 
-    PTO2TaskId task_id(uint32_t index = 0) const {
-        always_assert(index < output_count_);
-        return tensors_[index]->owner_task_id;
-    }
+    void set_task_id(PTO2TaskId id) { task_id_ = id; }
+
+    PTO2TaskId task_id() const { return task_id_; }
 
 private:
+    PTO2TaskId task_id_;
     uint32_t output_count_;
     const Tensor *tensors_[PTO2_MAX_OUTPUTS];
 };

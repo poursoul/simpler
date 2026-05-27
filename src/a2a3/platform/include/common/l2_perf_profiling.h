@@ -104,15 +104,25 @@ struct L2PerfRecord {
     uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore
     uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion
 
-    // AICore writes the register dispatch token (low 32 bits only) zero-extended into task_id.
-    // For tensormap_and_ringbuffer, AICPU overwrites with the full PTO2 encoding
-    // (ring_id << 32) | local_id after FIN/perf row match.
-    // For host_build_graph, task_id stays as the plain integer task index (ring_id = 0).
+    // Host-side perf path: AICore writes the FULL PTO2 task_id directly
+    // (ring_id << 32) | local_id. AICPU never touches this field. Use
+    // reg_task_id below as the dual-issue staging slot validation key.
     uint64_t task_id;
-    uint32_t func_id;    // Kernel function identifier
+    uint32_t func_id;    // Kernel function identifier (0 in host-side path; backfilled later if needed)
     CoreType core_type;  // Core type (AIC/AIV)
 
-    // Dependency relationship (fanout only)
+    // Host-side perf path additions:
+    //   reg_task_id — register dispatch token written by AICore alongside
+    //     task_id, used as dual-issue validation key (slot index mod ring size).
+    //   core_id     — AICore block_idx; lets host group staging slots by core
+    //     without consulting external metadata.
+    uint32_t reg_task_id;
+    uint8_t core_id;
+    uint8_t pad_after_core_id[3];
+
+    // Dependency relationship (fanout only) — kept for ABI compatibility with
+    // host_build_graph path; tensormap_and_ringbuffer host-side path always
+    // leaves these zero (use --deps-json for dep edges).
     uint64_t fanout[RUNTIME_MAX_FANOUT];  // Successor task task_id array
     int32_t fanout_count;                 // Number of successor tasks
 } __attribute__((aligned(64)));

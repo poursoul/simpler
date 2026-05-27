@@ -103,7 +103,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             if (l2_perf_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_perf_aicore_record_task(l2_perf_ring, actual_task_id, start_time, end_time);
+                // host_build_graph has no PTO2 task_id encoding; reuse reg_task_id as task_id.
+                l2_perf_aicore_record_task(
+                    l2_perf_ring, actual_task_id, static_cast<uint64_t>(actual_task_id), start_time, end_time,
+                    static_cast<uint8_t>(block_idx), core_type
+                );
             }
 
             last_task_id = task_id;

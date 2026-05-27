@@ -325,6 +325,13 @@ private:
     // ring_table[block_idx] via KernelArgs::aicore_ring_addr.
     void *aicore_ring_addr_table_dev_{nullptr};
 
+    // Host-side direct pointers to each per-core L2PerfAicoreRing buffer
+    // (parallel to aicore_ring_addr_table_dev_'s device pointers). Cached so
+    // export_swimlane_json() can walk the rings directly without touching
+    // AICPU buffers. On sim these are host pointers; on onboard they refer to
+    // DMA-mapped memory whose contents reflect AICore writes.
+    std::vector<void *> aicore_ring_host_ptrs_;
+
     int num_aicore_{0};
     L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};
 

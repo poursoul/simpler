@@ -157,7 +157,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // Performance profiling: record task execution
             if (l2_perf_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_perf_aicore_record_task(l2_perf_ring, task_id, start_time, end_time);
+                // Pull the full PTO2 task id from the dispatch payload's local_context.async_ctx.
+                // Host-side perf assembly uses this to group staging slots by task.
+                uint64_t full_task_id = exec_payload->local_context.async_ctx.task_token.raw;
+                l2_perf_aicore_record_task(
+                    l2_perf_ring, task_id, full_task_id, start_time, end_time, static_cast<uint8_t>(block_idx),
+                    core_type
+                );
             }
 
             last_reg_val = reg_val;

@@ -112,11 +112,14 @@ constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
  * Per-core AICore→AICPU staging ring slot count.
  *
  * AICore writes each task's timing into ring->dual_issue_slots[task_id %
- * PLATFORM_L2_AICORE_RING_SIZE]. Must be a power of two and ≥ the in-flight
- * issue depth on a single core. Today's runtime is dual-issue, so 2 slots
- * suffice; raise to the next power of two when issue depth grows.
+ * PLATFORM_L2_AICORE_RING_SIZE]. Must be a power of two.
+ *
+ * The host-side perf assembly path reads the entire ring at run end (no
+ * AICPU intermediate drain), so the ring must hold every task that runs on
+ * a single core for the whole run. 64 covers typical decode batches; bump
+ * if a worker reports staging-slot collisions.
  */
-constexpr int PLATFORM_L2_AICORE_RING_SIZE = 2;
+constexpr int PLATFORM_L2_AICORE_RING_SIZE = 64;
 
 /**
  * Number of buffer slots per core/thread for dynamic profiling

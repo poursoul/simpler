@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <map>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -184,6 +185,13 @@ int L2PerfCollector::initialize(
         }
         memset(ring_host_ptr, 0, sizeof(L2PerfAicoreRing));
         state->aicore_ring_ptr = reinterpret_cast<uint64_t>(ring_dev_ptr);
+
+        // Cache host-side direct pointer for export_swimlane_json() to walk
+        // the ring at run end without touching AICPU buffers.
+        if (aicore_ring_host_ptrs_.size() < static_cast<size_t>(num_aicore)) {
+            aicore_ring_host_ptrs_.resize(num_aicore, nullptr);
+        }
+        aicore_ring_host_ptrs_[i] = ring_host_ptr;
 
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
@@ -513,22 +521,30 @@ void L2PerfCollector::read_phase_header_metadata() {
 }
 
 int L2PerfCollector::export_swimlane_json() {
-    // Step 1: Validate collected data
-    bool has_any_records = false;
-    for (const auto &core_records : collected_perf_records_) {
-        if (!core_records.empty()) {
-            has_any_records = true;
-            break;
+    // Host-side perf path: read every per-core AICore staging ring directly,
+    // group slots by task_id, and produce one assembled record per task with
+    // start = min(slot.start), end = max(slot.end). AICPU never wrote any
+    // L2PerfRecord, so collected_perf_records_ is empty by design.
+
+    // Step 1: Walk all staging rings, collect slots whose task_id != 0
+    // (zero means an unused slot — the ring was zeroed at init).
+    std::vector<L2PerfRecord> all_slots;
+    for (size_t core_idx = 0; core_idx < aicore_ring_host_ptrs_.size(); core_idx++) {
+        L2PerfAicoreRing *ring = reinterpret_cast<L2PerfAicoreRing *>(aicore_ring_host_ptrs_[core_idx]);
+        if (ring == nullptr) continue;
+        for (int s = 0; s < PLATFORM_L2_AICORE_RING_SIZE; s++) {
+            const L2PerfRecord &slot = ring->dual_issue_slots[s];
+            if (slot.task_id == 0 || slot.start_time == 0) continue;  // unused / not written
+            all_slots.push_back(slot);
         }
     }
-    if (!has_any_records) {
-        LOG_WARN("Warning: No performance data to export.");
+
+    if (all_slots.empty()) {
+        LOG_WARN("Warning: No performance data to export (staging rings empty).");
         return -1;
     }
 
-    // Step 2: Create output directory (recursively — parent `outputs/` may not
-    // yet exist on a clean checkout / standalone run). `output_prefix_` was
-    // captured at initialize() time.
+    // Step 2: Create output directory
     std::error_code ec;
     std::filesystem::create_directories(output_prefix_, ec);
     if (ec) {
@@ -536,36 +552,17 @@ int L2PerfCollector::export_swimlane_json() {
         return -1;
     }
 
-    // Step 3: Flatten per-core vectors into tagged records with core_id derived from index
-    struct TaggedRecord {
-        const L2PerfRecord *record;
-        uint32_t core_id;
-    };
-    std::vector<TaggedRecord> tagged_records;
-    size_t total_records = 0;
-    for (const auto &core_records : collected_perf_records_) {
-        total_records += core_records.size();
-    }
-    tagged_records.reserve(total_records);
-    for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
-        for (const auto &record : collected_perf_records_[core_idx]) {
-            tagged_records.push_back({&record, static_cast<uint32_t>(core_idx)});
-        }
-    }
-
-    // Sort by canonical task_id (64-bit PTO2 raw)
-    std::sort(tagged_records.begin(), tagged_records.end(), [](const TaggedRecord &a, const TaggedRecord &b) {
-        return a.record->task_id < b.record->task_id;
+    // Step 3: Sort slots by (task_id, start_time) for deterministic per-block output.
+    std::sort(all_slots.begin(), all_slots.end(), [](const L2PerfRecord &a, const L2PerfRecord &b) {
+        if (a.task_id != b.task_id) return a.task_id < b.task_id;
+        return a.start_time < b.start_time;
     });
 
-    // Step 4: Calculate base time (minimum timestamp across all records)
+    // Step 4: Calculate base time (minimum start across all slots)
     uint64_t base_time_cycles = UINT64_MAX;
-    for (const auto &tagged : tagged_records) {
-        if (tagged.record->start_time < base_time_cycles) {
-            base_time_cycles = tagged.record->start_time;
-        }
-        if (tagged.record->dispatch_time > 0 && tagged.record->dispatch_time < base_time_cycles) {
-            base_time_cycles = tagged.record->dispatch_time;
+    for (const auto &slot : all_slots) {
+        if (slot.start_time < base_time_cycles) {
+            base_time_cycles = slot.start_time;
         }
     }
 
@@ -597,43 +594,32 @@ int L2PerfCollector::export_swimlane_json() {
     outfile << "  \"version\": " << version << ",\n";
     outfile << "  \"tasks\": [\n";
 
-    for (size_t i = 0; i < tagged_records.size(); ++i) {
-        const auto &tagged = tagged_records[i];
-        const auto &record = *tagged.record;
+    for (size_t i = 0; i < all_slots.size(); ++i) {
+        const L2PerfRecord &record = all_slots[i];
 
-        // Convert times to microseconds
+        // Convert times to microseconds. dispatch/finish are aliased to
+        // start/end (host-side perf path doesn't record AICPU dispatch/finish).
         double start_us = cycles_to_us(record.start_time - base_time_cycles);
         double end_us = cycles_to_us(record.end_time - base_time_cycles);
         double duration_us = end_us - start_us;
-        double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time - base_time_cycles) : 0.0;
-        double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time - base_time_cycles) : 0.0;
 
         const char *core_type_str = (record.core_type == CoreType::AIC) ? "aic" : "aiv";
 
         outfile << "    {\n";
         outfile << "      \"task_id\": " << record.task_id << ",\n";
-        outfile << "      \"func_id\": " << record.func_id << ",\n";
-        outfile << "      \"core_id\": " << tagged.core_id << ",\n";
+        outfile << "      \"func_id\": 0,\n";  // host-side path drops func_id (use deps.json for names)
+        outfile << "      \"core_id\": " << static_cast<int>(record.core_id) << ",\n";
         outfile << "      \"core_type\": \"" << core_type_str << "\",\n";
         outfile << "      \"ring_id\": " << static_cast<int>(record.task_id >> 32) << ",\n";
         outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
-        outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
-        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
-        outfile << "      \"fanout\": [";
-        int safe_fanout_count =
-            (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;
-        for (int j = 0; j < safe_fanout_count; ++j) {
-            outfile << record.fanout[j];
-            if (j < safe_fanout_count - 1) {
-                outfile << ", ";
-            }
-        }
-        outfile << "],\n";
-        outfile << "      \"fanout_count\": " << record.fanout_count << "\n";
+        outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
+        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
+        outfile << "      \"fanout\": [],\n";
+        outfile << "      \"fanout_count\": 0\n";
         outfile << "    }";
-        if (i < tagged_records.size() - 1) {
+        if (i < all_slots.size() - 1) {
             outfile << ",";
         }
         outfile << "\n";
@@ -771,7 +757,7 @@ int L2PerfCollector::export_swimlane_json() {
     // Step 9: Close file
     outfile.close();
 
-    uint32_t record_count = static_cast<uint32_t>(tagged_records.size());
+    uint32_t record_count = static_cast<uint32_t>(all_slots.size());
     LOG_INFO_V0("=== JSON Export Complete ===");
     LOG_INFO_V0("File: %s", filepath.c_str());
     LOG_INFO_V0("Records: %u", record_count);

@@ -67,12 +67,12 @@ SlotTransition SchedulerContext::decide_slot_transition(
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
-    PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
+    PTO2TaskSlotState &slot_state, [[maybe_unused]] int32_t expected_reg_task_id, PTO2SubtaskSlot subslot,
     int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
     PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
     ,
-    uint64_t dispatch_ts
+    [[maybe_unused]] uint64_t dispatch_ts
 #endif
 ) {
 #if PTO2_PROFILING
@@ -81,31 +81,31 @@ void SchedulerContext::complete_slot_task(
     (void)hank;
 #endif
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
-    if (slot_state.payload != nullptr) {
-        int32_t reg_err = PTO2_ERROR_NONE;
-        AsyncWaitList::RegisterResult reg_result;
-        volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
-        AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
-        do {
-            reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
-            if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
-                SPIN_WAIT_HINT();
-            }
-        } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
+    // if (slot_state.payload != nullptr) {
+    //     int32_t reg_err = PTO2_ERROR_NONE;
+    //     AsyncWaitList::RegisterResult reg_result;
+    //     volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
+    //     AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
+    //     do {
+    //         reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
+    //         if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
+    //             SPIN_WAIT_HINT();
+    //         }
+    //     } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
 
-        if (reg_result == AsyncWaitList::RegisterResult::Error) {
-            int32_t expected = PTO2_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
-            );
-            completed_.store(true, std::memory_order_release);
-            return;
-        }
+    //     if (reg_result == AsyncWaitList::RegisterResult::Error) {
+    //         int32_t expected = PTO2_ERROR_NONE;
+    //         sched_->sm_header->sched_error_code.compare_exchange_strong(
+    //             expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
+    //         );
+    //         completed_.store(true, std::memory_order_release);
+    //         return;
+    //     }
 
-        if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
-            return;
-        }
-    }
+    //     if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
+    //         return;
+    //     }
+    // }
     if (mixed_complete) {
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
@@ -149,40 +149,10 @@ void SchedulerContext::complete_slot_task(
         completed_this_turn++;
     }
 
+    // Host-side perf path: AICPU does NOT write any L2PerfRecord here. AICore
+    // already populated the staging ring with start/end/task_id/core_id; host
+    // walks the ring at run end and assembles records itself.
 #if PTO2_PROFILING
-    if (l2_perf.l2_perf_enabled) {
-#if PTO2_SCHED_PROFILING
-        uint64_t t_perf_start = get_sys_cnt_aicpu();
-#endif
-        uint64_t finish_ts = 0;
-        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-        int32_t fanout_n = 0;
-
-        if (l2_perf_level_ >= L2PerfLevel::AICPU_TIMING) {
-            finish_ts = get_sys_cnt_aicpu();
-            PTO2DepListEntry *cur = slot_state.fanout_head;
-            while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
-                fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
-                cur = cur->next;
-            }
-        }
-
-        int32_t perf_slot_idx = static_cast<int32_t>(subslot);
-        if (l2_perf_aicpu_complete_record(
-                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
-                fanout_n
-            ) != 0) {
-            LOG_ERROR(
-                "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
-                static_cast<uint64_t>(slot_state.task->task_id.raw)
-            );
-        }
-#if PTO2_SCHED_PROFILING
-        l2_perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
-#endif
-    }
-
     if (is_pmu_enabled()) {
         pmu_aicpu_record_task(
             core_id, thread_idx, slot_state.task->task_id.raw,

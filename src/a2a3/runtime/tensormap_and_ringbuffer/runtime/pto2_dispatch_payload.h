@@ -68,12 +68,27 @@ static_assert(
  * concurrently dispatched cores.
  */
 struct alignas(64) PTO2DispatchPayload {
-    uint64_t function_bin_addr;            /**< Kernel entry address in GM (set by Scheduler) */
-    uint64_t args[PTO2_DISPATCH_MAX_ARGS]; /**< Kernel arguments (GM pointers + scalars + ext params) */
+    // --- AICPU-written / AICore-read-first block (leading cache lines) ---
+    // Everything AICPU writes per dispatch lives here so the writes (and the
+    // AICore reads right after dcci) hit the front cache lines instead of the
+    // tail. args[] (assembled only by AICore) goes after.
 
-    /** Per-dispatch context: block_idx and block_num.
-     *  Written by build_payload() before each dispatch.
-     *  args[SPMD_LOCAL_CONTEXT_INDEX] points here. */
+    /** Kernel entry address in GM (set by Scheduler). */
+    uint64_t function_bin_addr;
+
+    /** GM address of the task-shared arg template (PTO2TaskPayload
+     *  .dispatch_args_template). AICPU writes only this pointer + arg_count
+     *  instead of copying the N args; AICore copies args[0..arg_count) from here
+     *  into args[] before invoking the kernel. Shares the tensor/scalar args
+     *  across all SPMD blocks of the task. */
+    uint64_t task_args;
+    int32_t arg_count;
+    // (local_context needs 8B alignment for its pointers, so the compiler pads
+    //  the 4B after arg_count automatically — no explicit reserved field needed.)
+
+    /** Per-dispatch context: block_idx / block_num / async_ctx. AICPU writes
+     *  this every dispatch — kept in the leading block. args[SPMD_LOCAL_CONTEXT_INDEX]
+     *  points here. */
     LocalContext local_context;
 
     /** Per-core global context: sub_block_id (AIV lane identity).
@@ -81,7 +96,11 @@ struct alignas(64) PTO2DispatchPayload {
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
 
-    uint8_t reserved_payload_abi_pad[8];
+    /** Kernel arguments (GM pointers + scalars + ext params). 64B-aligned for
+     *  aligned burst copy from dispatch_args_template; placed after the
+     *  AICPU-written control block so the front cache lines stay hot for the
+     *  per-dispatch writes/reads. */
+    alignas(64) uint64_t args[PTO2_DISPATCH_MAX_ARGS];
 
     static_assert(sizeof(args[0]) == 8);
     static_assert(
@@ -90,4 +109,7 @@ struct alignas(64) PTO2DispatchPayload {
     );
 };
 
-static_assert(sizeof(PTO2DispatchPayload) == 512, "PTO2DispatchPayload hardware ABI size drift");
+// args[] (64B-aligned) sits after the ~76B control block, so the struct is
+// 576B (512 + one extra cache line vs args-first). The control + local_context
+// the AICPU writes each dispatch live in the leading two cache lines.
+static_assert(sizeof(PTO2DispatchPayload) == 576, "PTO2DispatchPayload hardware ABI size drift");

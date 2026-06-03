@@ -230,18 +230,30 @@ private:
         const AsyncCtx &async_ctx, int32_t block_idx
     );
 
-    void dispatch_subtask_to_core(
+    // Batched-dispatch primitives: split the original dispatch_subtask_to_core
+    // into a payload-prep half (build_payload + CoreExecState writes) and a
+    // publish half (write_reg + tracker mutation). The caller amortizes a
+    // single wmb() across multiple prepare calls before issuing the publish
+    // batch — eliminates per-subtask wmb+MMIO NoC serialization that costs
+    // ~500-700ns per MIX subtask in back-to-back dispatch.
+    struct PublishHandle {
+        uint64_t reg_addr;
+        uint32_t reg_task_id;
+        int32_t core_offset;
+    };
+
+    PublishHandle prepare_subtask_to_core(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
         bool to_pending, int32_t block_idx
     );
 
-    void dispatch_mix_block_to_cluster(
-        int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending, int32_t block_idx
-    );
+    void publish_subtask_to_core(const PublishHandle &handle);
 
-    void dispatch_block(
+    // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
+    // caller-supplied handles buffer. Returns the number of handles written.
+    int prepare_block_for_dispatch(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-        bool to_pending, int32_t block_idx
+        bool to_pending, int32_t block_idx, PublishHandle *out_handles
     );
 
     void dispatch_shape(

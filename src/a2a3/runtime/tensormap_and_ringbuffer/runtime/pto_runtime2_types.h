@@ -248,6 +248,11 @@ struct PTO2TaskPayload {
     // === Cache lines 41-44 (256B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
 
+    // Pre-built dispatch args (tensor pointers then scalars), laid out exactly
+    // like PTO2DispatchPayload.args[0..n). Filled once in init() so build_payload
+    // can memcpy them into the per-core payload instead of rebuilding per dispatch.
+    alignas(64) uint64_t dispatch_args_template[MAX_TENSOR_ARGS + MAX_SCALAR_ARGS];
+
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
     static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 256, "scalar region must be 256B (4 cache lines)");
@@ -283,6 +288,16 @@ struct PTO2TaskPayload {
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
+
+        // Pre-build the dispatch arg template once: tensor pointers then scalars,
+        // matching build_payload's args[0..n) order so it can memcpy on dispatch.
+        int32_t a = 0;
+        for (int32_t i = 0; i < tensor_count; i++) {
+            dispatch_args_template[a++] = reinterpret_cast<uint64_t>(&tensors[i]);
+        }
+        for (int32_t i = 0; i < scalar_count; i++) {
+            dispatch_args_template[a++] = scalars[i];
+        }
     }
 };
 
@@ -297,7 +312,8 @@ static_assert(
     "scalars must immediately follow tensors"
 );
 static_assert(
-    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
+    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t) +
+                                   (MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) * sizeof(uint64_t),
     "PTO2TaskPayload size must stay on the baseline cache-line footprint"
 );
 

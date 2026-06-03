@@ -38,6 +38,22 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
         return;
     }
 
+    // Assemble per-core args: copy the task-shared tensor/scalar segment (which
+    // AICPU published once as task_args, shared across all SPMD blocks) into this
+    // core's args[0..n). The context-pointer args[SPMD_LOCAL/GLOBAL_CONTEXT_INDEX]
+    // are init-time fixed and untouched here. src is 64B-aligned
+    // (dispatch_args_template), so invalidate it cache-line by cache-line.
+    __gm__ uint64_t *src = reinterpret_cast<__gm__ uint64_t *>(payload->task_args);
+    int32_t n = payload->arg_count;
+    if (src != nullptr) {
+        for (int32_t off = 0; off < n; off += 8) {
+            dcci(src + off, SINGLE_CACHE_LINE);
+        }
+        for (int32_t i = 0; i < n; i++) {
+            payload->args[i] = src[i];
+        }
+    }
+
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     OUT_OF_ORDER_STORE_BARRIER();

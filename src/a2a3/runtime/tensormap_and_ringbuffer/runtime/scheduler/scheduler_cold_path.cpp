@@ -914,6 +914,18 @@ int32_t SchedulerContext::init(
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
     memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
 
+    // Context-pointer args are per-core fixed addresses (the payload buffer
+    // never moves). Set them once here — after the memset above — so
+    // build_payload's hot path no longer rewrites them on every dispatch.
+    for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
+        for (int32_t b = 0; b < 2; b++) {
+            payload_per_core_[i][b].args[PAYLOAD_LOCAL_CONTEXT_INDEX] =
+                reinterpret_cast<uint64_t>(&payload_per_core_[i][b].local_context);
+            payload_per_core_[i][b].args[PAYLOAD_GLOBAL_CONTEXT_INDEX] =
+                reinterpret_cast<uint64_t>(&payload_per_core_[i][b].global_context);
+        }
+    }
+
     // Initialize per-core GlobalContext (sub_block_id) based on cluster position.
     // This is done once at startup and never modified afterwards.
     for (int32_t t = 0; t < sched_thread_num_; t++) {

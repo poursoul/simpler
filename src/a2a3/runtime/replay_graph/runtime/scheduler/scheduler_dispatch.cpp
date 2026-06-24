@@ -769,15 +769,15 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         return -1;
     }
     LOG_INFO_V0(
-        "Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
-        static_cast<uint64_t>(header->rings[0].task_descriptors_offset),
-        static_cast<uint64_t>(header->rings[0].task_window_size)
+        "Thread %d: header=%p, task_desc_offset=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
+        static_cast<uint64_t>(header->ring.task_descriptors_offset),
+        static_cast<uint64_t>(header->ring.task_window_size)
     );
 
     Handshake *hank = static_cast<Handshake *>(runtime->workers);
     LOG_INFO_V0(
         "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
-        static_cast<uint64_t>(header->rings[0].task_window_size)
+        static_cast<uint64_t>(header->ring.task_window_size)
     );
 
     // One-time init: assign perf buffers (one thread does it; others wait)

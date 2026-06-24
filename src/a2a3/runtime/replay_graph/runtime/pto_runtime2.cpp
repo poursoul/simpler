@@ -169,7 +169,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     auto do_wait = [&]() {
         // Step A: creator retention — read owner directly from tensor metadata
         if (owner.is_valid()) {
-            auto &s = orch.sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
+            auto &s = orch.sm_header->ring.get_slot_state_by_task_id(owner.local());
             try_push(s);
             if (failed) return;
         }
@@ -177,7 +177,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         // Step B: modifier writer lookup (OverlapMap), direct callback
         orch.tensor_map.lookup(tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus) -> bool {
             PTO2TaskId pid = entry.producer_task_id;
-            auto &s = orch.sm_header->rings[pid.ring()].get_slot_state_by_task_id(pid.local());
+            auto &s = orch.sm_header->ring.get_slot_state_by_task_id(pid.local());
             try_push(s);
             return !failed;
         });

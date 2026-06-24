@@ -16,7 +16,6 @@
  * - Insert / lookup / cleanup lifecycle
  * - Overlap detection: fast-path (is_all_offset_zero) and slow-path (offsets)
  * - Lazy invalidation (stale entries skipped, not truncated)
- * - Multi-ring isolation in the same hash chain
  * - Lookup returns all matches (no silent 16-result cap post-#669)
  * - Entry pool allocation and free-list recycling
  * - cleanup_retired correctness across task windows
@@ -80,8 +79,7 @@ protected:
     DeviceArena arena;
 
     void SetUp() override {
-        int32_t window_sizes[PTO2_MAX_RING_DEPTH] = {WINDOW_SIZE, WINDOW_SIZE, WINDOW_SIZE, WINDOW_SIZE};
-        auto layout = PTO2TensorMap::reserve_layout(arena, NUM_BUCKETS, POOL_SIZE, window_sizes);
+        auto layout = PTO2TensorMap::reserve_layout(arena, NUM_BUCKETS, POOL_SIZE, WINDOW_SIZE);
         ASSERT_NE(arena.commit(), nullptr);
         ASSERT_TRUE(tmap.init_data_from_layout(layout, arena));
         tmap.wire_arena_pointers(layout, arena);
@@ -111,8 +109,7 @@ TEST_F(TensorMapTest, InitRequiresPowerOfTwoBuckets) {
     // always_assert may compile out). Smoke-test only the success path here.
     PTO2TensorMap bad{};
     DeviceArena bad_arena;
-    int32_t ws[PTO2_MAX_RING_DEPTH] = {8, 8, 8, 8};
-    auto layout = PTO2TensorMap::reserve_layout(bad_arena, 8, 64, ws);
+    auto layout = PTO2TensorMap::reserve_layout(bad_arena, 8, 64, WINDOW_SIZE);
     ASSERT_NE(bad_arena.commit(), nullptr);
     EXPECT_TRUE(bad.init_data_from_layout(layout, bad_arena));
     bad.wire_arena_pointers(layout, bad_arena);
@@ -327,7 +324,7 @@ TEST_F(TensorMapTest, StaleEntriesSkippedDuringLookup) {
     tmap.insert(t, PTO2TaskId::make(0, 1));
 
     // Advance validity to skip task 0
-    tmap.sync_validity(0, 1);
+    tmap.sync_validity(1);
 
     TestLookupResult result;
     run_lookup(tmap, t, result);
@@ -335,20 +332,21 @@ TEST_F(TensorMapTest, StaleEntriesSkippedDuringLookup) {
     EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 1));
 }
 
-TEST_F(TensorMapTest, StaleEntriesNotTruncatedAcrossRings) {
+TEST_F(TensorMapTest, StaleEntryDoesNotTruncateChain) {
     Tensor t = make_test_tensor(0x1000, 256);
-    // Ring 0, task 0 and Ring 1, task 0 -> same bucket
+    // Two tasks in the same bucket; the older one will become stale. Lookup
+    // must skip the stale entry without truncating traversal of the chain.
     tmap.insert(t, PTO2TaskId::make(0, 0));
-    tmap.insert(t, PTO2TaskId::make(1, 0));
+    tmap.insert(t, PTO2TaskId::make(0, 1));
 
-    // Invalidate ring 0 only
-    tmap.sync_validity(0, 1);
+    // Invalidate task 0 only
+    tmap.sync_validity(1);
 
     TestLookupResult result;
     run_lookup(tmap, t, result);
-    // Ring 1 task 0 still valid, ring 0 task 0 invalidated
+    // Task 1 still valid, task 0 invalidated
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(1, 0));
+    EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 1));
 }
 
 // =============================================================================
@@ -363,7 +361,7 @@ TEST_F(TensorMapTest, CleanupRetiredRemovesEntriesForRetiredTasks) {
     EXPECT_EQ(tmap.valid_count(), 3);
 
     // Cleanup tasks [0, 2) on ring 0
-    tmap.cleanup_retired(0, 0, 2);
+    tmap.cleanup_retired(0, 2);
 
     EXPECT_EQ(tmap.valid_count(), 1);
 
@@ -373,19 +371,20 @@ TEST_F(TensorMapTest, CleanupRetiredRemovesEntriesForRetiredTasks) {
     EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 2));
 }
 
-TEST_F(TensorMapTest, CleanupRetiredPreservesOtherRings) {
+TEST_F(TensorMapTest, CleanupRetiredPreservesUnretiredTasks) {
     Tensor t = make_test_tensor(0x1000, 256);
     tmap.insert(t, PTO2TaskId::make(0, 0));
-    tmap.insert(t, PTO2TaskId::make(1, 0));
+    tmap.insert(t, PTO2TaskId::make(0, 1));
 
-    tmap.cleanup_retired(0, 0, 1);
+    // Retire only task 0; task 1 (a distinct task slot) must survive.
+    tmap.cleanup_retired(0, 1);
 
     EXPECT_EQ(tmap.valid_count(), 1);
 
     TestLookupResult result;
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(1, 0));
+    EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 1));
 }
 
 TEST_F(TensorMapTest, CleanupRetiredFreesEntriesToPool) {
@@ -394,7 +393,7 @@ TEST_F(TensorMapTest, CleanupRetiredFreesEntriesToPool) {
     EXPECT_EQ(tmap.free_num, 0);
     EXPECT_EQ(tmap.next_entry_idx, 1);
 
-    tmap.cleanup_retired(0, 0, 1);
+    tmap.cleanup_retired(0, 1);
 
     EXPECT_EQ(tmap.free_num, 1) << "Cleaned entry should be in free list";
 
@@ -405,27 +404,26 @@ TEST_F(TensorMapTest, CleanupRetiredFreesEntriesToPool) {
 }
 
 // =============================================================================
-// Multi-ring isolation
+// Lazy invalidation by threshold
 // =============================================================================
 
-TEST_F(TensorMapTest, MultiRingIndependentLookup) {
+TEST_F(TensorMapTest, LookupHonorsValidityThreshold) {
     Tensor t = make_test_tensor(0x1000, 256);
+    tmap.insert(t, PTO2TaskId::make(0, 3));
     tmap.insert(t, PTO2TaskId::make(0, 5));
-    tmap.insert(t, PTO2TaskId::make(1, 3));
-    tmap.insert(t, PTO2TaskId::make(2, 7));
+    tmap.insert(t, PTO2TaskId::make(0, 7));
 
     TestLookupResult result;
     run_lookup(tmap, t, result);
     EXPECT_EQ(result.count, 3);
 
-    // Invalidate ring 0 up to task 6 and ring 2 up to task 8
-    tmap.sync_validity(0, 6);
-    tmap.sync_validity(2, 8);
+    // Advance validity past tasks 3 and 5; only task 7 stays valid.
+    tmap.sync_validity(7);
 
     TestLookupResult result2;
     run_lookup(tmap, t, result2);
     EXPECT_EQ(result2.count, 1);
-    EXPECT_EQ(result2.entries[0].entry->producer_task_id, PTO2TaskId::make(1, 3));
+    EXPECT_EQ(result2.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 7));
 }
 
 // =============================================================================
@@ -468,7 +466,7 @@ TEST_F(TensorMapTest, FreeListRecycling) {
     for (int i = 0; i < 10; i++) {
         tmap.insert(t, PTO2TaskId::make(0, i));
     }
-    tmap.cleanup_retired(0, 0, 10);
+    tmap.cleanup_retired(0, 10);
     EXPECT_EQ(tmap.free_num, 10);
 
     // Re-insert should use free list
@@ -493,7 +491,7 @@ TEST_F(TensorMapTest, PerTaskEntryListTracksMultipleOutputs) {
     EXPECT_EQ(tmap.valid_count(), 2);
 
     // Cleanup task 5 should remove both entries
-    tmap.cleanup_retired(0, 5, 6);
+    tmap.cleanup_retired(5, 6);
     EXPECT_EQ(tmap.valid_count(), 0);
     EXPECT_EQ(tmap.free_num, 2);
 }
@@ -513,7 +511,7 @@ TEST_F(TensorMapTest, RemoveMiddleEntryPreservesChain) {
     tmap.insert(t, tid2);
 
     // Remove middle entry (task 1)
-    tmap.cleanup_retired(0, 1, 2);
+    tmap.cleanup_retired(1, 2);
 
     TestLookupResult result;
     run_lookup(tmap, t, result);

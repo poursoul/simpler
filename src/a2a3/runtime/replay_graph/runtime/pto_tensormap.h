@@ -76,10 +76,10 @@ struct PTO2TensorMapLayout {
     size_t off_buckets;
     size_t off_entry_pool;
     size_t off_free_entry_list;
-    size_t off_task_entry_heads[PTO2_MAX_RING_DEPTH];
+    size_t off_task_entry_heads;
     int32_t num_buckets;
     int32_t pool_size;
-    int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
+    int32_t task_window_size;
 };
 
 // TensorMap Lookup Profiling (must precede inline lookup/insert methods).
@@ -368,20 +368,18 @@ struct PTO2TensorMap {
     int32_t next_entry_idx;                // id when next entry insert
     int32_t free_num;                      // free entry number in entry pool
 
-    // Per-ring per-task entry tracking (for efficient bucket cleanup)
-    // Indexed by [ring_id][local_id & (task_window_sizes[ring_id] - 1)]
-    PTO2TensorMapEntry **task_entry_heads[PTO2_MAX_RING_DEPTH];
-    int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];  // Per-ring task window size (for slot masking)
+    // Per-task entry tracking (for efficient bucket cleanup)
+    // Indexed by [local_id & (task_window_size - 1)]
+    PTO2TensorMapEntry **task_entry_heads;
+    int32_t task_window_size;  // Task window size (for slot masking)
 
-    // Per-ring validity threshold (for lazy invalidation)
-    int32_t last_task_alives[PTO2_MAX_RING_DEPTH];  // Cached from shared memory per ring
+    // Validity threshold (for lazy invalidation)
+    int32_t last_task_alive;  // Cached from shared memory
 
-    // Per-ring cleanup progress (for periodic cleanup_retired)
-    int32_t last_cleanup[PTO2_MAX_RING_DEPTH]{};
+    // Cleanup progress (for periodic cleanup_retired)
+    int32_t last_cleanup{};
 
-    uint32_t get_task_local_id_slot(uint8_t ring_id, uint32_t task_local_id) const {
-        return task_local_id & (task_window_sizes[ring_id] - 1);
-    }
+    uint32_t get_task_local_id_slot(uint32_t task_local_id) const { return task_local_id & (task_window_size - 1); }
 
     // Accessors read by scope_stats_collector. Declared unconditionally so the
     // collector .cpp compiles at PTO2_PROFILING=0 (collector is unconditional —
@@ -438,16 +436,14 @@ struct PTO2TensorMap {
      * the returned layout descriptor. Must be called before the arena is
      * committed.
      */
-    static PTO2TensorMapLayout reserve_layout(
-        DeviceArena &arena, int32_t num_buckets, int32_t pool_size, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH]
-    );
+    static PTO2TensorMapLayout
+    reserve_layout(DeviceArena &arena, int32_t num_buckets, int32_t pool_size, int32_t task_window_size);
 
     /**
      * Same as reserve_layout() with default sizes (PTO2_TENSORMAP_NUM_BUCKETS,
      * PTO2_TENSORMAP_POOL_SIZE).
      */
-    static PTO2TensorMapLayout
-    reserve_layout_default(DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+    static PTO2TensorMapLayout reserve_layout_default(DeviceArena &arena, int32_t task_window_size);
 
     /**
      * Phase 3a: write everything *except* arena-internal pointer fields
@@ -476,7 +472,7 @@ struct PTO2TensorMap {
      *
      * @param last_task_alive  Current value from shared memory
      */
-    void sync_validity(int32_t ring_id, int32_t last_task_alive) { this->last_task_alives[ring_id] = last_task_alive; }
+    void sync_validity(int32_t new_last_task_alive) { this->last_task_alive = new_last_task_alive; }
 
     /**
      * Lookup producer for a tensor region
@@ -572,26 +568,23 @@ struct PTO2TensorMap {
      * @param old_last_task_alive  Previous threshold
      * @param new_last_task_alive  New threshold
      */
-    void cleanup_retired(int32_t ring_id, int32_t old_last_task_alive, int32_t new_last_task_alive) {
-        // Iterate through retired tasks on this ring and remove their entries
+    void cleanup_retired(int32_t old_last_task_alive, int32_t new_last_task_alive) {
+        // Iterate through retired tasks and remove their entries
         for (int32_t local_id = old_last_task_alive; local_id < new_last_task_alive; local_id++) {
-            int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
-            PTO2TensorMapEntry *cur_entry = task_entry_heads[ring_id][task_slot];
+            int32_t task_slot = local_id & (task_window_size - 1);
+            PTO2TensorMapEntry *cur_entry = task_entry_heads[task_slot];
 
             while (cur_entry != nullptr) {
                 PTO2TensorMapEntry *next_entry = cur_entry->next_in_task;  // Save before clearing
                 // Only remove if this entry belongs to the retiring task
                 // (slot may have been reused by a newer task)
-                debug_assert(
-                    cur_entry->producer_task_id ==
-                    PTO2TaskId::make(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id))
-                );
+                debug_assert(cur_entry->producer_task_id == PTO2TaskId::make(0, static_cast<uint32_t>(local_id)));
                 free_entry(*cur_entry);
                 cur_entry = next_entry;
             }
 
-            // Clear task's entry head (slot will be reused by local_id + task_window_sizes[ring_id])
-            task_entry_heads[ring_id][task_slot] = nullptr;
+            // Clear task's entry head (slot will be reused by local_id + task_window_size)
+            task_entry_heads[task_slot] = nullptr;
         }
     }
 
@@ -620,9 +613,8 @@ struct PTO2TensorMap {
         g_insert_count++;
 #endif
         uint32_t bucket_index = hash(addr);
-        auto ring_id = producer_task_id.ring();
         auto local_id = producer_task_id.local();
-        int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
+        int32_t task_slot = local_id & (task_window_size - 1);
 
         entry->producer_task_id = producer_task_id;
 
@@ -636,19 +628,19 @@ struct PTO2TensorMap {
         entry->prev_in_bucket = nullptr;
 
         // Link to task's entry list
-        entry->next_in_task = task_entry_heads[ring_id][task_slot];
+        entry->next_in_task = task_entry_heads[task_slot];
         entry->prev_in_task = nullptr;
         if (entry->next_in_task != nullptr) {
             entry->next_in_task->prev_in_task = entry;
         }
-        task_entry_heads[ring_id][task_slot] = entry;
+        task_entry_heads[task_slot] = entry;
     }
 
     /**
      * Check if entry is valid (producer has not retired)
      */
     bool entry_valid(const PTO2TensorMapEntry &entry) const {
-        return static_cast<int32_t>(entry.producer_task_id.local()) >= last_task_alives[entry.producer_task_id.ring()];
+        return static_cast<int32_t>(entry.producer_task_id.local()) >= last_task_alive;
     }
 
     void remove_entry(PTO2TensorMapEntry &entry) {
@@ -665,10 +657,9 @@ struct PTO2TensorMap {
         // Update predecessor's next pointer (O(1) via prev_in_task)
         if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_heads
-            int32_t ring_id = entry.producer_task_id.ring();
             int32_t local_id = static_cast<int32_t>(entry.producer_task_id.local());
-            int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
-            task_entry_heads[ring_id][task_slot] = entry.next_in_task;
+            int32_t task_slot = local_id & (task_window_size - 1);
+            task_entry_heads[task_slot] = entry.next_in_task;
         } else {
             entry.prev_in_task->next_in_task = entry.next_in_task;
         }

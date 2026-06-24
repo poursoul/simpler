@@ -74,12 +74,9 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 void PTO2SchedulerState::print_stats() {
     PTO2SchedulerState *sched = this;
     LOG_INFO_V0("=== Scheduler Statistics ===");
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (sched->ring_sched_states[r].last_task_alive > 0) {
-            LOG_INFO_V0("Ring %d:", r);
-            LOG_INFO_V0("  last_task_alive: %d", sched->ring_sched_states[r].last_task_alive);
-            // dep_pool moved to the orchestrator (replay_graph stage 1).
-        }
+    if (sched->ring_sched_state.last_task_alive > 0) {
+        LOG_INFO_V0("  last_task_alive: %d", sched->ring_sched_state.last_task_alive);
+        // dep_pool moved to the orchestrator (replay_graph stage 1).
     }
 #if PTO2_SCHED_PROFILING
     LOG_INFO_V0("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));

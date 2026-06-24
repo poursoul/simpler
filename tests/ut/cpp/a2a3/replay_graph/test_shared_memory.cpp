@@ -86,30 +86,21 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     EXPECT_EQ(hdr->sched_error_bitmap.load(), 0);
     EXPECT_EQ(hdr->sched_error_code.load(), 0);
 
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        auto &fc = hdr->rings[r].fc;
-        EXPECT_EQ(fc.current_task_index.load(), 0);
-        EXPECT_EQ(fc.last_task_alive.load(), 0);
-    }
+    auto &fc = hdr->ring.fc;
+    EXPECT_EQ(fc.current_task_index.load(), 0);
+    EXPECT_EQ(fc.last_task_alive.load(), 0);
 }
 
 TEST_F(SharedMemoryTest, Validate) { EXPECT_TRUE(handle->validate()); }
 
-TEST_F(SharedMemoryTest, PerRingIndependence) {
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        EXPECT_NE(handle->header->rings[r].task_descriptors, nullptr) << "Ring " << r;
-        EXPECT_NE(handle->header->rings[r].task_payloads, nullptr) << "Ring " << r;
-    }
-    for (int r = 1; r < PTO2_MAX_RING_DEPTH; r++) {
-        EXPECT_NE(handle->header->rings[r].task_descriptors, handle->header->rings[0].task_descriptors) << "Ring " << r;
-    }
+TEST_F(SharedMemoryTest, RingPointersInitialized) {
+    EXPECT_NE(handle->header->ring.task_descriptors, nullptr);
+    EXPECT_NE(handle->header->ring.task_payloads, nullptr);
 }
 
 TEST_F(SharedMemoryTest, PointerAlignment) {
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        auto addr = reinterpret_cast<uintptr_t>(handle->header->rings[r].task_descriptors);
-        EXPECT_EQ(addr % PTO2_ALIGN_SIZE, 0u) << "Ring " << r << " descriptors not aligned";
-    }
+    auto addr = reinterpret_cast<uintptr_t>(handle->header->ring.task_descriptors);
+    EXPECT_EQ(addr % PTO2_ALIGN_SIZE, 0u) << "descriptors not aligned";
 }
 
 TEST_F(SharedMemoryTest, HeaderAlignment) {
@@ -117,25 +108,17 @@ TEST_F(SharedMemoryTest, HeaderAlignment) {
     EXPECT_EQ(header_addr % PTO2_ALIGN_SIZE, 0u) << "Header must be cache-line aligned";
 }
 
-// Descriptor and payload regions don't overlap within or across rings.
+// Descriptor and payload regions don't overlap.
 TEST(SharedMemoryLayout, RegionsNonOverlapping) {
     DeviceArena arena;
     PTO2SharedMemoryHandle *h = make_handle(arena, /*ws=*/64, /*heap=*/4096);
     ASSERT_NE(h, nullptr);
 
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        uintptr_t desc_start = (uintptr_t)h->header->rings[r].task_descriptors;
-        uintptr_t desc_end = desc_start + 64 * sizeof(PTO2TaskDescriptor);
-        uintptr_t payload_start = (uintptr_t)h->header->rings[r].task_payloads;
+    uintptr_t desc_start = (uintptr_t)h->header->ring.task_descriptors;
+    uintptr_t desc_end = desc_start + 64 * sizeof(PTO2TaskDescriptor);
+    uintptr_t payload_start = (uintptr_t)h->header->ring.task_payloads;
 
-        EXPECT_GE(payload_start, desc_end) << "Ring " << r << ": payload region should not overlap descriptors";
-    }
-
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH - 1; r++) {
-        uintptr_t this_payload_end = (uintptr_t)h->header->rings[r].task_payloads + 64 * sizeof(PTO2TaskPayload);
-        uintptr_t next_desc_start = (uintptr_t)h->header->rings[r + 1].task_descriptors;
-        EXPECT_GE(next_desc_start, this_payload_end) << "Ring " << r << " and " << (r + 1) << " should not overlap";
-    }
+    EXPECT_GE(payload_start, desc_end) << "payload region should not overlap descriptors";
 }
 
 // =============================================================================
@@ -155,18 +138,10 @@ TEST(SharedMemoryCalcSize, LargerWindowGivesLargerSize) {
 
 TEST(SharedMemoryCalcSize, HeaderAligned) { EXPECT_EQ(sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE, 0u); }
 
-TEST(SharedMemoryCalcSize, PerRingDifferentSizes) {
-    uint64_t ws[PTO2_MAX_RING_DEPTH] = {128, 256, 512, 1024};
-    uint64_t size = PTO2SharedMemoryHandle::calculate_size_per_ring(ws);
-
-    uint64_t uniform_size = PTO2SharedMemoryHandle::calculate_size(128);
-    EXPECT_GT(size, uniform_size);
-}
-
-TEST(SharedMemoryLayout, InitPerRingWritesHeaderValues) {
-    uint64_t ws[PTO2_MAX_RING_DEPTH] = {16, 32, 64, 128};
-    uint64_t heaps[PTO2_MAX_RING_DEPTH] = {10 * 1024, 20 * 1024, 30 * 1024, 40 * 1024};
-    const uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(ws);
+TEST(SharedMemoryLayout, InitWritesHeaderValues) {
+    const uint64_t ws = 64;
+    const uint64_t heap = 20 * 1024;
+    const uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(ws);
 
     DeviceArena arena;
     const size_t off_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
@@ -177,27 +152,21 @@ TEST(SharedMemoryLayout, InitPerRingWritesHeaderValues) {
     std::memset(handle, 0, sizeof(*handle));
     void *buffer = arena.region_ptr(off_buffer);
     std::memset(buffer, 0, static_cast<size_t>(sm_size));
-    ASSERT_TRUE(handle->init_per_ring(buffer, sm_size, ws, heaps));
+    ASSERT_TRUE(handle->init(buffer, sm_size, ws, heap));
 
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        EXPECT_EQ(handle->header->rings[r].task_window_size, ws[r]);
-        EXPECT_EQ(handle->header->rings[r].heap_size, heaps[r]);
-        EXPECT_EQ(handle->header->rings[r].task_window_mask, static_cast<int32_t>(ws[r] - 1));
-    }
+    EXPECT_EQ(handle->header->ring.task_window_size, ws);
+    EXPECT_EQ(handle->header->ring.heap_size, heap);
+    EXPECT_EQ(handle->header->ring.task_window_mask, static_cast<int32_t>(ws - 1));
 }
 
-TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
-    uint64_t ws[PTO2_MAX_RING_DEPTH] = {16, 32, 64, 128};
-    uint64_t heaps[PTO2_MAX_RING_DEPTH] = {10 * 1024, 20 * 1024, 30 * 1024, 40 * 1024};
-    int32_t dep_caps[PTO2_MAX_RING_DEPTH] = {4, 8, 16, 32};
-    const uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(ws);
-    uint64_t total_heap = 0;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        total_heap += heaps[r];
-    }
+TEST(RuntimeArenaLayout, ConfigInitializesRuntimeComponents) {
+    const uint64_t ws = 64;
+    const uint64_t heap = 20 * 1024;
+    const int32_t dep_cap = 16;
+    const uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(ws);
 
     DeviceArena runtime_arena;
-    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(runtime_arena, ws, heaps, dep_caps);
+    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(runtime_arena, ws, heap, dep_cap);
     ASSERT_NE(runtime_arena.commit(DeviceArena::kDefaultBaseAlign), nullptr);
 
     DeviceArena sm_arena;
@@ -206,59 +175,31 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
     void *sm = sm_arena.region_ptr(sm_off);
     std::memset(sm, 0, static_cast<size_t>(sm_size));
 
-    std::vector<char> gm(static_cast<size_t>(total_heap));
+    std::vector<char> gm(static_cast<size_t>(heap));
     PTO2Runtime *rt =
-        runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, sm, sm_size, gm.data(), heaps);
+        runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, sm, sm_size, gm.data(), heap);
     ASSERT_NE(rt, nullptr);
     runtime_wire_arena_pointers(runtime_arena, layout, rt);
 
-    EXPECT_EQ(rt->gm_heap_size, total_heap);
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        EXPECT_EQ(layout.task_window_sizes[r], ws[r]);
-        EXPECT_EQ(layout.heap_sizes[r], heaps[r]);
-        EXPECT_EQ(layout.dep_pool_capacities[r], dep_caps[r]);
-        EXPECT_EQ(rt->orchestrator.rings[r].task_allocator.window_size(), static_cast<int32_t>(ws[r]));
-        EXPECT_EQ(rt->orchestrator.rings[r].task_allocator.heap_capacity(), heaps[r]);
-        EXPECT_EQ(rt->orchestrator.rings[r].fanin_pool.capacity, dep_caps[r]);
-        EXPECT_EQ(rt->orchestrator.rings[r].dep_pool.capacity, dep_caps[r]);
-    }
-}
-
-TEST(RuntimeArenaLayout, RejectsOverflowingPerRingHeapSum) {
-    uint64_t ws[PTO2_MAX_RING_DEPTH] = {16, 32, 64, 128};
-    uint64_t heaps[PTO2_MAX_RING_DEPTH] = {std::numeric_limits<uint64_t>::max(), 1, 0, 0};
-    int32_t dep_caps[PTO2_MAX_RING_DEPTH] = {4, 8, 16, 32};
-
-    DeviceArena runtime_arena;
-    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(runtime_arena, ws, heaps, dep_caps);
-    ASSERT_NE(runtime_arena.commit(DeviceArena::kDefaultBaseAlign), nullptr);
-
-    char sm = 0;
-    char gm = 0;
-    EXPECT_EQ(runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, &sm, 0, &gm, heaps), nullptr);
-
-    PTO2OrchestratorState orch{};
-    EXPECT_FALSE(orch.init_data_from_layout(layout.orch, runtime_arena, &sm, &gm, heaps, ws));
+    EXPECT_EQ(rt->gm_heap_size, heap);
+    EXPECT_EQ(layout.task_window_size, ws);
+    EXPECT_EQ(layout.heap_size, heap);
+    EXPECT_EQ(layout.dep_pool_capacity, dep_cap);
+    EXPECT_EQ(rt->orchestrator.ring.task_allocator.window_size(), static_cast<int32_t>(ws));
+    EXPECT_EQ(rt->orchestrator.ring.task_allocator.heap_capacity(), heap);
+    EXPECT_EQ(rt->orchestrator.ring.fanin_pool.capacity, dep_cap);
+    EXPECT_EQ(rt->orchestrator.ring.dep_pool.capacity, dep_cap);
 }
 
 // =============================================================================
 // Boundary conditions
 // =============================================================================
 
-// Zero window size: all ring descriptor pointers collapse to the same address.
+// Zero window size: SM collapses to just the header region.
 TEST(SharedMemoryBoundary, ZeroWindowSize) {
     uint64_t size = PTO2SharedMemoryHandle::calculate_size(0);
     uint64_t header_size = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     EXPECT_EQ(size, header_size);
-
-    DeviceArena arena;
-    PTO2SharedMemoryHandle *h = make_handle(arena, /*ws=*/0, /*heap=*/4096);
-    if (h) {
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH - 1; r++) {
-            EXPECT_EQ(h->header->rings[r].task_descriptors, h->header->rings[r + 1].task_descriptors)
-                << "Zero window: all rings' descriptor pointers collapse to same address";
-        }
-    }
 }
 
 TEST(SharedMemoryBoundary, ValidateDetectsCorruption) {
@@ -267,7 +208,7 @@ TEST(SharedMemoryBoundary, ValidateDetectsCorruption) {
     ASSERT_NE(h, nullptr);
     EXPECT_TRUE(h->validate());
 
-    h->header->rings[0].fc.current_task_index.store(-1);
+    h->header->ring.fc.current_task_index.store(-1);
     EXPECT_FALSE(h->validate());
 }
 

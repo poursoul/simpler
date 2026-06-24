@@ -44,18 +44,18 @@
  * pools, scope arrays, plus the nested PTO2TensorMap layout).
  */
 struct PTO2OrchestratorLayout {
-    size_t off_fanin_pool[PTO2_MAX_RING_DEPTH];
-    size_t off_fanin_seen_epoch[PTO2_MAX_RING_DEPTH];
+    size_t off_fanin_pool;
+    size_t off_fanin_seen_epoch;
     // Wiring sub-regions, moved off the scheduler layout: the orchestrator now
     // owns the fanout dep_pool entries, the wiring SPSC buffer, and the
     // initial-ready handoff array (replay_graph stage 1).
-    size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
+    size_t off_dep_pool_entries;
     size_t off_wiring_spsc_buffer;
     size_t off_initial_ready;
     size_t off_scope_tasks;
     size_t off_scope_begins;
     PTO2TensorMapLayout tensor_map;
-    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
+    int32_t dep_pool_capacity;
     uint64_t spsc_capacity;
     int32_t initial_ready_cap;
     int32_t scope_tasks_cap;
@@ -75,9 +75,9 @@ struct PTO2OrchestratorState {
     // === SHARED MEMORY ACCESS ===
     PTO2SharedMemoryHeader *sm_header;
 
-    // === PER-RING RESOURCES ===
-    PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
-    uint32_t *fanin_seen_epoch[PTO2_MAX_RING_DEPTH];
+    // === RING RESOURCES (single ring) ===
+    PTO2RingSet ring;
+    uint32_t *fanin_seen_epoch;
     uint32_t fanin_seen_current_epoch{1};
 
     // === TENSOR MAP (Private) ===
@@ -167,16 +167,6 @@ struct PTO2OrchestratorState {
     int64_t bytes_allocated;
 #endif
 
-    /**
-     * Get current ring index from scope depth.
-     * Maps scope depth to ring_id: min(scope_depth, PTO2_MAX_RING_DEPTH - 1)
-     */
-    uint8_t current_ring_id() const {
-        int32_t depth = scope_stack_top;
-        if (depth < 0) depth = 0;
-        return depth < PTO2_MAX_RING_DEPTH ? static_cast<uint8_t>(depth) : PTO2_MAX_RING_DEPTH - 1;
-    }
-
     bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
 
     // === WIRING (orchestrator-owned, replay_graph stage 1) ===
@@ -255,14 +245,12 @@ struct PTO2OrchestratorState {
 
         while (wiring.batch_index < wiring.batch_count) {
             PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            int ring_id = ws->ring_id;
-            PTO2DepListPool &dep_pool = rings[ring_id].dep_pool;
+            PTO2DepListPool &dep_pool = ring.dep_pool;
             int32_t wfanin = ws->payload->fanin_actual_count;
             if (wfanin > 0 && dep_pool.available() < wfanin) {
                 report_fatal(
                     PTO2_ERROR_DEP_POOL_OVERFLOW, __FUNCTION__,
-                    "dep_pool exhausted during orch wiring (ring=%d need=%d avail=%d)", ring_id, wfanin,
-                    dep_pool.available()
+                    "dep_pool exhausted during orch wiring (need=%d avail=%d)", wfanin, dep_pool.available()
                 );
                 return wired;
             }
@@ -285,18 +273,12 @@ struct PTO2OrchestratorState {
 
     // === Cold-path API (defined in pto_orchestrator.cpp) ===
 
-    // Phase 1: declare every sub-region (per-ring fanin pool, scope arrays,
-    // tensor_map sub-layout) on the supplied arena. task_window_sizes feeds
+    // Phase 1: declare every sub-region (fanin pool, scope arrays,
+    // tensor_map sub-layout) on the supplied arena. task_window_size feeds
     // the nested tensor_map layout. Returned layout is consumed by
     // init_from_layout.
-    static PTO2OrchestratorLayout reserve_layout(
-        DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-        int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-    );
-    static PTO2OrchestratorLayout reserve_layout(
-        DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-        const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]
-    );
+    static PTO2OrchestratorLayout
+    reserve_layout(DeviceArena &arena, int32_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // sm_dev_base is the SM device address (only stored, never dereferenced);
@@ -305,10 +287,6 @@ struct PTO2OrchestratorState {
     bool init_data_from_layout(
         const PTO2OrchestratorLayout &layout, DeviceArena &arena, void *sm_dev_base, void *gm_heap, uint64_t heap_size,
         uint64_t task_window_size
-    );
-    bool init_data_from_layout(
-        const PTO2OrchestratorLayout &layout, DeviceArena &arena, void *sm_dev_base, void *gm_heap,
-        const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]
     );
 
     // Phase 3b: write the arena-internal pointer fields (scope_tasks,

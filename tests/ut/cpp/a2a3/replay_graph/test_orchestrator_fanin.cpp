@@ -32,14 +32,9 @@ protected:
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
-        gm_heap.resize(4096 * PTO2_MAX_RING_DEPTH);
+        gm_heap.resize(4096);
 
-        int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            task_window_sizes[r] = static_cast<int32_t>(PTO2_TASK_WINDOW_SIZE);
-        }
-
-        orch_layout = PTO2OrchestratorState::reserve_layout(runtime_arena, task_window_sizes);
+        orch_layout = PTO2OrchestratorState::reserve_layout(runtime_arena, static_cast<int32_t>(PTO2_TASK_WINDOW_SIZE));
         sched_layout = PTO2SchedulerState::reserve_layout(runtime_arena);
         ASSERT_NE(runtime_arena.commit(), nullptr);
 
@@ -72,10 +67,8 @@ TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
     ASSERT_TRUE(consumer.task_id().is_valid());
 
-    auto &producer_slot =
-        sm_handle->header->rings[producer.task_id().ring()].get_slot_state_by_task_id(producer.task_id().local());
-    auto &consumer_slot =
-        sm_handle->header->rings[consumer.task_id().ring()].get_slot_state_by_task_id(consumer.task_id().local());
+    auto &producer_slot = sm_handle->header->ring.get_slot_state_by_task_id(producer.task_id().local());
+    auto &consumer_slot = sm_handle->header->ring.get_slot_state_by_task_id(consumer.task_id().local());
 
     ASSERT_NE(consumer_slot.payload, nullptr);
     EXPECT_EQ(consumer_slot.payload->fanin_actual_count, 1);

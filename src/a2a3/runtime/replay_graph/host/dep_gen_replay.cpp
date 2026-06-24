@@ -453,25 +453,20 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     }
     LOG_INFO_V0("dep_gen replay: processing %zu in-memory records (dual-pass)", num_records);
 
-    // Per-ring task window sizes — tensormap masks slot indices and requires
-    // each to be a power of two. Auto-size from the records themselves so each
-    // ring's window comfortably covers its observed max local_id (no slot
-    // aliasing during INOUT+COVERED remove_from_task). Same sizes feed both
-    // maps so they stay in lockstep.
-    int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    uint32_t max_local[PTO2_MAX_RING_DEPTH] = {0};
+    // Task window size — tensormap masks slot indices and requires a power of
+    // two. Auto-size from the records themselves so the window comfortably
+    // covers the observed max local_id (no slot aliasing during INOUT+COVERED
+    // remove_from_task). Same size feeds both maps so they stay in lockstep.
+    uint32_t max_local = 0;
     for (size_t i = 0; i < num_records; i++) {
         PTO2TaskId tid{records[i].task_id};
-        uint8_t ring = tid.ring();
         uint32_t local = tid.local();
-        if (ring < PTO2_MAX_RING_DEPTH && local > max_local[ring]) {
-            max_local[ring] = local;
+        if (local > max_local) {
+            max_local = local;
         }
     }
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        int32_t need = static_cast<int32_t>(max_local[r] + 1);
-        task_window_sizes[r] = ceil_pow2(need < 16 ? 16 : need);
-    }
+    int32_t need = static_cast<int32_t>(max_local + 1);
+    int32_t task_window_size = ceil_pow2(need < 16 ? 16 : need);
 
     int32_t output_count = count_outputs(records, num_records);
     int32_t pool_size = output_count + (output_count / 10) + 64;
@@ -489,9 +484,9 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     DeviceArena replay_arena;
 
     auto oracle_layout =
-        PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
+        PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_size);
     auto annot_layout =
-        PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
+        PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_size);
     if (replay_arena.commit() == nullptr || !tm_oracle.init_data_from_layout(oracle_layout, replay_arena) ||
         !tm_annot.init_data_from_layout(annot_layout, replay_arena)) {
         LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", PTO2_TENSORMAP_NUM_BUCKETS, pool_size);

@@ -243,8 +243,8 @@ void SchedulerContext::log_stall_diagnostics(
     // produce identical TASK lines once per scheduler thread.
     if (thread_idx == 0) {
         int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, submitted_in_ring = 0;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
+        {
+            PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
             int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
             submitted_in_ring += ring_task_count;
             for (int32_t si = 0; si < ring_task_count; si++) {
@@ -285,7 +285,7 @@ void SchedulerContext::log_stall_diagnostics(
                         "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
                         " state=RUNNING fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
                         "running_on=[owner_thread=%d cores=[%s]]",
-                        thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
+                        thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
                     );
                     continue;
                 }
@@ -295,7 +295,7 @@ void SchedulerContext::log_stall_diagnostics(
                     LOG_INFO_V9(
                         "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
                         " state=READY   fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
-                        thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
+                        thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
                     );
                     continue;
                 }
@@ -304,7 +304,7 @@ void SchedulerContext::log_stall_diagnostics(
                 LOG_INFO_V9(
                     "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
                     " state=WAIT    fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
-                    thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
+                    thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
                 );
             }
         }
@@ -906,16 +906,14 @@ int32_t SchedulerContext::init(
         auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
         // Read at one-time boot init, before the SM is reset for the run, so a
         // ring not yet written holds uninitialized memory (0xbe... under ASAN's
-        // malloc-fill). Sum in int64 and only count rings whose value is a
-        // plausible task count — (0, PTO2_SCOPE_TASKS_CAP]; a ring cannot hold
-        // more than the scope cap. This rejects any garbage pattern (negative
-        // or positive), so uninitialized rings contribute 0 (the correct boot
-        // count) while valid counts still add up, with no signed overflow.
+        // malloc-fill). Only count the ring when its value is a plausible task
+        // count — (0, PTO2_SCOPE_TASKS_CAP]; a ring cannot hold more than the
+        // scope cap. This rejects any garbage pattern (negative or positive),
+        // so an uninitialized ring contributes 0 (the correct boot count) while
+        // a valid count still applies, with no signed overflow.
         int64_t pto2_count = 0;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
-            if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) pto2_count += ring_tasks;
-        }
+        int32_t ring_tasks = header->ring.fc.current_task_index.load(std::memory_order_acquire);
+        if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) pto2_count += ring_tasks;
         total_tasks_ = static_cast<int32_t>(pto2_count);
     } else {
         total_tasks_ = 0;

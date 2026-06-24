@@ -478,25 +478,23 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Wire every arena-internal pointer field (host wrote host-mirror
             // addresses; we overwrite them with device addresses).
             runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
-            for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
-                LOG_INFO_V0(
-                    "Thread %d: Ring %d sizes: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%d", thread_idx, r,
-                    rt->prebuilt_layout.task_window_sizes[r], rt->prebuilt_layout.heap_sizes[r],
-                    rt->prebuilt_layout.dep_pool_capacities[r]
-                );
-            }
+            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(rt->prebuilt_layout.task_window_size);
+            LOG_INFO_V0(
+                "Thread %d: Ring sizes: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%d", thread_idx,
+                rt->prebuilt_layout.task_window_size, rt->prebuilt_layout.heap_size,
+                rt->prebuilt_layout.dep_pool_capacity
+            );
 
-            // Reset SM state. setup_pointers + init_header_per_ring restore
+            // Reset SM state. setup_pointers + init_header restore
             // ring flow-control counters, layout metadata, error flags, and
             // the per-slot ring->slot_states[] (bind_ring + reset_for_reuse +
             // fanin_count/active_mask zero — previously done inside
             // RingSchedState::init).
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->init_per_ring(
-                    sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes, rt->prebuilt_layout.heap_sizes
+            if (!rt->sm_handle->init(
+                    sm_ptr, sm_size, rt->prebuilt_layout.task_window_size, rt->prebuilt_layout.heap_size
                 )) {
-                LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
+                LOG_ERROR("Thread %d: sm_handle->init failed", thread_idx);
                 rt = nullptr;
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
@@ -514,12 +512,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
             {
                 auto &orch = rt->orchestrator;
-                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-                    auto &alloc = orch.rings[r].task_allocator;
-                    scope_stats_set_ring_capacity(
-                        r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacities[r]
-                    );
-                }
+                auto &alloc = orch.ring.task_allocator;
+                scope_stats_set_ring_capacity(
+                    0, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacity
+                );
                 scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
             }
 #endif
@@ -664,10 +660,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // streams that already cover everything inside submit_task().
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {
-                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-                    total_tasks +=
-                        rt->orchestrator.sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
-                }
+                total_tasks = rt->orchestrator.sm_header->ring.fc.current_task_index.load(std::memory_order_acquire);
             }
 
 #if PTO2_PROFILING

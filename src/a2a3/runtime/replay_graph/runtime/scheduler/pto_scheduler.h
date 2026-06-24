@@ -582,7 +582,7 @@ struct PTO2SchedulerState {
         // field stores the device address of the SM ring header — computed via
         // offset arithmetic, no SM dereference. (The fanout dep_pool moved to the
         // orchestrator's PTO2RingSet; replay_graph stage 1.)
-        bool init_data_from_layout(void *sm_dev_base, int32_t ring_id);
+        bool init_data_from_layout(void *sm_dev_base);
         void destroy();
 
         void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
@@ -610,7 +610,7 @@ struct PTO2SchedulerState {
 
             sync_to_sm();
         }
-    } ring_sched_states[PTO2_MAX_RING_DEPTH];
+    } ring_sched_state;
 
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
@@ -663,14 +663,13 @@ struct PTO2SchedulerState {
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-        int32_t ring_id = slot_state.ring_id;
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
+        // Try-lock — if another thread is advancing the ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
+        if (ring_sched_state.advance_lock.compare_exchange_strong(
                 expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
             )) {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
+            ring_sched_state.advance_ring_pointers();
+            ring_sched_state.advance_lock.store(0, std::memory_order_release);
         }
     }
 
@@ -697,14 +696,13 @@ struct PTO2SchedulerState {
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-        int32_t ring_id = slot_state.ring_id;
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
+        // Try-lock — if another thread is advancing the ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
+        if (ring_sched_state.advance_lock.compare_exchange_strong(
                 expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
             )) {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
+            ring_sched_state.advance_ring_pointers();
+            ring_sched_state.advance_lock.store(0, std::memory_order_release);
             atomic_count += 2;  // try-lock CAS + unlock store
         } else {
             atomic_count += 1;  // failed try-lock CAS

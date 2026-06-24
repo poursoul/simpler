@@ -63,26 +63,22 @@
 // NOTE: PTO2_TASK_WINDOW_SIZE is now a per-ring default value.
 // Actual window size is passed at runtime to runtime_create_from_sm().
 // Use pto2_task_slot(sched, task_id) for slot calculation.
-#define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
+#define PTO2_TASK_WINDOW_SIZE 16384  // Default task window size (power of 2)
 
-// Multi-ring: number of independent ring layers (HeapRing + TaskRing + DepPool per layer)
-// Scope depth maps to ring index via: min(scope_depth, PTO2_MAX_RING_DEPTH - 1)
-#define PTO2_MAX_RING_DEPTH 4
-
-// Memory pools (per-ring defaults; total = value × PTO2_MAX_RING_DEPTH)
-#define PTO2_HEAP_SIZE (256 * 1024 * 1024)  // 256MB per ring (1GB total)
-#define PTO2_DEP_LIST_POOL_SIZE 16384       // Per-ring dependency list pool entries
+// Memory pools
+#define PTO2_HEAP_SIZE (256 * 1024 * 1024)  // 256MB heap
+#define PTO2_DEP_LIST_POOL_SIZE 16384       // Dependency list pool entries
 #define PTO2_TENSORMAP_POOL_SIZE (65536)    // TensorMap entry pool
 #define PTO2_TENSORMAP_NUM_BUCKETS 4096     // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
-// Hard cap for the scope_tasks buffer. Equals the total in-flight ring slot
-// budget (PTO2_TASK_WINDOW_SIZE × PTO2_MAX_RING_DEPTH): once every ring slot
-// is in flight, no more tasks can ever be pushed regardless of buffer size.
-// scope_tasks_push fatals on overflow rather than growing the arena-owned
-// buffer (which would be UB on the arena's malloc'd backing).
-#define PTO2_SCOPE_TASKS_CAP (PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH)
+// Hard cap for the scope_tasks buffer. Equals the total in-flight slot budget
+// (PTO2_TASK_WINDOW_SIZE): once every ring slot is in flight, no more tasks can
+// ever be pushed regardless of buffer size. scope_tasks_push fatals on overflow
+// rather than growing the arena-owned buffer (which would be UB on the arena's
+// malloc'd backing).
+#define PTO2_SCOPE_TASKS_CAP (PTO2_TASK_WINDOW_SIZE)
 
 // Ready queue
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size

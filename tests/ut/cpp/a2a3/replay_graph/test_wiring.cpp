@@ -64,14 +64,9 @@ protected:
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
-        gm_heap.resize(4096 * PTO2_MAX_RING_DEPTH);
+        gm_heap.resize(4096);
 
-        int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            task_window_sizes[r] = static_cast<int32_t>(PTO2_TASK_WINDOW_SIZE);
-        }
-
-        orch_layout = PTO2OrchestratorState::reserve_layout(runtime_arena, task_window_sizes);
+        orch_layout = PTO2OrchestratorState::reserve_layout(runtime_arena, static_cast<int32_t>(PTO2_TASK_WINDOW_SIZE));
         sched_layout = PTO2SchedulerState::reserve_layout(runtime_arena);
         ASSERT_NE(runtime_arena.commit(), nullptr);
 
@@ -130,7 +125,7 @@ TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    orch.wire_task(orch.rings[0].dep_pool, &task_slot, 0);
+    orch.wire_task(orch.ring.dep_pool, &task_slot, 0);
 
     // fanin_count set to 0 + 1 = 1 (the wiring "+1" sentinel)
     EXPECT_EQ(task_slot.fanin_count, 1);
@@ -168,7 +163,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    orch.wire_task(orch.rings[0].dep_pool, &task_slot, 2);
+    orch.wire_task(orch.ring.dep_pool, &task_slot, 2);
 
     // fanin_count = 2 + 1 = 3
     EXPECT_EQ(task_slot.fanin_count, 3);
@@ -203,7 +198,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    orch.wire_task(orch.rings[0].dep_pool, &task_slot, 2);
+    orch.wire_task(orch.ring.dep_pool, &task_slot, 2);
 
     // fanin_count = 3 (2 + 1)
     EXPECT_EQ(task_slot.fanin_count, 3);
@@ -244,7 +239,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    orch.wire_task(orch.rings[0].dep_pool, &task_slot, 3);
+    orch.wire_task(orch.ring.dep_pool, &task_slot, 3);
 
     // fanin_count = 4 (3 + 1)
     EXPECT_EQ(task_slot.fanin_count, 4);
@@ -354,7 +349,7 @@ TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
 // =============================================================================
 
 TEST_F(WiringTest, AdvanceRingPointersScansConsumed) {
-    auto &rss = sched.ring_sched_states[0];
+    auto &rss = sched.ring_sched_state;
     auto *ring = rss.ring;
 
     // Submit 3 tasks via flow control
@@ -375,7 +370,7 @@ TEST_F(WiringTest, AdvanceRingPointersScansConsumed) {
 }
 
 TEST_F(WiringTest, AdvanceRingPointersStopsAtNonConsumed) {
-    auto &rss = sched.ring_sched_states[0];
+    auto &rss = sched.ring_sched_state;
     auto *ring = rss.ring;
 
     ring->fc.current_task_index.store(5, std::memory_order_release);
@@ -390,7 +385,7 @@ TEST_F(WiringTest, AdvanceRingPointersStopsAtNonConsumed) {
 }
 
 TEST_F(WiringTest, AdvanceRingPointersResetsSlots) {
-    auto &rss = sched.ring_sched_states[0];
+    auto &rss = sched.ring_sched_state;
     auto *ring = rss.ring;
 
     ring->fc.current_task_index.store(1, std::memory_order_release);

@@ -682,8 +682,8 @@ struct PTO2DepListPool {
 // =============================================================================
 
 /**
- * Groups a TaskAllocator and DepPool into one per-depth unit.
- * PTO2_MAX_RING_DEPTH instances provide independent reclamation per scope depth.
+ * Groups a TaskAllocator and DepPool into one ring unit. replay_graph uses a
+ * single instance (the orchestrator's PTO2OrchestratorState::ring).
  */
 struct PTO2RingSet {
     PTO2TaskAllocator task_allocator;

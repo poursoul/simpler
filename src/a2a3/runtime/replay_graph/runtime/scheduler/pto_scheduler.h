@@ -555,11 +555,9 @@ struct PTO2SchedulerLayout {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
     size_t off_early_dispatch_queue_slots;
-    size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
-    size_t off_wiring_spsc_buffer;
     uint64_t ready_queue_capacity;
-    uint64_t spsc_capacity;
-    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
+    // dep_pool entries + wiring SPSC buffer moved to PTO2OrchestratorLayout
+    // (replay_graph stage 1): wiring is owned by the orchestrator now.
 };
 
 /**
@@ -580,36 +578,14 @@ struct PTO2SchedulerState {
         int32_t last_task_alive;
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
-        // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
-        alignas(64) PTO2DepListPool dep_pool;
-#if PTO2_PROFILING
-        // Published only for scope_stats; orchestrator must not read dep_pool's non-atomic counters directly.
-        alignas(64) std::atomic<int32_t> dep_pool_snapshot_tail;
-        std::atomic<int32_t> dep_pool_snapshot_top;
-#endif
-
-        // Initialize arena-internal data + arena-external pointers; does NOT
-        // store dep_pool.base (that lives in the runtime arena and is wired
-        // by SchedulerState::wire_arena_pointers). The `ring` field stores
-        // the device address of the SM ring header — computed via offset
-        // arithmetic, no SM dereference.
+        // Initialize arena-internal data + arena-external pointers. The `ring`
+        // field stores the device address of the SM ring header — computed via
+        // offset arithmetic, no SM dereference. (The fanout dep_pool moved to the
+        // orchestrator's PTO2RingSet; replay_graph stage 1.)
         bool init_data_from_layout(void *sm_dev_base, int32_t ring_id);
         void destroy();
 
         void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
-
-#if PTO2_PROFILING
-        void publish_dep_pool_snapshot() {
-            dep_pool_snapshot_tail.store(dep_pool.tail, std::memory_order_release);
-            dep_pool_snapshot_top.store(dep_pool.top, std::memory_order_release);
-        }
-
-        void read_dep_pool_snapshot(int32_t &tail, int32_t &top) const {
-            top = dep_pool_snapshot_top.load(std::memory_order_acquire);
-            tail = dep_pool_snapshot_tail.load(std::memory_order_acquire);
-            if (tail > top) tail = top;
-        }
-#endif
 
         void advance_ring_pointers() {
             int32_t current_task_index = ring->fc.current_task_index.load(std::memory_order_acquire);
@@ -643,33 +619,10 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
-    // Wiring subsystem — groups all wiring-related state for cache-line isolation.
-    //
-    // Three cache-line regions by writer:
-    //   1. batch_*  / backoff — thread 0 exclusive (local batch buffer)
-    //   2. queue    — SPSC: orchestrator push, thread 0 pop
-    //   3. orch_needs_drain — orchestrator write, thread 0 read
-    struct alignas(64) WiringState {
-        static constexpr uint64_t BATCH_SIZE = 30;
-        static constexpr int BACKOFF_LIMIT = 32;
-
-        // --- Thread 0 exclusive: local batch buffer + backoff ---
-        int batch_count = 0;
-        int batch_index = 0;
-        int backoff_counter = 0;
-        PTO2TaskSlotState *batch[BATCH_SIZE];
-
-        // --- SPSC queue: orchestrator (push) ↔ thread 0 (pop) ---
-        PTO2SpscQueue queue;
-
-        // --- Orchestrator write, thread 0 read ---
-        alignas(64) std::atomic<bool> orch_needs_drain{false};
-    } wiring;
-
-    static_assert(
-        offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue"
-    );
-    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
+    // Wiring (SPSC queue + dep_pool + wire_task/drain_wiring_queue) moved to the
+    // orchestrator (replay_graph stage 1). The scheduler only consumes the
+    // orchestrator's products: it seeds initial_ready into ready_queues and
+    // traverses fanout linked lists read-only during completion.
 
     alignas(64) AsyncWaitList async_wait_list;
 
@@ -681,62 +634,6 @@ struct PTO2SchedulerState {
     // =========================================================================
     // Inline hot-path methods
     // =========================================================================
-
-    /**
-     * Drain wiring queue: pop submitted tasks and wire their fanout edges.
-     * Called by scheduler thread 0 each loop iteration. Sets fanin_count,
-     * acquires fanout_lock per producer, allocates dep_pool entries, and
-     * pushes ready tasks to the appropriate ready queue.
-     *
-     * @return Number of tasks wired this call.
-     */
-
-    int drain_wiring_queue(bool force_drain = false) {
-        int wired = 0;
-
-        // Refill local batch buffer when exhausted.
-        if (wiring.batch_index >= wiring.batch_count) {
-            // Backoff: defer pop when queue holds fewer than a full batch,
-            // unless force_drain, orch_needs_drain, or backoff limit reached.
-            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
-                if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
-                    wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
-                    wiring.backoff_counter++;
-                    return 0;
-                }
-            }
-            wiring.backoff_counter = 0;
-            wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
-            wiring.batch_index = 0;
-            if (wiring.batch_count == 0) return 0;
-        }
-
-        // Process tasks from local buffer in strict FIFO order.
-        while (wiring.batch_index < wiring.batch_count) {
-            PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            int ring_id = ws->ring_id;
-            auto &rss = ring_sched_states[ring_id];
-            int32_t wfanin = ws->payload->fanin_actual_count;
-
-            if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
-                if (rss.dep_pool.available() < wfanin) {
-#if PTO2_PROFILING
-                    if (is_scope_stats_enabled()) {
-                        rss.publish_dep_pool_snapshot();
-                    }
-#endif
-                    break;  // not enough dep_pool space — keep remainder for next call
-                }
-            }
-
-            wiring.batch_index++;
-            wire_task(rss, ws, wfanin);
-            wired++;
-        }
-
-        return wired;
-    }
 
     // Route a ready slot to the right global queue. Dummy tasks (empty
     // active_mask) live in dummy_ready_queue; everything else goes to the
@@ -750,58 +647,6 @@ struct PTO2SchedulerState {
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
         }
-    }
-
-    /**
-     * Wire fanout edges for a single task. Sets fanin_count, acquires each
-     * producer's fanout_lock, allocates dep_pool entries for live producers,
-     * pushes the task to the ready queue once its fanin refcount is satisfied.
-     */
-    void wire_task(RingSchedState &rss, PTO2TaskSlotState *ws, int32_t wfanin) {
-        PTO2TaskPayload *wp = ws->payload;
-        ws->fanin_count = wfanin + 1;
-
-        if (wfanin != 0) {
-            int32_t early_finished = 0;
-            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-                producer->lock_fanout();
-                int32_t pstate = producer->task_state.load(std::memory_order_acquire);
-                if (pstate >= PTO2_TASK_COMPLETED) {
-                    early_finished++;
-                } else {
-                    producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
-                }
-                producer->unlock_fanout();
-            });
-
-            // Seed dispatch_fanin with producers already complete at wiring
-            // time (e.g. buffer-creator tasks that finished before this
-            // consumer entered the graph). Such producers never dispatch at
-            // runtime, so they can never bump dispatch_fanin via the fanout
-            // walk; without this seed the candidate compare
-            // (dispatch_fanin == fanin_actual_count) would be unreachable
-            // whenever any producer is pre-completed. Mirrors the
-            // early_finished seed that ready_fanin gets via init_rc.
-            if (early_finished != 0) {
-                wp->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
-            }
-
-            int32_t init_rc = early_finished + 1;
-            int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
-            if (new_rc >= ws->fanin_count) {
-                push_ready_routed(ws);
-            }
-        } else {
-            ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            push_ready_routed(ws);
-        }
-
-        ws->dep_pool_mark = rss.dep_pool.top;
-#if PTO2_PROFILING
-        if (is_scope_stats_enabled()) {
-            rss.publish_dep_pool_snapshot();
-        }
-#endif
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {
@@ -1292,13 +1137,10 @@ struct PTO2SchedulerState {
 
     // === Cold-path API (defined in pto_scheduler.cpp) ===
 
-    // Phase 1: declare every sub-region (ready_queue slots, dummy queue slots,
-    // per-ring dep_pool entries, wiring SPSC buffer) on the supplied arena.
-    // Capacities are baked into the returned layout; init_data_from_layout uses
-    // the same values.
-    static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
-    static PTO2SchedulerLayout
-    reserve_layout(DeviceArena &arena, const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]);
+    // Phase 1: declare every sub-region (ready_queue slots, dummy queue slots)
+    // on the supplied arena. dep_pool entries + wiring SPSC buffer are reserved
+    // by the orchestrator now (replay_graph stage 1).
+    static PTO2SchedulerLayout reserve_layout(DeviceArena &arena);
 
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // `sm_dev_base` is the device address of the SM (only stored, never

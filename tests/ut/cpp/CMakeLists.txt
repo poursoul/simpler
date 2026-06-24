@@ -429,6 +429,10 @@ add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
 add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
 
+# replay_graph runtime UTs live in their own subdirectory: own OBJECT lib and
+# auto-discovery of test_*.cpp, kept isolated from the trb runtime UTs above.
+add_subdirectory(a2a3/replay_graph)
+
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------

@@ -457,9 +457,10 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
         auto &alloc = orch->rings[ring_id].task_allocator;
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
-        if (orch->scheduler) {
-            orch->scheduler->ring_sched_states[ring_id].read_dep_pool_snapshot(dep_pool_tail, dep_pool_top);
-        }
+        // dep_pool is orchestrator-owned now (replay_graph stage 1) — read it
+        // directly instead of via the scheduler's atomic snapshot.
+        dep_pool_tail = orch->rings[ring_id].dep_pool.tail;
+        dep_pool_top = orch->rings[ring_id].dep_pool.top;
         scope_stats_begin(
             ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
@@ -486,9 +487,10 @@ void PTO2OrchestratorState::end_scope() {
         auto &alloc = orch->rings[ring_id].task_allocator;
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
-        if (orch->scheduler) {
-            orch->scheduler->ring_sched_states[ring_id].read_dep_pool_snapshot(dep_pool_tail, dep_pool_top);
-        }
+        // dep_pool is orchestrator-owned now (replay_graph stage 1) — read it
+        // directly instead of via the scheduler's atomic snapshot.
+        dep_pool_tail = orch->rings[ring_id].dep_pool.tail;
+        dep_pool_top = orch->rings[ring_id].dep_pool.top;
         scope_stats_end(
             ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
@@ -541,7 +543,6 @@ static TaskOutputTensors submit_task_common(
         return result;
     }
     uint8_t ring_id = prepared.task_id.ring();
-    PTO2SchedulerState *sched = orch->scheduler;
     PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
     PTO2TaskId task_id = prepared.task_id;
     PTO2TaskSlotState &cur_slot_state = *prepared.slot_state;
@@ -701,12 +702,12 @@ static TaskOutputTensors submit_task_common(
     g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
 
-    // === STEP 6: push to wiring queue ===
-    // Deferred wiring: orchestrator only stores dependency metadata and increments
-    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
-    // is handled asynchronously by scheduler thread 0 via the wiring queue.
-    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    while (!sched->wiring.queue.push(&cur_slot_state)) {
+    // === STEP 6: push to the orchestrator-owned wiring queue ===
+    // submit_task only stores dependency metadata and increments fanout_count;
+    // it pushes the task into the orchestrator's own wiring queue. The actual
+    // fanout_head wiring (lock + dep_pool + early_finished) runs later in
+    // run_wiring(), after orchestration completes (replay_graph stage 1).
+    while (!orch->wiring.queue.push(&cur_slot_state)) {
         SPIN_WAIT_HINT();
     }
 

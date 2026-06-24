@@ -72,7 +72,7 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         return LoopAction::BREAK_LOOP;
     }
 
-    bool orch_done = orchestrator_done_;
+    bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
     if (!orch_done) return LoopAction::NONE;
 
     task_count = total_tasks_;
@@ -923,7 +923,7 @@ int32_t SchedulerContext::init(
     completed_tasks_.store(0, std::memory_order_release);
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
-    orchestrator_done_ = false;
+    orchestrator_done_.store(false, std::memory_order_relaxed);
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
@@ -971,9 +971,10 @@ void SchedulerContext::deinit() {
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
-    orchestrator_done_ = false;
+    orchestrator_done_.store(false, std::memory_order_relaxed);
     pto2_init_claimed_.store(false, std::memory_order_release);
     pto2_init_complete_.store(false, std::memory_order_release);
+    pto2_seed_claimed_.store(false, std::memory_order_release);
 
     // Reset core transition state
     transition_requested_.store(false, std::memory_order_release);
@@ -1037,7 +1038,11 @@ void SchedulerContext::on_orchestration_done(
         rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
 #endif
     }
-    orchestrator_done_ = true;
+    // Release: publishes everything the orchestrator thread wrote before this
+    // point — including the wiring-built dependency graph (fanout lists in
+    // dep_pool, fanin refcounts, initial_ready) — to scheduler threads that
+    // observe orchestrator_done_ via acquire. (replay_graph stage 1)
+    orchestrator_done_.store(true, std::memory_order_release);
 
     // Check for fatal error from orchestration; if so, shut down immediately.
     int32_t orch_err = 0;

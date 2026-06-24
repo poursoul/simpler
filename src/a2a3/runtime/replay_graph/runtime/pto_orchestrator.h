@@ -46,10 +46,18 @@
 struct PTO2OrchestratorLayout {
     size_t off_fanin_pool[PTO2_MAX_RING_DEPTH];
     size_t off_fanin_seen_epoch[PTO2_MAX_RING_DEPTH];
+    // Wiring sub-regions, moved off the scheduler layout: the orchestrator now
+    // owns the fanout dep_pool entries, the wiring SPSC buffer, and the
+    // initial-ready handoff array (replay_graph stage 1).
+    size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
+    size_t off_wiring_spsc_buffer;
+    size_t off_initial_ready;
     size_t off_scope_tasks;
     size_t off_scope_begins;
     PTO2TensorMapLayout tensor_map;
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
+    uint64_t spsc_capacity;
+    int32_t initial_ready_cap;
     int32_t scope_tasks_cap;
     uint64_t scope_stack_capacity;
 };
@@ -92,6 +100,43 @@ struct PTO2OrchestratorState {
     // In real mode, they communicate via shared memory only
     PTO2SchedulerState *scheduler;  // For simulated mode only
 
+    // === WIRING (orchestrator-owned) ===
+    // replay_graph stage 1: wiring is fully owned by the orchestrator. submit_task
+    // only pushes into this queue; run_wiring() drains it after orchestration,
+    // builds the fanout linked lists in rings[].dep_pool, and produces the
+    // initial-ready handoff array consumed by the scheduler. The SPSC queue is
+    // kept (not collapsed into submit_task) so submit and wiring can be pipelined
+    // once the orchestrator runs multi-threaded.
+    struct alignas(64) WiringState {
+        static constexpr uint64_t BATCH_SIZE = 30;
+        static constexpr int BACKOFF_LIMIT = 32;
+
+        // --- single-thread exclusive: local batch buffer + backoff ---
+        int batch_count = 0;
+        int batch_index = 0;
+        int backoff_counter = 0;
+        PTO2TaskSlotState *batch[BATCH_SIZE];
+
+        // --- SPSC queue: submit (push) ↔ drain (pop) ---
+        PTO2SpscQueue queue;
+
+        // --- reserved for future submit/drain pipelining ---
+        alignas(64) std::atomic<bool> orch_needs_drain{false};
+    } wiring;
+
+    static_assert(
+        offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue"
+    );
+    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
+
+    // Initial-ready handoff (orchestrator → scheduler, single direction). wire_task
+    // appends every task whose fanin is satisfied at wiring time; the scheduler
+    // seeds these into its ready_queues before dispatch. A construction-time
+    // pure-function product, reusable across future multi-pass scheduling.
+    PTO2TaskSlotState **initial_ready;
+    int32_t initial_ready_count;
+    int32_t initial_ready_capacity;
+
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
@@ -133,6 +178,110 @@ struct PTO2OrchestratorState {
     }
 
     bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
+
+    // === WIRING (orchestrator-owned, replay_graph stage 1) ===
+
+    // Append a task whose fanin is satisfied at wiring time to the initial-ready
+    // handoff array (seeded into the scheduler's ready_queues before dispatch).
+    void push_initial_ready(PTO2TaskSlotState *ws) {
+        if (initial_ready_count >= initial_ready_capacity) {
+            report_fatal(
+                PTO2_ERROR_DEP_POOL_OVERFLOW, __FUNCTION__, "initial_ready overflow (count=%d cap=%d)",
+                initial_ready_count, initial_ready_capacity
+            );
+            return;
+        }
+        initial_ready[initial_ready_count++] = ws;
+    }
+
+    // Wire one task's fanout edges into the given ring's dep_pool and seed its
+    // fanin refcount. Moved off the scheduler (was PTO2SchedulerState::wire_task):
+    // builds fanout linked lists the scheduler later traverses read-only. Producers
+    // are still PENDING during the orch phase except for inline-completed alloc
+    // tasks, so early_finished is normally 0 but the branch is kept for those.
+    void wire_task(PTO2DepListPool &dep_pool, PTO2TaskSlotState *ws, int32_t wfanin) {
+        PTO2TaskPayload *wp = ws->payload;
+        ws->fanin_count = wfanin + 1;
+
+        if (wfanin != 0) {
+            int32_t early_finished = 0;
+            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+                producer->lock_fanout();
+                int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+                if (pstate >= PTO2_TASK_COMPLETED) {
+                    early_finished++;
+                } else {
+                    producer->fanout_head = dep_pool.prepend(producer->fanout_head, ws);
+                }
+                producer->unlock_fanout();
+            });
+
+            if (early_finished != 0) {
+                wp->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
+            }
+
+            int32_t init_rc = early_finished + 1;
+            int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
+            if (new_rc >= ws->fanin_count) {
+                push_initial_ready(ws);
+            }
+        } else {
+            ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
+            push_initial_ready(ws);
+        }
+
+        ws->dep_pool_mark = dep_pool.top;
+    }
+
+    // Drain a batch of submitted tasks from the wiring queue and wire each. No
+    // task is CONSUMED during the orch phase, so dep_pool cannot be reclaimed —
+    // its capacity must hold every fanout edge of the whole graph. Overflow is
+    // fatal rather than a spin (reclamation can never make progress here).
+    int drain_wiring_queue(bool force_drain = false) {
+        int wired = 0;
+        if (wiring.batch_index >= wiring.batch_count) {
+            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
+                if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
+                    wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
+                    wiring.backoff_counter++;
+                    return 0;
+                }
+            }
+            wiring.backoff_counter = 0;
+            wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
+            wiring.batch_index = 0;
+            if (wiring.batch_count == 0) return 0;
+        }
+
+        while (wiring.batch_index < wiring.batch_count) {
+            PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
+            int ring_id = ws->ring_id;
+            PTO2DepListPool &dep_pool = rings[ring_id].dep_pool;
+            int32_t wfanin = ws->payload->fanin_actual_count;
+            if (wfanin > 0 && dep_pool.available() < wfanin) {
+                report_fatal(
+                    PTO2_ERROR_DEP_POOL_OVERFLOW, __FUNCTION__,
+                    "dep_pool exhausted during orch wiring (ring=%d need=%d avail=%d)", ring_id, wfanin,
+                    dep_pool.available()
+                );
+                return wired;
+            }
+            wiring.batch_index++;
+            wire_task(dep_pool, ws, wfanin);
+            wired++;
+        }
+
+        return wired;
+    }
+
+    // Drain the entire wiring queue after orchestration completes. Single-threaded
+    // for now (submit fully precedes wiring); becomes pipelinable when the orch
+    // runs multi-threaded.
+    void run_wiring() {
+        while (drain_wiring_queue(/*force_drain=*/true) > 0) {
+            if (fatal) return;
+        }
+    }
 
     // === Cold-path API (defined in pto_orchestrator.cpp) ===
 

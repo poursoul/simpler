@@ -806,6 +806,25 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
     }
 
+    // replay_graph stage 1: run orch fully before sched. One-time init above
+    // already published pto2_init_complete_, which unblocks the orchestrator's
+    // wait_pto2_init_complete() so it can run submit + wiring. Now wait until the
+    // orchestrator publishes the dependency graph (orchestration_done_), then seed
+    // the initial-ready handoff into the ready queues exactly once. Other
+    // scheduler threads skip the seed and pick the tasks up by polling the ready
+    // queues in the dispatch loop. is_completed() guards against orch-fatal so a
+    // failed orchestration doesn't leave threads spinning forever.
+    while (!orchestration_done() && !is_completed()) {
+        SPIN_WAIT_HINT();
+    }
+    if (rt_ != nullptr && !pto2_seed_claimed_.exchange(true, std::memory_order_acq_rel)) {
+        PTO2OrchestratorState &orch = rt_->orchestrator;
+        for (int32_t i = 0; i < orch.initial_ready_count; i++) {
+            sched_->push_ready_routed(orch.initial_ready[i]);
+        }
+        LOG_INFO_V0("Thread %d: seeded %d initial-ready tasks", thread_idx, orch.initial_ready_count);
+    }
+
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;
     // Non-zero once a scheduler-hang timeout latches; returned in place of the
@@ -1041,17 +1060,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             continue;
         }
 
-        // Phase 3: Drain wiring queue (thread 0 only)
+        // Phase 3 (wiring) removed: wiring runs entirely in the orchestrator now
+        // (replay_graph stage 1). `wired` stays 0 so the profiling block below is
+        // skipped.
         int wired = 0;
-        if (thread_idx == 0) {
-            wired = sched_->drain_wiring_queue(orchestrator_done_);
-            if (wired > 0) {
-                made_progress = true;
-#if PTO2_SCHED_PROFILING
-                l2_swimlane.phase_wiring_count += wired;
-#endif
-            }
-        }
 #if PTO2_PROFILING
         CYCLE_COUNT_LAP(l2_swimlane.sched_wiring_cycle);
         // Wire outer phase: emit one bar covering this iter's drain_wiring_queue

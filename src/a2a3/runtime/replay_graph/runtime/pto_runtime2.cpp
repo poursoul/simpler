@@ -161,7 +161,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         }
         seg[seg_count++] = &s;
         if (!signaled) {
-            orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
+            orch.wiring.orch_needs_drain.store(true, std::memory_order_release);
             signaled = true;
         }
     };
@@ -187,7 +187,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
 
     do_wait();
     if (signaled) {
-        orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
+        orch.wiring.orch_needs_drain.store(false, std::memory_order_release);
     }
     return !failed;
 }

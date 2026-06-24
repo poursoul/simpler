@@ -101,6 +101,12 @@ public:
     int32_t aic_count() const { return aic_count_; }
     int32_t aiv_count() const { return aiv_count_; }
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
+    // replay_graph: scheduler threads gate dispatch behind this (set by
+    // on_orchestration_done after submit + wiring finish). Acquire pairs with the
+    // release store in on_orchestration_done so the scheduler sees the orch-built
+    // dependency graph (fanout lists, dep_pool, fanin refcounts, initial_ready)
+    // that the orchestrator thread wrote before flipping the flag.
+    bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
 
     // Block until the first scheduler thread has finished one-time PTO2 init.
@@ -145,9 +151,12 @@ private:
     // --- Task-execution tracking ---
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
-    // Device orchestration: set by last orchestrator when graph is built; schedulers poll it.
-    // volatile prevents the compiler from hoisting the load out of spin loops.
-    volatile bool orchestrator_done_{false};
+    // Device orchestration: set by the orchestrator once the graph is built;
+    // scheduler threads poll it before dispatch. Atomic (not volatile) so the
+    // release store publishes the orch-built dependency graph to the acquiring
+    // scheduler threads — replay_graph builds wiring on the orchestrator thread,
+    // so the scheduler must observe those writes via this handoff (stage 1).
+    std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
     uint64_t *func_id_to_addr_{nullptr};
 
@@ -182,6 +191,9 @@ private:
     // --- One-time init coordination ---
     std::atomic<bool> pto2_init_claimed_{false};
     std::atomic<bool> pto2_init_complete_{false};
+    // replay_graph: claimed once after the orchestration_done_ barrier so a single
+    // scheduler thread seeds initial_ready into the ready queues.
+    std::atomic<bool> pto2_seed_claimed_{false};
 
     // =========================================================================
     // Core management (scheduler_cold_path.cpp)

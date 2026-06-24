@@ -569,6 +569,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
 
+            // replay_graph stage 1: wiring is an orchestrator step that runs after
+            // all submit_task calls. Single-threaded for now (submit fully precedes
+            // wiring); drains the wiring queue, builds the fanout graph in the
+            // orchestrator's dep_pool, and fills the initial_ready handoff — all
+            // before on_orchestration_done releases the scheduler threads.
+            rt->orchestrator.run_wiring();
+
             // Flush the (potentially partially-filled) DepGenBuffer so the host
             // collector can pick it up before this orchestrator thread joins.
             if (is_dep_gen_enabled()) {
@@ -695,6 +702,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         while (!runtime_init_ready_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();
         }
+        // replay_graph stage 1: the "run orch fully before sched" barrier lives
+        // INSIDE resolve_and_dispatch, after one-time init — not here. Gating
+        // dispatch on orchestration_done_ at this point would deadlock: the
+        // orchestrator's wait_pto2_init_complete() (above, before it runs submit +
+        // wiring) waits on the scheduler's one-time init, which only happens once
+        // the scheduler enters resolve_and_dispatch.
         if (rt == nullptr) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {

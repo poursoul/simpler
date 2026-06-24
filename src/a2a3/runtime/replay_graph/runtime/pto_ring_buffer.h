@@ -688,6 +688,11 @@ struct PTO2DepListPool {
 struct PTO2RingSet {
     PTO2TaskAllocator task_allocator;
     PTO2FaninPool fanin_pool;
+    // Fanout dependency-list pool. Owned by the orchestrator: wiring builds the
+    // fanout linked list here during the orch phase; the scheduler only reads it
+    // (read-only traversal in on_task_complete). Moved off the scheduler's
+    // RingSchedState so wiring is fully decoupled from the scheduler.
+    PTO2DepListPool dep_pool;
 };
 
 #endif  // PTO_RING_BUFFER_H

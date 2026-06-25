@@ -11,28 +11,24 @@
 /**
  * Unit tests for PTO2TaskAllocator from pto_ring_buffer.h
  *
- * Tests ring buffer allocation, heap bump logic, wrap-around, alignment,
- * task window flow control, and heap_available semantics.
+ * replay_graph is single-shot: the arena is filled exactly once and never
+ * wraps, and the scheduler does not run during the orch phase so nothing is
+ * ever reclaimed. The allocator is therefore a pure bump — running out of
+ * either the task window or the heap is a fatal sizing error, not a
+ * back-pressure / spin condition.
  *
- * The allocator is single-threaded (orchestrator thread), so no concurrency
- * tests are needed. The unified PTO2TaskAllocator replaces the previous
- * separate PTO2HeapRing + PTO2TaskRing.
+ * Design contracts (pure bump):
  *
- * Design contracts (try_bump_heap):
+ * - Task slots and heap bytes are handed out monotonically. task_id grows by
+ *   1 per alloc; slot == task_id (single-shot never wraps, so no modulo).
  *
- * - Wrap-around guard uses `tail > alloc_size` (strict >).  When
- *   tail == alloc_size the wrap branch returns nullptr.  Allowing it
- *   would create top == tail (full/empty ambiguity).  Strict >
- *   sacrifices one quantum of capacity.
+ * - heap_available() is simply heap_size - heap_top: no wrap, no reclaim.
  *
- * - heap_available() returns max(at_end, at_begin), not the sum.
- *   A single allocation cannot split across the wrap boundary.
+ * - Zero-size allocation is a no-op for the heap top, returning the current
+ *   position. Two consecutive zero-size allocs return the SAME pointer.
  *
- * - Zero-size allocation is a no-op returning the current top.
- *   Two consecutive zero-size allocs return the SAME pointer.
- *
- * - Wrap path wasted space: space between old top and heap_size is not
- *   reclaimed.  Inherent ring-buffer fragmentation cost.
+ * - Exceeding the task window -> fatal (PTO2_ERROR_FLOW_CONTROL_DEADLOCK).
+ *   Exceeding the heap -> fatal (PTO2_ERROR_HEAP_RING_DEADLOCK).
  */
 
 #include <gtest/gtest.h>
@@ -46,26 +42,6 @@
 #include "pto_ring_buffer.h"
 
 // =============================================================================
-// Helpers
-//
-// WHITE-BOX: consume_up_to simulates the scheduler consuming tasks by directly
-// writing descriptor.packed_buffer_end and advancing last_alive.  This binds
-// to the internal tail-derivation mechanism.  If the allocator's reclaim
-// protocol changes (e.g. explicit tail field instead of packed_buffer_end),
-// this helper and all wrap/reclaim tests must be updated.
-// =============================================================================
-
-static void consume_up_to(
-    std::vector<PTO2TaskDescriptor> &descriptors, std::atomic<int32_t> &last_alive, void *heap_base,
-    int32_t window_size, int32_t new_last_alive, uint64_t heap_tail_offset
-) {
-    int32_t last_consumed = new_last_alive - 1;
-    descriptors[last_consumed & (window_size - 1)].packed_buffer_end =
-        static_cast<char *>(heap_base) + heap_tail_offset;
-    last_alive.store(new_last_alive, std::memory_order_release);
-}
-
-// =============================================================================
 // Fixture
 // =============================================================================
 
@@ -77,7 +53,6 @@ protected:
     std::vector<PTO2TaskDescriptor> descriptors;
     alignas(64) uint8_t heap_buf[HEAP_SIZE]{};
     std::atomic<int32_t> current_index{0};
-    std::atomic<int32_t> last_alive{0};
     std::atomic<int32_t> error_code{PTO2_ERROR_NONE};
     PTO2TaskAllocator allocator{};
 
@@ -85,9 +60,8 @@ protected:
         descriptors.assign(WINDOW_SIZE, PTO2TaskDescriptor{});
         std::memset(heap_buf, 0, sizeof(heap_buf));
         current_index.store(0);
-        last_alive.store(0);
         error_code.store(PTO2_ERROR_NONE);
-        allocator.init(descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code);
+        allocator.init(descriptors.data(), WINDOW_SIZE, &current_index, heap_buf, HEAP_SIZE, &error_code);
     }
 };
 
@@ -101,6 +75,9 @@ TEST_F(TaskAllocatorTest, InitialState) {
     EXPECT_EQ(allocator.heap_top(), 0u);
     EXPECT_EQ(allocator.heap_capacity(), HEAP_SIZE);
     EXPECT_EQ(allocator.heap_available(), HEAP_SIZE);
+    EXPECT_EQ(allocator.task_tail(), 0);
+    EXPECT_EQ(allocator.task_head(), 0);
+    EXPECT_EQ(allocator.heap_tail(), 0u);
 }
 
 TEST_F(TaskAllocatorTest, AllocNonZeroSize) {
@@ -125,10 +102,12 @@ TEST_F(TaskAllocatorTest, SequentialTaskIds) {
         auto result = allocator.alloc(0);
         ASSERT_FALSE(result.failed()) << "Alloc failed at i=" << i;
         EXPECT_EQ(result.task_id, prev_id + 1) << "Task IDs must be monotonically increasing";
-        EXPECT_EQ(result.slot, result.task_id & (WINDOW_SIZE - 1));
+        EXPECT_EQ(result.slot, result.task_id) << "slot == task_id (single-shot never wraps)";
         prev_id = result.task_id;
     }
     EXPECT_EQ(allocator.active_count(), 5);
+    EXPECT_EQ(allocator.task_head(), 5);
+    EXPECT_EQ(current_index.load(), 5) << "current_index published to shared memory";
 }
 
 TEST_F(TaskAllocatorTest, OutputSizeAlignment) {
@@ -148,81 +127,34 @@ TEST_F(TaskAllocatorTest, OutputSizeAlignment) {
     EXPECT_EQ(allocator.heap_top(), 192u);
 }
 
-TEST_F(TaskAllocatorTest, SlotMappingPowerOfTwoWindow) {
+TEST_F(TaskAllocatorTest, SlotEqualsTaskId) {
+    // Single-shot fill: every slot is the task id itself, distinct across the
+    // window (no modulo, no reuse).
     std::set<int32_t> slots;
-    for (int i = 0; i < WINDOW_SIZE; i++) {
-        consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, i, 0);
+    for (int i = 0; i < WINDOW_SIZE - 1; i++) {
         auto r = allocator.alloc(0);
         ASSERT_FALSE(r.failed());
-        EXPECT_EQ(r.slot, r.task_id & (WINDOW_SIZE - 1));
+        EXPECT_EQ(r.slot, r.task_id);
         slots.insert(r.slot);
     }
-    EXPECT_EQ(slots.size(), static_cast<size_t>(WINDOW_SIZE))
-        << "Every slot should be visited exactly once over one window cycle";
+    EXPECT_EQ(slots.size(), static_cast<size_t>(WINDOW_SIZE - 1)) << "Every slot is allocated exactly once";
 }
 
-TEST_F(TaskAllocatorTest, UpdateHeapTailFromConsumedTask) {
-    auto r1 = allocator.alloc(256);
-    ASSERT_FALSE(r1.failed());
-    EXPECT_EQ(allocator.heap_top(), 256u);
-
-    EXPECT_EQ(allocator.heap_available(), HEAP_SIZE - 256u);
-
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 256);
-
-    // Force the allocator to observe the new last_alive by doing another alloc
-    auto r2 = allocator.alloc(0);
-    ASSERT_FALSE(r2.failed());
-
-    // top=256, tail=256: at_end = 4096-256=3840, at_begin = 256
-    EXPECT_EQ(allocator.heap_available(), HEAP_SIZE - 256u);
-}
-
-TEST_F(TaskAllocatorTest, UpdateHeapTailAtTask0) {
-    auto r1 = allocator.alloc(64);
-    ASSERT_FALSE(r1.failed());
-    EXPECT_EQ(r1.task_id, 0);
-
-    descriptors[0].packed_buffer_end = static_cast<char *>(static_cast<void *>(heap_buf)) + 64;
-    last_alive.store(1, std::memory_order_release);
-
-    auto r2 = allocator.alloc(0);
-    ASSERT_FALSE(r2.failed());
-    EXPECT_EQ(r2.task_id, 1);
-}
-
-TEST_F(TaskAllocatorTest, UpdateHeapTailIdempotent) {
-    auto r1 = allocator.alloc(128);
-    ASSERT_FALSE(r1.failed());
-
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 128);
-
-    auto r2 = allocator.alloc(0);
-    ASSERT_FALSE(r2.failed());
-    uint64_t avail_after_first = allocator.heap_available();
-
-    auto r3 = allocator.alloc(0);
-    ASSERT_FALSE(r3.failed());
-    EXPECT_EQ(allocator.heap_available(), avail_after_first);
-}
-
-TEST_F(TaskAllocatorTest, HeapAvailableTopGeTail) {
+// Heap bump advances monotonically; heap_available shrinks by the aligned size.
+TEST_F(TaskAllocatorTest, HeapBumpMonotonic) {
     EXPECT_EQ(allocator.heap_available(), HEAP_SIZE);
 
     auto r1 = allocator.alloc(256);
     ASSERT_FALSE(r1.failed());
+    EXPECT_EQ(allocator.heap_top(), 256u);
     EXPECT_EQ(allocator.heap_available(), HEAP_SIZE - 256u);
-}
-
-TEST_F(TaskAllocatorTest, HeapAvailableTopLtTail) {
-    auto r1 = allocator.alloc(HEAP_SIZE - 64);
-    ASSERT_FALSE(r1.failed());
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, HEAP_SIZE - 64);
 
     auto r2 = allocator.alloc(128);
     ASSERT_FALSE(r2.failed());
-    // top=128, tail=HEAP_SIZE-64: available = (HEAP_SIZE-64) - 128
-    EXPECT_EQ(allocator.heap_available(), HEAP_SIZE - 64 - 128);
+    EXPECT_EQ(allocator.heap_top(), 384u);
+    EXPECT_EQ(allocator.heap_available(), HEAP_SIZE - 384u);
+    // Buffers do not overlap and are contiguous.
+    EXPECT_EQ(r2.packed_base, static_cast<char *>(r1.packed_end));
 }
 
 // =============================================================================
@@ -239,87 +171,7 @@ TEST_F(TaskAllocatorTest, HeapExactFitAtEnd) {
     ASSERT_FALSE(r2.failed());
     EXPECT_EQ(allocator.heap_top(), HEAP_SIZE);
     EXPECT_EQ(static_cast<char *>(r2.packed_base), reinterpret_cast<char *>(heap_buf) + HEAP_SIZE - 64);
-}
-
-// Wrap guard `tail > alloc_size` uses strict > to prevent full/empty ambiguity.
-// If the allocation were allowed, heap_top would advance to alloc_size == tail,
-// making top == tail.  Because top == tail is the canonical "empty" state, the
-// ring could not distinguish "completely full" from "completely empty".
-TEST_F(TaskAllocatorTest, HeapWrapGuardRejectsTailEqualsAllocSize) {
-    auto r1 = allocator.alloc(HEAP_SIZE);
-    ASSERT_FALSE(r1.failed());
-    EXPECT_EQ(allocator.heap_top(), HEAP_SIZE);
-
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 64);
-
-    auto r2 = allocator.alloc(64);
-    EXPECT_TRUE(r2.failed()) << "wrap guard must reject when tail == alloc_size (full/empty ambiguity)";
-}
-
-TEST_F(TaskAllocatorTest, HeapWrapAroundSuccess) {
-    auto r1 = allocator.alloc(HEAP_SIZE);
-    ASSERT_FALSE(r1.failed());
-
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 128);
-
-    auto r2 = allocator.alloc(64);
-    ASSERT_FALSE(r2.failed());
-    EXPECT_EQ(r2.packed_base, static_cast<void *>(heap_buf));
-    EXPECT_EQ(allocator.heap_top(), 64u);
-}
-
-// Linear-gap guard `tail - top > alloc_size` uses strict > for the same reason.
-TEST_F(TaskAllocatorTest, HeapLinearGapGuardRejectsExactFit) {
-    // Fill most of heap, leaving just 64 at end so next alloc wraps.
-    auto r1 = allocator.alloc(HEAP_SIZE - 64);
-    ASSERT_FALSE(r1.failed());
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, HEAP_SIZE - 64);
-
-    // Allocate 128 bytes: space_at_end = 64, not enough -> wrap.
-    // tail = HEAP_SIZE-64, which is > 128 -> wraps to beginning.
-    auto r2 = allocator.alloc(128);
-    ASSERT_FALSE(r2.failed());
-    EXPECT_EQ(allocator.heap_top(), 128u);
-
-    // Now top=128, tail=HEAP_SIZE-64 (top < tail)
-    // gap = (HEAP_SIZE-64) - 128 = HEAP_SIZE-192
-    // Allocate exactly gap bytes: gap > alloc_size -> FALSE
-    uint64_t gap = (HEAP_SIZE - 64) - 128;
-    auto r3 = allocator.alloc(gap);
-    EXPECT_TRUE(r3.failed()) << "linear-gap guard must reject exact fit (full/empty ambiguity)";
-}
-
-TEST_F(TaskAllocatorTest, HeapTopLessThanTailInsufficientSpace) {
-    auto r1 = allocator.alloc(HEAP_SIZE - 64);
-    ASSERT_FALSE(r1.failed());
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, HEAP_SIZE - 64);
-
-    auto r2 = allocator.alloc(128);
-    ASSERT_FALSE(r2.failed());
-
-    // gap = (HEAP_SIZE-64) - 128. Try to allocate more than gap.
-    auto r3 = allocator.alloc(HEAP_SIZE);
-    EXPECT_TRUE(r3.failed());
-    EXPECT_NE(error_code.load(), 0);
-}
-
-// heap_available reports max(at_end, at_begin), not the sum -- a single
-// allocation cannot split across the wrap boundary.
-TEST_F(TaskAllocatorTest, AvailableReportsMaxNotSum) {
-    auto r1 = allocator.alloc(3008);
-    ASSERT_FALSE(r1.failed());
-    uint64_t actual_top = allocator.heap_top();
-
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, 1024);
-
-    auto r_probe = allocator.alloc(0);
-    ASSERT_FALSE(r_probe.failed());
-
-    uint64_t avail = allocator.heap_available();
-    uint64_t at_end = HEAP_SIZE - actual_top;
-    uint64_t at_begin = 1024;
-    EXPECT_EQ(avail, std::max(at_end, at_begin));
-    EXPECT_LT(avail, at_end + at_begin);
+    EXPECT_EQ(allocator.heap_available(), 0u);
 }
 
 // Zero-size allocs return the same address and don't advance the top.
@@ -334,23 +186,9 @@ TEST_F(TaskAllocatorTest, ZeroSizeAllocationAliased) {
     EXPECT_EQ(allocator.heap_top(), 0u) << "top doesn't advance for zero-size allocs";
 }
 
-// Wrap path: wasted space between old top and heap_size is not reclaimed.
-TEST_F(TaskAllocatorTest, WrapPathWastedSpace) {
-    auto r1 = allocator.alloc(4000);
-    ASSERT_FALSE(r1.failed());
-    uint64_t top_after = allocator.heap_top();
-    EXPECT_GE(top_after, 4000u);
-    EXPECT_LT(top_after, HEAP_SIZE);
-
-    consume_up_to(descriptors, last_alive, heap_buf, WINDOW_SIZE, 1, top_after);
-
-    auto r2 = allocator.alloc(128);
-    ASSERT_FALSE(r2.failed());
-    EXPECT_EQ(r2.packed_base, static_cast<void *>(heap_buf)) << "Allocation wrapped to beginning";
-
-    uint64_t avail = allocator.heap_available();
-    EXPECT_LT(avail, HEAP_SIZE) << "Wasted space at end reduces available capacity";
-}
+// =============================================================================
+// Overflow is fatal (no back-pressure, no spin)
+// =============================================================================
 
 TEST_F(TaskAllocatorTest, AllocExactlyHeapSize) {
     auto r1 = allocator.alloc(HEAP_SIZE);
@@ -369,6 +207,18 @@ TEST_F(TaskAllocatorTest, AllocLargerThanHeap) {
     EXPECT_EQ(error_code.load(), PTO2_ERROR_HEAP_RING_DEADLOCK);
 }
 
+TEST_F(TaskAllocatorTest, HeapOverflowDoesNotAdvanceTop) {
+    auto r1 = allocator.alloc(HEAP_SIZE - 64);
+    ASSERT_FALSE(r1.failed());
+    uint64_t top_before = allocator.heap_top();
+
+    // 128 needed but only 64 left -> fatal, top unchanged.
+    auto r2 = allocator.alloc(128);
+    EXPECT_TRUE(r2.failed());
+    EXPECT_EQ(error_code.load(), PTO2_ERROR_HEAP_RING_DEADLOCK);
+    EXPECT_EQ(allocator.heap_top(), top_before) << "Failed alloc must not advance the heap top";
+}
+
 TEST_F(TaskAllocatorTest, TaskWindowSaturates) {
     for (int i = 0; i < WINDOW_SIZE - 1; i++) {
         auto r = allocator.alloc(0);
@@ -380,31 +230,40 @@ TEST_F(TaskAllocatorTest, TaskWindowSaturates) {
     auto overflow = allocator.alloc(0);
     EXPECT_TRUE(overflow.failed());
     EXPECT_EQ(error_code.load(), PTO2_ERROR_FLOW_CONTROL_DEADLOCK);
+    EXPECT_EQ(allocator.active_count(), WINDOW_SIZE - 1) << "Failed alloc must not bump the task counter";
 }
 
-// Task IDs grow monotonically as int32_t. Near INT32_MAX, the same
-// signed-overflow concern applies but is cosmetic since we use
-// task_id & window_mask for indexing.
-TEST_F(TaskAllocatorTest, TaskIdNearInt32Max) {
-    current_index.store(INT32_MAX - 2);
-    last_alive.store(INT32_MAX - 2);
+// Single-shot bounds task_id by the window, so a seed must stay below
+// window_size. Allocation resumes from the seed and slot mirrors task_id
+// directly (no modulo). The window guard still fires once head + 1 == window.
+TEST_F(TaskAllocatorTest, TaskIdNonZeroSeed) {
+    constexpr int32_t SEED = 10;
+    current_index.store(SEED);
     allocator.init(
-        descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code,
-        /*initial_local_task_id=*/INT32_MAX - 2
+        descriptors.data(), WINDOW_SIZE, &current_index, heap_buf, HEAP_SIZE, &error_code,
+        /*initial_local_task_id=*/SEED
     );
 
     auto r1 = allocator.alloc(0);
     ASSERT_FALSE(r1.failed());
-    EXPECT_EQ(r1.task_id, INT32_MAX - 2);
-    EXPECT_EQ(r1.slot, (INT32_MAX - 2) & (WINDOW_SIZE - 1));
+    EXPECT_EQ(r1.task_id, SEED);
+    EXPECT_EQ(r1.slot, SEED) << "slot == task_id (single-shot never wraps)";
+    EXPECT_EQ(current_index.load(), SEED + 1);
 
     auto r2 = allocator.alloc(0);
     ASSERT_FALSE(r2.failed());
-    EXPECT_EQ(r2.task_id, INT32_MAX - 1);
+    EXPECT_EQ(r2.task_id, SEED + 1);
+    EXPECT_EQ(r2.slot, SEED + 1);
 
-    auto r3 = allocator.alloc(0);
-    ASSERT_FALSE(r3.failed());
-    EXPECT_EQ(r3.task_id, INT32_MAX);
-    EXPECT_GE(r3.slot, 0);
-    EXPECT_LT(r3.slot, WINDOW_SIZE);
+    // head is now SEED+2 == 12; the guard rejects once head + 1 >= 16,
+    // i.e. when head reaches 15. Allocate up to head==15, the last success.
+    for (int32_t head = 12; head < 15; head++) {
+        auto r = allocator.alloc(0);  // head 12->13, 13->14, 14->15
+        ASSERT_FALSE(r.failed()) << "alloc failed early at head=" << head;
+    }
+    EXPECT_EQ(allocator.task_head(), 15);
+
+    auto overflow = allocator.alloc(0);  // head 15, 15 + 1 >= 16 -> fatal
+    EXPECT_TRUE(overflow.failed());
+    EXPECT_EQ(error_code.load(), PTO2_ERROR_FLOW_CONTROL_DEADLOCK);
 }

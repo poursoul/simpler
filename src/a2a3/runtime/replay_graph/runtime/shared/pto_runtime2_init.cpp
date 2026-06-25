@@ -217,11 +217,9 @@ bool PTO2OrchestratorState::init_data_from_layout(
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
     auto *task_descs_dev = pto2_sm_layout::ring_task_descriptors_addr(sm_dev_base);
     auto *cur_idx_dev = pto2_sm_layout::ring_current_task_index_addr(sm_dev_base);
-    auto *last_alive_dev = pto2_sm_layout::ring_last_task_alive_addr(sm_dev_base);
 
     orch->ring.task_allocator.init(
-        task_descs_dev, static_cast<int32_t>(task_window_size), cur_idx_dev, last_alive_dev, gm_heap, heap_size,
-        orch_err
+        task_descs_dev, static_cast<int32_t>(task_window_size), cur_idx_dev, gm_heap, heap_size, orch_err
     );
 
     const size_t fanin_pool_bytes =

@@ -15,7 +15,7 @@
  *
  * 1. TaskAllocator - Unified task slot + output buffer allocation
  *    - Combines task ring (slot allocation) and heap ring (output buffer allocation)
- *    - Single spin-wait loop with unified back-pressure and deadlock detection
+ *    - Single-shot pure bump: the arena fills once and never wraps; overflow is fatal
  *    - O(1) bump allocation for both task slots and heap buffers
  *
  * 2. FaninPool - Fanin spill entry allocation
@@ -42,18 +42,6 @@
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
 
-#if PTO2_PROFILING
-// Heap-ring wrap reporting — the allocator is the only place each individual
-// wrap is observable, so it notifies the scope_stats collector here. Gated:
-// pays nothing (no include, no call) when profiling is compiled out.
-#include "aicpu/scope_stats_collector_aicpu.h"
-#endif
-
-// Block notification interval (in spin counts)
-#define PTO2_BLOCK_NOTIFY_INTERVAL 10000
-// Alloc spin limit - after this, report deadlock and exit
-#define PTO2_ALLOC_SPIN_LIMIT 100000
-
 // Dep pool spin limit - if exceeded, dep pool capacity too small for workload
 #define PTO2_DEP_POOL_SPIN_LIMIT 100000
 
@@ -68,8 +56,10 @@
  * single-threaded, both pointers (task index, heap top) are tracked locally
  * and published to shared memory via plain store — no fetch_add or CAS needed.
  *
- * The alloc() method checks both resources BEFORE committing to either,
- * eliminating the need for rollback on partial failure.
+ * replay_graph is single-shot: the arena is filled exactly once and never
+ * wraps, and the scheduler does not run during the orch phase so nothing is
+ * ever reclaimed. alloc() is therefore a pure bump — running out of either the
+ * task window or the heap is a fatal sizing error, not a back-pressure spin.
  */
 class PTO2TaskAllocator {
 public:
@@ -81,154 +71,95 @@ public:
      * from host code that constructs a prebuilt arena image.
      *
      * Production callers leave `initial_local_task_id` at 0: the SM ring
-     * flow-control counters that current_index_ptr / last_alive_ptr point at
-     * start at zero (PTO2RingFlowControl::init() runs on the AICPU during SM
-     * reset), so we keep local_task_id_ aligned with that without reading the
-     * SM. Tests that drive SM state directly may pass a non-zero seed to
-     * exercise corner cases like task IDs near INT32_MAX.
+     * flow-control counters that current_index_ptr points at start at zero
+     * (PTO2RingFlowControl::init() runs on the AICPU during SM reset), so we
+     * keep local_task_id_ aligned with that without reading the SM. Tests that
+     * drive SM state directly may pass a non-zero in-window seed.
      */
     void init(
-        PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr,
-        std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr,
-        int32_t initial_local_task_id = 0
+        PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr, void *heap_base,
+        uint64_t heap_size, std::atomic<int32_t> *error_code_ptr, int32_t initial_local_task_id = 0
     ) {
         descriptors_ = descriptors;
         window_size_ = window_size;
-        window_mask_ = window_size - 1;
         current_index_ptr_ = current_index_ptr;
-        last_alive_ptr_ = last_alive_ptr;
         heap_base_ = heap_base;
         heap_size_ = heap_size;
         error_code_ptr_ = error_code_ptr;
         local_task_id_ = initial_local_task_id;
         heap_top_ = 0;
-        heap_tail_ = 0;
-        last_alive_seen_ = 0;
     }
 
     /**
      * Allocate a task slot and its associated output buffer in one call.
      *
-     * Both task index and heap top are maintained as local counters and
-     * published to shared memory only on success. Since the orchestrator is
-     * single-threaded, no CAS or fetch_add is needed — just check-then-commit.
+     * replay_graph is single-shot: total tasks <= window and total output
+     * bytes <= heap, the arena is filled exactly once and never wraps, and the
+     * scheduler does not run during the orch phase so nothing is ever reclaimed.
+     * Allocation is therefore a pure bump — running out of either resource is a
+     * fatal sizing error, not a back-pressure condition to spin on.
      *
      * @param output_size  Total packed output size in bytes (0 = no heap needed)
      * @return Allocation result; check failed() for errors
      */
     PTO2TaskAllocResult alloc(int32_t output_size) {
-        uint64_t aligned_size =
-            output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
-
-        int spin_count = 0;
-        int32_t prev_last_alive = last_alive_ptr_->load(std::memory_order_acquire);
-        int32_t last_alive = prev_last_alive;
-        update_heap_tail(last_alive);
-        bool blocked_on_heap = false;
-#if PTO2_ORCH_PROFILING
-        uint64_t wait_start = 0;
-        bool waiting = false;
-#endif
-
-        while (true) {
-            // Check both resources; commit only if both available
-            if (local_task_id_ - last_alive + 1 < window_size_) {
-                void *heap_ptr = try_bump_heap(aligned_size);
-                if (heap_ptr) {
-                    int32_t task_id = commit_task();
-#if PTO2_ORCH_PROFILING
-                    record_wait(spin_count, wait_start, waiting);
-#endif
-                    return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
-                }
-                blocked_on_heap = true;
-            } else {
-                blocked_on_heap = false;
-            }
-
-            // Spin: wait for scheduler to advance last_task_alive
-            spin_count++;
-#if PTO2_ORCH_PROFILING
-            if (!waiting) {
-                wait_start = get_sys_cnt_aicpu();
-                waiting = true;
-            }
-#endif
-            last_alive = last_alive_ptr_->load(std::memory_order_acquire);
-            update_heap_tail(last_alive);
-            if (last_alive > prev_last_alive) {
-                spin_count = 0;
-                prev_last_alive = last_alive;
-            } else {
-                if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
-                    LOG_WARN(
-                        "[TaskAllocator] BLOCKED: tasks=%d/%d, heap=%" PRIu64 "/%" PRIu64 ", on=%s, spins=%d",
-                        local_task_id_ - last_alive, window_size_, heap_top_, heap_size_,
-                        blocked_on_heap ? "heap" : "task", spin_count
-                    );
-                }
-                if (spin_count >= PTO2_ALLOC_SPIN_LIMIT) {
-                    report_deadlock(output_size, blocked_on_heap);
-                    return {-1, -1, nullptr, nullptr};
-                }
-            }
-            SPIN_WAIT_HINT();
+        uint64_t aligned = output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
+        // single-shot fill, no wrap: out-of-bounds is a fatal config error, not a spin
+        if (local_task_id_ + 1 >= window_size_) {
+            report_task_overflow();
+            return {-1, -1, nullptr, nullptr};
         }
+        if (heap_top_ + aligned > heap_size_) {
+            report_heap_overflow(output_size);
+            return {-1, -1, nullptr, nullptr};
+        }
+        void *p = static_cast<char *>(heap_base_) + heap_top_;
+        heap_top_ += aligned;
+        int32_t task_id = local_task_id_++;
+        current_index_ptr_->store(local_task_id_, std::memory_order_release);
+#if PTO2_ORCH_PROFILING
+        extern uint64_t g_orch_alloc_atomic_count;
+        g_orch_alloc_atomic_count += 1;
+#endif
+        return {task_id, task_id, p, static_cast<char *>(p) + aligned};
     }
 
     // =========================================================================
     // State queries
     // =========================================================================
 
-    int32_t active_count() const {
-        int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
-        return local_task_id_ - last_alive;
-    }
+    // Single-shot: nothing is reclaimed during the orch phase, so every
+    // allocated task is still live. active_count == number allocated.
+    int32_t active_count() const { return local_task_id_; }
 
-    // Task ring start/end: tail = oldest live task (last_task_alive), head =
-    // next task id to allocate. head - tail == active_count().
-    int32_t task_tail() const { return last_alive_ptr_->load(std::memory_order_acquire); }
+    // Task ring start/end: head = next task id to allocate. Single-shot never
+    // reclaims, so the tail stays at the origin.
+    int32_t task_tail() const { return 0; }
     int32_t task_head() const { return local_task_id_; }
 
     int32_t window_size() const { return window_size_; }
 
-    uint64_t heap_available() const {
-        uint64_t tail = heap_tail_;
-        if (heap_top_ >= tail) {
-            uint64_t at_end = heap_size_ - heap_top_;
-            uint64_t at_begin = tail;
-            return at_end > at_begin ? at_end : at_begin;
-        }
-        return tail - heap_top_;
-    }
+    // Pure bump: free space is simply what's left between the top and the cap.
+    uint64_t heap_available() const { return heap_size_ - heap_top_; }
 
     uint64_t heap_top() const { return heap_top_; }
-    // Heap ring start: reclaim pointer (oldest byte still live). heap_top() is
-    // the end (next allocation). heap_top - heap_tail == heap_used_bytes().
-    uint64_t heap_tail() const { return heap_tail_; }
+    // Heap ring start: single-shot never reclaims, so the tail stays at 0.
+    uint64_t heap_tail() const { return 0; }
     uint64_t heap_capacity() const { return heap_size_; }
-    uint64_t heap_used_bytes() const {
-        if (heap_size_ == 0) return 0;
-        return (heap_top_ + heap_size_ - heap_tail_) % heap_size_;
-    }
 
 private:
     // --- Task Ring ---
     PTO2TaskDescriptor *descriptors_ = nullptr;
     int32_t window_size_ = 0;
-    int32_t window_mask_ = 0;
     std::atomic<int32_t> *current_index_ptr_ = nullptr;
-    std::atomic<int32_t> *last_alive_ptr_ = nullptr;
 
     // --- Heap ---
     void *heap_base_ = nullptr;
     uint64_t heap_size_ = 0;
 
     // --- Local state (single-writer, no atomics needed) ---
-    int32_t local_task_id_ = 0;    // Next task ID to allocate
-    uint64_t heap_top_ = 0;        // Current heap allocation pointer
-    uint64_t heap_tail_ = 0;       // Heap reclamation pointer (derived from consumed tasks)
-    int32_t last_alive_seen_ = 0;  // last_task_alive at last heap_tail derivation
+    int32_t local_task_id_ = 0;  // Next task ID to allocate
+    uint64_t heap_top_ = 0;      // Current heap allocation pointer
 
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
@@ -238,161 +169,46 @@ private:
     // =========================================================================
 
     /**
-     * Commit a task slot: bump local counter and publish to shared memory.
-     * Must only be called after space check has passed.
+     * Report a fatal task-ring overflow: the single-shot fill needs more task
+     * slots than the window provides. Sizing error, not back-pressure.
      */
-    int32_t commit_task() {
-        int32_t task_id = local_task_id_++;
-        current_index_ptr_->store(local_task_id_, std::memory_order_release);
-        return task_id;
-    }
-
-    /**
-     * Derive heap_tail_ from the last consumed task's packed_buffer_end.
-     *
-     * Every task has a valid packed_buffer_end (equal to packed_buffer_base
-     * for zero-size allocations), so the last consumed task always determines
-     * the correct heap_tail — no backward scan needed.
-     */
-    void update_heap_tail(int32_t last_alive) {
-        if (last_alive <= last_alive_seen_) return;
-        last_alive_seen_ = last_alive;
-
-        PTO2TaskDescriptor &desc = descriptors_[(last_alive - 1) & window_mask_];
-        uint64_t old_tail = heap_tail_;
-        heap_tail_ =
-            static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
-#if PTO2_PROFILING
-        // Reclaim pointer moves forward monotonically in ring order; a decrease
-        // means it wrapped past heap_size_ (occupancy < heap_size_ guarantees at
-        // most one wrap per call). Report it so scope_stats can unroll.
-        if (is_scope_stats_enabled() && heap_tail_ < old_tail) {
-            scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_RECLAIM);
-        }
-#else
-        (void)old_tail;
-#endif
-    }
-
-    /**
-     * Bump the heap pointer for the given allocation size.
-     * Returns the allocated pointer, or nullptr if insufficient space.
-     * When alloc_size == 0, returns current position without advancing.
-     */
-    void *try_bump_heap(uint64_t alloc_size) {
-        uint64_t top = heap_top_;
-        if (alloc_size == 0) {
-            return static_cast<char *>(heap_base_) + top;
-        }
-        uint64_t tail = heap_tail_;
-        void *result;
-
-        if (top >= tail) {
-            uint64_t space_at_end = heap_size_ - top;
-            if (space_at_end >= alloc_size) {
-                result = static_cast<char *>(heap_base_) + top;
-                heap_top_ = top + alloc_size;
-            } else if (tail > alloc_size) {
-                LOG_DEBUG(
-                    "try_bump_heap wrap-around alloc: top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64, top, tail,
-                    alloc_size
-                );
-                result = heap_base_;
-                heap_top_ = alloc_size;
-#if PTO2_PROFILING
-                // Allocation pointer just wrapped past heap_size_; report it so
-                // scope_stats can unroll the wrapping offset into a monotonic value.
-                // The collector attributes the wrap to the current scope's ring.
-                if (is_scope_stats_enabled()) scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_ALLOC);
-#endif
-            } else {
-                LOG_DEBUG(
-                    "try_bump_heap failed (top>=tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
-                    ", heap_size=%" PRIu64,
-                    top, tail, alloc_size, heap_size_
-                );
-                return nullptr;
-            }
-        } else {
-            if (tail - top > alloc_size) {
-                result = static_cast<char *>(heap_base_) + top;
-                heap_top_ = top + alloc_size;
-            } else {
-                LOG_DEBUG(
-                    "try_bump_heap failed (top<tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
-                    ", free_gap=%" PRIu64,
-                    top, tail, alloc_size, tail - top
-                );
-                return nullptr;
-            }
-        }
-
-        return result;
-    }
-
-#if PTO2_ORCH_PROFILING
-    void record_wait(int spin_count, uint64_t wait_start, bool waiting) {
-        if (waiting) {
-            extern uint64_t g_orch_alloc_wait_cycle;
-            g_orch_alloc_wait_cycle += (get_sys_cnt_aicpu() - wait_start);
-        }
-        {
-            extern uint64_t g_orch_alloc_atomic_count;
-            g_orch_alloc_atomic_count += spin_count + 1;
-        }
-    }
-#endif
-
-    /**
-     * Report deadlock with targeted diagnostics.
-     */
-    void report_deadlock(int32_t requested_output_size, bool heap_blocked) {
-        int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
-        int32_t active_tasks = local_task_id_ - last_alive;
-        uint64_t htail = heap_tail_;
-
+    void report_task_overflow() {
         LOG_ERROR("========================================");
-        if (heap_blocked) {
-            LOG_ERROR("FATAL: Task Allocator Deadlock - Heap Exhausted!");
-        } else {
-            LOG_ERROR("FATAL: Task Allocator Deadlock - Task Ring Full!");
-        }
+        LOG_ERROR("FATAL: Task Allocator Overflow - Task Window Full!");
         LOG_ERROR("========================================");
-        LOG_ERROR("No progress after %d spins.", PTO2_ALLOC_SPIN_LIMIT);
         LOG_ERROR(
-            "  Task ring:  current=%d, last_alive=%d, active=%d/%d (%.1f%%)", local_task_id_, last_alive, active_tasks,
-            window_size_, 100.0 * active_tasks / window_size_
+            "  Task ring:  current=%d, window=%d (single-shot fill exceeds window)", local_task_id_, window_size_
         );
-        LOG_ERROR(
-            "  Heap ring:  top=%" PRIu64 ", tail=%" PRIu64 ", size=%" PRIu64 ", available=%" PRIu64, heap_top_, htail,
-            heap_size_, heap_available()
-        );
-        if (heap_blocked) {
-            LOG_ERROR("  Requested:  %d bytes", requested_output_size);
-        }
-        LOG_ERROR("Diagnosis:");
-        LOG_ERROR("  last_task_alive is stuck at %d, meaning task %d", last_alive, last_alive);
-        LOG_ERROR("  cannot transition to CONSUMED. Possible causes:");
-        LOG_ERROR("  1. Task %d still executing (subtasks not complete)", last_alive);
-        LOG_ERROR("  2. Task %d fanout not fully released (downstream not done)", last_alive);
-        LOG_ERROR("  3. Scope reference not released (scope_end not called)");
-        LOG_ERROR("  4. Orchestrator blocked here -> can't call scope_end -> circular wait");
         LOG_ERROR("Solution:");
-        if (heap_blocked) {
-            LOG_ERROR(
-                "  Increase heap size (current: %" PRIu64 ", recommended: %" PRIu64 ")", heap_size_, heap_size_ * 2
-            );
-            LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<bytes> (e.g. %" PRIu64 ")", heap_size_ * 2);
-        } else {
-            LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size_, active_tasks * 2);
-            LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", active_tasks * 2);
-        }
+        LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size_, window_size_ * 2);
+        LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
+        LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", window_size_ * 2);
         LOG_ERROR("========================================");
         if (error_code_ptr_) {
-            int32_t code = heap_blocked ? PTO2_ERROR_HEAP_RING_DEADLOCK : PTO2_ERROR_FLOW_CONTROL_DEADLOCK;
-            error_code_ptr_->store(code, std::memory_order_release);
+            error_code_ptr_->store(PTO2_ERROR_FLOW_CONTROL_DEADLOCK, std::memory_order_release);
+        }
+    }
+
+    /**
+     * Report a fatal heap overflow: the single-shot fill needs more output
+     * bytes than the heap provides. Sizing error, not back-pressure.
+     */
+    void report_heap_overflow(int32_t requested) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Task Allocator Overflow - Heap Exhausted!");
+        LOG_ERROR("========================================");
+        LOG_ERROR(
+            "  Heap ring:  top=%" PRIu64 ", size=%" PRIu64 ", available=%" PRIu64, heap_top_, heap_size_,
+            heap_available()
+        );
+        LOG_ERROR("  Requested:  %d bytes", requested);
+        LOG_ERROR("Solution:");
+        LOG_ERROR("  Increase heap size (current: %" PRIu64 ", recommended: %" PRIu64 ")", heap_size_, heap_size_ * 2);
+        LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
+        LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<bytes> (e.g. %" PRIu64 ")", heap_size_ * 2);
+        LOG_ERROR("========================================");
+        if (error_code_ptr_) {
+            error_code_ptr_->store(PTO2_ERROR_HEAP_RING_DEADLOCK, std::memory_order_release);
         }
     }
 };

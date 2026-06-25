@@ -165,7 +165,9 @@ This project-defined flattened numbering is kept unchanged.
 1. Validate submit arguments.
 2. Allocate mixed-task ID and initialize descriptor/payload/slot_state once.
 3. Lookup producers via TensorMap; collect fanin metadata and increment producers' `fanout_count`.
-4. Push task to scheduler's wiring queue (scheduler thread 0 asynchronously wires fanout edges and determines readiness).
+4. Push task to the orchestrator's own wiring queue; after orchestration
+   finishes, `run_wiring()` wires fanout edges and produces the initial-ready
+   handoff (the scheduler only reads it).
 5. Dispatch all active lanes atomically when resources allow.
 6. Aggregate completion and release downstream once.
 
@@ -203,7 +205,7 @@ Recommended validation coverage:
 Milestone command (device):
 
 ```bash
-python tests/st/a2a3/tensormap_and_ringbuffer/batch_paged_attention/test_batch_paged_attention.py \
+python tests/st/a2a3/replay_graph/paged_attention_unroll/test_paged_attention_unroll.py \
   -p a2a3 -d 9
 ```
 

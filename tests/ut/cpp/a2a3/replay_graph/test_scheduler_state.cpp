@@ -52,10 +52,7 @@ protected:
         sm_arena.release();
     }
 
-    void init_slot(
-        PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, int32_t fanout_count, uint8_t ring_id = 0
-    ) {
-        (void)fanout_count;  // fanout_count/fanout_refcount removed (single-shot replay)
+    void init_slot(PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, uint8_t ring_id = 0) {
         memset(&slot, 0, sizeof(slot));
         slot.task_state.store(state);
         slot.fanin_count = fanin_count;
@@ -79,7 +76,7 @@ protected:
 
 TEST_F(SchedulerStateTest, SubtaskCompleteSingle) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1);
     slot.total_required_subtasks = 1;
     slot.completed_subtasks.store(0);
 
@@ -88,7 +85,7 @@ TEST_F(SchedulerStateTest, SubtaskCompleteSingle) {
 
 TEST_F(SchedulerStateTest, SubtaskCompleteMultiBlock) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1);
     slot.total_required_subtasks = 6;  // 3 cores * 2 blocks
     slot.completed_subtasks.store(0);
 
@@ -108,7 +105,7 @@ TEST_F(SchedulerStateTest, ScopeEndBatchRelease) {
     PTO2TaskSlotState *ptrs[N];
 
     for (int i = 0; i < N; i++) {
-        init_slot(slots[i], PTO2_TASK_COMPLETED, 1, 2);
+        init_slot(slots[i], PTO2_TASK_COMPLETED, 1);
         ptrs[i] = &slots[i];
     }
 
@@ -123,8 +120,8 @@ TEST_F(SchedulerStateTest, ScopeEndBatchRelease) {
 
 TEST_F(SchedulerStateTest, GetReadyTasksBatchLocalFirst) {
     alignas(64) PTO2TaskSlotState slot_a, slot_b;
-    init_slot(slot_a, PTO2_TASK_PENDING, 0, 1);
-    init_slot(slot_b, PTO2_TASK_PENDING, 1, 1);
+    init_slot(slot_a, PTO2_TASK_PENDING, 0);
+    init_slot(slot_b, PTO2_TASK_PENDING, 1);
 
     PTO2TaskSlotState *local_buf_storage[4];
     PTO2LocalReadyBuffer local_buf;

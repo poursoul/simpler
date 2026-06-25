@@ -74,10 +74,9 @@ public:
      * drive SM state directly may pass a non-zero in-window seed.
      */
     void init(
-        PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr, void *heap_base,
-        uint64_t heap_size, std::atomic<int32_t> *error_code_ptr, int32_t initial_local_task_id = 0
+        int32_t window_size, std::atomic<int32_t> *current_index_ptr, void *heap_base, uint64_t heap_size,
+        std::atomic<int32_t> *error_code_ptr, int32_t initial_local_task_id = 0
     ) {
-        descriptors_ = descriptors;
         window_size_ = window_size;
         current_index_ptr_ = current_index_ptr;
         heap_base_ = heap_base;
@@ -146,7 +145,6 @@ public:
 
 private:
     // --- Task Ring ---
-    PTO2TaskDescriptor *descriptors_ = nullptr;
     int32_t window_size_ = 0;
     std::atomic<int32_t> *current_index_ptr_ = nullptr;
 

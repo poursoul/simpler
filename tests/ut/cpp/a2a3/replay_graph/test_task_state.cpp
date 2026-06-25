@@ -59,8 +59,7 @@ protected:
         sm_arena.release();
     }
 
-    void init_slot(PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, int32_t fanout_count) {
-        (void)fanout_count;  // fanout_count/fanout_refcount removed (single-shot replay)
+    void init_slot(PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count) {
         memset(&slot, 0, sizeof(slot));
         slot.task_state.store(state);
         slot.fanin_count = fanin_count;
@@ -84,7 +83,7 @@ protected:
 // =============================================================================
 TEST_F(TaskStateTest, FullLifecycleThroughAPI) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1);
     slot.total_required_subtasks = 1;
     slot.completed_subtasks.store(0);
 
@@ -111,7 +110,7 @@ TEST_F(TaskStateTest, FullLifecycleThroughAPI) {
 // =============================================================================
 TEST_F(TaskStateTest, ReadyPathStaysPending) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1);
 
     bool ready = sched.release_fanin_and_check_ready(slot);
     ASSERT_TRUE(ready) << "Task should be detected as ready via refcount";
@@ -125,7 +124,7 @@ TEST_F(TaskStateTest, ReadyPathStaysPending) {
 // =============================================================================
 TEST_F(TaskStateTest, MultiFaninPartialNotReady) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_PENDING, 3, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 3);
 
     EXPECT_FALSE(sched.release_fanin_and_check_ready(slot));
     EXPECT_FALSE(sched.release_fanin_and_check_ready(slot));
@@ -140,7 +139,7 @@ TEST_F(TaskStateTest, ConcurrentFaninExactlyOneReady) {
 
     for (int round = 0; round < ROUNDS; round++) {
         alignas(64) PTO2TaskSlotState slot;
-        init_slot(slot, PTO2_TASK_PENDING, 3, 1);
+        init_slot(slot, PTO2_TASK_PENDING, 3);
         std::atomic<int> ready_count{0};
 
         auto release = [&]() {
@@ -166,7 +165,7 @@ TEST_F(TaskStateTest, ConcurrentSubtaskCompletion) {
 
     for (int round = 0; round < ROUNDS; round++) {
         alignas(64) PTO2TaskSlotState slot;
-        init_slot(slot, PTO2_TASK_PENDING, 1, 1);
+        init_slot(slot, PTO2_TASK_PENDING, 1);
         slot.total_required_subtasks = 3;
         slot.completed_subtasks.store(0);
         std::atomic<int> done_count{0};
@@ -195,7 +194,7 @@ TEST_F(TaskStateTest, ConcurrentSubtaskCompletion) {
 // =============================================================================
 TEST_F(TaskStateTest, DoubleSubtaskCompletionCounterWeakness) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1);
     slot.total_required_subtasks = 2;
     slot.completed_subtasks.store(0);
 

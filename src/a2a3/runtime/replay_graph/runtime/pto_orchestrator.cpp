@@ -591,10 +591,6 @@ static TaskOutputTensors submit_task_common(
         }
         PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->ring;
         int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
-        int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
-        if (dep_local_task_id < dep_last_task_alive) {
-            continue;
-        }
         int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
         PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
         if (!append_fanin_or_fail(orch, dep_slot, producer_slot_state, &fanin_builder)) {

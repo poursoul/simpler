@@ -82,10 +82,7 @@ protected:
     }
 
     // Initialize a slot for testing wiring/completion
-    void init_slot(
-        PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, int32_t fanout_count, uint8_t ring_id = 0
-    ) {
-        (void)fanout_count;  // fanout_count/fanout_refcount removed (single-shot replay)
+    void init_slot(PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, uint8_t ring_id = 0) {
         memset(&slot, 0, sizeof(slot));
         slot.task_state.store(state);
         slot.fanin_count = fanin_count;
@@ -114,7 +111,7 @@ TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
     memset(&payload, 0, sizeof(payload));
     PTO2TaskDescriptor desc{};
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    init_slot(task_slot, PTO2_TASK_PENDING, 0);
     payload.fanin_actual_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -145,11 +142,11 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
 
     // Set up 2 producers that are already COMPLETED
     for (int i = 0; i < 2; i++) {
-        init_slot(producer_slots[i], PTO2_TASK_COMPLETED, 1, 2);
+        init_slot(producer_slots[i], PTO2_TASK_COMPLETED, 1);
     }
 
     // Consumer task with 2 fanins
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    init_slot(task_slot, PTO2_TASK_PENDING, 0);
     payload.fanin_actual_count = 2;
     payload.fanin_inline_slot_states[0] = &producer_slots[0];
     payload.fanin_inline_slot_states[1] = &producer_slots[1];
@@ -182,10 +179,10 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 
     // Producers are PENDING (not yet completed)
     for (int i = 0; i < 2; i++) {
-        init_slot(producer_slots[i], PTO2_TASK_PENDING, 1, 2);
+        init_slot(producer_slots[i], PTO2_TASK_PENDING, 1);
     }
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    init_slot(task_slot, PTO2_TASK_PENDING, 0);
     payload.fanin_actual_count = 2;
     payload.fanin_inline_slot_states[0] = &producer_slots[0];
     payload.fanin_inline_slot_states[1] = &producer_slots[1];
@@ -221,11 +218,11 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     memset(&payload, 0, sizeof(payload));
     PTO2TaskDescriptor desc{};
 
-    init_slot(producers[0], PTO2_TASK_COMPLETED, 1, 2);  // early finished
-    init_slot(producers[1], PTO2_TASK_PENDING, 1, 2);    // in flight (< COMPLETED)
-    init_slot(producers[2], PTO2_TASK_COMPLETED, 1, 2);  // early finished (>= COMPLETED)
+    init_slot(producers[0], PTO2_TASK_COMPLETED, 1);  // early finished
+    init_slot(producers[1], PTO2_TASK_PENDING, 1);    // in flight (< COMPLETED)
+    init_slot(producers[2], PTO2_TASK_COMPLETED, 1);  // early finished (>= COMPLETED)
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    init_slot(task_slot, PTO2_TASK_PENDING, 0);
     payload.fanin_actual_count = 3;
     for (int i = 0; i < 3; i++) {
         payload.fanin_inline_slot_states[i] = &producers[i];
@@ -259,17 +256,17 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     PTO2TaskDescriptor desc{};
 
     // Producer in flight (PENDING, not yet COMPLETED) with 2 consumers in fanout chain
-    init_slot(producer, PTO2_TASK_PENDING, 1, 1);
+    init_slot(producer, PTO2_TASK_PENDING, 1);
     producer.payload = &prod_payload;
     producer.task = &desc;
 
     // Consumer1: needs 1 more fanin to become ready
-    init_slot(consumer1, PTO2_TASK_PENDING, 2, 1);
+    init_slot(consumer1, PTO2_TASK_PENDING, 2);
     consumer1.fanin_refcount.store(1);  // 1 of 2 satisfied
     consumer1.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
 
     // Consumer2: this release will make it ready
-    init_slot(consumer2, PTO2_TASK_PENDING, 2, 1);
+    init_slot(consumer2, PTO2_TASK_PENDING, 2);
     consumer2.fanin_refcount.store(1);  // 1 of 2 satisfied
     consumer2.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
 
@@ -307,7 +304,7 @@ TEST_F(WiringTest, DrainWiringQueueProcessesTasks) {
     memset(&payload, 0, sizeof(payload));
     PTO2TaskDescriptor desc{};
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    init_slot(task_slot, PTO2_TASK_PENDING, 0);
     payload.fanin_actual_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -330,7 +327,7 @@ TEST_F(WiringTest, DrainWiringQueueBackoffDefers) {
     memset(&payload, 0, sizeof(payload));
     PTO2TaskDescriptor desc{};
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    init_slot(task_slot, PTO2_TASK_PENDING, 0);
     payload.fanin_actual_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -350,7 +347,7 @@ TEST_F(WiringTest, DrainWiringQueueBackoffLimitForcesProcess) {
     memset(&payload, 0, sizeof(payload));
     PTO2TaskDescriptor desc{};
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    init_slot(task_slot, PTO2_TASK_PENDING, 0);
     payload.fanin_actual_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;

@@ -37,7 +37,6 @@
 #include <climits>
 #include <cstring>
 #include <set>
-#include <vector>
 
 #include "pto_ring_buffer.h"
 
@@ -50,18 +49,16 @@ protected:
     static constexpr int32_t WINDOW_SIZE = 16;
     static constexpr uint64_t HEAP_SIZE = 4096;
 
-    std::vector<PTO2TaskDescriptor> descriptors;
     alignas(64) uint8_t heap_buf[HEAP_SIZE]{};
     std::atomic<int32_t> current_index{0};
     std::atomic<int32_t> error_code{PTO2_ERROR_NONE};
     PTO2TaskAllocator allocator{};
 
     void SetUp() override {
-        descriptors.assign(WINDOW_SIZE, PTO2TaskDescriptor{});
         std::memset(heap_buf, 0, sizeof(heap_buf));
         current_index.store(0);
         error_code.store(PTO2_ERROR_NONE);
-        allocator.init(descriptors.data(), WINDOW_SIZE, &current_index, heap_buf, HEAP_SIZE, &error_code);
+        allocator.init(WINDOW_SIZE, &current_index, heap_buf, HEAP_SIZE, &error_code);
     }
 };
 
@@ -240,7 +237,7 @@ TEST_F(TaskAllocatorTest, TaskIdNonZeroSeed) {
     constexpr int32_t SEED = 10;
     current_index.store(SEED);
     allocator.init(
-        descriptors.data(), WINDOW_SIZE, &current_index, heap_buf, HEAP_SIZE, &error_code,
+        WINDOW_SIZE, &current_index, heap_buf, HEAP_SIZE, &error_code,
         /*initial_local_task_id=*/SEED
     );
 

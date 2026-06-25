@@ -232,13 +232,4 @@ inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base) noexce
     );
 }
 
-// Compute the ring's task_descriptors device address (same arithmetic as
-// setup_pointers): the descriptors region begins right after the aligned
-// SM header.
-inline PTO2TaskDescriptor *ring_task_descriptors_addr(void *sm_dev_base) noexcept {
-    char *p = static_cast<char *>(sm_dev_base);
-    p += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
-    return reinterpret_cast<PTO2TaskDescriptor *>(p);
-}
-
 }  // namespace pto2_sm_layout

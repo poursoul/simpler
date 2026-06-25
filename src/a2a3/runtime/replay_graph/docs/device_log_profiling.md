@@ -117,7 +117,7 @@ The scheduler loop runs four phases each iteration. Each phase's time is accumul
 **Interpreting phase percentages:**
 
 - **dispatch** is typically the largest (~55-60%) because it includes ready-queue pops (with spinlock), payload construction, and cache flush (`dc cvac` + `dsb sy`).
-- **complete** is the second largest (~40-45%) because it traverses both fanout (CAS-based fanin decrement, conditional ready-queue push) and fanin (release_producer, check_consumed, ring pointer advancement).
+- **complete** traverses the fanout list to notify consumers (CAS-based fanin decrement, conditional ready-queue push). The fanin-side producer release / consumed transition / ring-pointer advancement that `tensormap_and_ringbuffer` runs here is gone in the single-shot model, so complete is lighter than in tmr.
 - **scan** is small (<1%) — only updates the perf header.
 - **idle** is negligible when tasks are flowing; high idle% indicates the scheduler is starved.
 

@@ -38,10 +38,16 @@ addr null-check → TensorMap lookup → spin-wait producer COMPLETED → comput
 ### 3.2 set_tensor_data Flow
 
 ```text
-addr null-check → TensorMap lookup → spin-wait producer COMPLETED → spin-wait consumers done → memcpy write
+addr null-check → TensorMap lookup → spin-wait producer COMPLETED → memcpy write
 ```
 
-One extra step versus get_tensor_data: wait for all consumers to finish (`fanout_refcount >= fanout_count - 1`, excluding the scope reference).
+Identical to `get_tensor_data`. In `tensormap_and_ringbuffer`, `set_tensor_data`
+had an extra step — wait for all consumers to finish (a WAR drain) — but the
+single-shot replay model dropped the `CONSUMED` lifecycle and the consumer
+counter (`fanout_refcount`) it relied on, so the consumer-drain is gone. Both
+get and set now wait only for the producer to reach `PTO2_TASK_COMPLETED`
+(WAW safety). No workload currently calls `set_tensor_data`, so there is
+nothing to regress; the WAR caveat below applies if one ever does.
 
 ### 3.3 Timeout
 
@@ -104,9 +110,9 @@ Three actors:
 | - | ---------- | -------- | ------ | --------- | ----- |
 | 1 | Kernel write (OUTPUT) | Orch Read | RAW | spin-wait producer COMPLETED | Yes |
 | 2 | Kernel write (OUTPUT) | Orch Write | WAW | spin-wait producer COMPLETED | Yes |
-| 3 | Kernel read (INPUT) | Orch Write | WAR | spin-wait fanout_refcount | **Needs INOUT** |
+| 3 | Kernel read (INPUT) | Orch Write | WAR | none (consumer-drain dropped) | **Unprotected** |
 | 4 | Kernel read-write (INOUT) | Orch Read | RAW | spin-wait producer COMPLETED | Yes |
-| 5 | Kernel read-write (INOUT) | Orch Write | WAW+WAR | spin-wait producer + consumers | Yes |
+| 5 | Kernel read-write (INOUT) | Orch Write | WAW | spin-wait producer COMPLETED (WAR part unprotected) | WAW only |
 | 6 | Orch Write | Kernel read (INPUT) | RAW | blocking completes before next submit | Yes |
 | 7 | Orch Write | Kernel write (OUTPUT) | WAW | same — serial guarantee | Yes |
 | 8 | Orch Read | Kernel write (OUTPUT) | WAR | same — serial guarantee | Yes |
@@ -114,11 +120,17 @@ Three actors:
 
 ### Key Design Points
 
-**Scenario #3 is the only case requiring special attention**:
+**WAR hazards (#3, #5) are no longer guarded at runtime**:
 
-TensorMap tracks only producers (OUTPUT/INOUT), not pure INPUT consumers. If a tensor is only registered via `add_input()`, TensorMap has no producer entry for it. `set_tensor_data`'s `wait_for_tensor_ready()` finds no matching producer (the lookup callback never fires) and returns immediately — but the kernel may still be reading → **WAR data race**.
-
-**Solution**: For tensors that may later be written via `set_tensor_data`, use `add_inout()` instead of `add_input()`. INOUT registers a producer entry in TensorMap, enabling `set_tensor_data` to track all consumers through `fanout_refcount`.
+`set_tensor_data` only waits for the producer to finish writing (WAW). It
+does **not** wait for downstream kernel consumers to finish reading, because
+the single-shot replay model dropped the `CONSUMED` lifecycle and the
+`fanout_refcount` consumer counter that the old WAR drain relied on. If a
+kernel may still be reading a tensor when `set_tensor_data` overwrites it,
+that is an unprotected WAR race. No workload currently uses `set_tensor_data`,
+so this is dormant; if one is added that needs WAR safety, the consumer-drain
+would have to be reintroduced. INOUT vs INPUT no longer changes this — both
+hit the same dropped drain.
 
 **Scenarios #6–8 serial guarantee**:
 
@@ -131,7 +143,10 @@ get/set_tensor_data are blocking calls, and orchestration is single-threaded ser
 | Scenario | Behavior |
 | -------- | -------- |
 | External tensor never submitted as OUTPUT/INOUT | No TensorMap entry — get/set execute immediately |
-| External tensor previously submitted as OUTPUT/INOUT | TensorMap has producer entry — get/set spin-wait |
-| External tensor submitted as INPUT, then set_tensor_data | **WAR risk** — must use INOUT instead (same as scenario #3) |
+| External tensor previously submitted as OUTPUT/INOUT | TensorMap has producer entry — get/set spin-wait producer COMPLETED |
+| External tensor submitted as INPUT, then set_tensor_data | **WAR risk** — unprotected (consumer-drain dropped; same as scenario #3) |
 
-**Key rule**: If an external tensor will later be written via `set_tensor_data`, all prior kernel accesses must use `add_inout()`, not `add_input()`.
+**Key rule**: `set_tensor_data` only protects against the producer write
+(WAW), not against in-flight kernel reads (WAR). The single-shot replay model
+has no consumer-drain, so neither `add_input()` nor `add_inout()` makes a
+later `set_tensor_data` WAR-safe.

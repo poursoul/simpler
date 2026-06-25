@@ -976,23 +976,6 @@ struct PTO2SchedulerState {
 #endif
     }
 
-    /**
-     * Cold path: formerly released producers (fanin traversal) and ran the
-     * self CONSUMED check. Both serviced slot reclaim, which the single-shot
-     * replay model dropped, so the body is now just the fanin-edge count that
-     * callers feed to profiling. Returns fanin edge count.
-     */
-
-#if PTO2_SCHED_PROFILING
-    int32_t on_task_release(PTO2TaskSlotState &slot_state, int32_t thread_idx) {
-        (void)thread_idx;
-#else
-    int32_t on_task_release(PTO2TaskSlotState &slot_state) {
-#endif
-        PTO2TaskPayload *payload = slot_state.payload;
-        return payload->fanin_actual_count;
-    }
-
     // === Cold-path API (defined in pto_scheduler.cpp) ===
 
     // Phase 1: declare every sub-region (ready_queue slots, dummy queue slots)
@@ -1027,11 +1010,6 @@ struct PTO2SchedulerState {
 // drain so they don't grow entries[]. Defined here (not in pto_async_wait.h)
 // because PTO2SchedulerState's on_task_complete signature is only known
 // after its full definition above.
-//
-// When the deferred_release_slot_states[] buffer is full, drain it via
-// on_task_release before appending — mirrors the same overflow-drain idiom
-// that scheduler_completion.cpp's inline NotDeferred path uses, so high task
-// rates don't surface as ASYNC_WAIT_OVERFLOW errors.
 inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state) {
     // Return value (CompletionStats / consumer-walk count) discarded:
@@ -1041,26 +1019,13 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
 #else
     (void)sink.sched->on_task_complete(slot_state, sink.local_bufs);
 #endif
-    if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
-        while (*sink.deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
-            (void)sink.sched->on_task_release(
-                *sink.deferred_release_slot_states[--(*sink.deferred_release_count)], sink.thread_idx
-            );
-#else
-            sink.sched->on_task_release(*sink.deferred_release_slot_states[--(*sink.deferred_release_count)]);
-#endif
-        }
-    }
-    sink.deferred_release_slot_states[(*sink.deferred_release_count)++] = &slot_state;
     sink.inline_completed++;
     return true;
 }
 
 template <bool Profiling>
 inline AsyncPollResult AsyncWaitList::poll_and_complete(
-    AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
-    PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity
+    AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_SCHED_PROFILING
     ,
     int thread_idx
@@ -1072,9 +1037,6 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
     AsyncWaitList::DrainCompletionSink sink{};
     sink.sched = sched;
     sink.local_bufs = local_bufs;
-    sink.deferred_release_slot_states = deferred_release_slot_states;
-    sink.deferred_release_count = &deferred_release_count;
-    sink.deferred_release_capacity = deferred_release_capacity;
 #if PTO2_SCHED_PROFILING
     sink.thread_idx = thread_idx;
 #endif
@@ -1123,21 +1085,6 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 #else
             (void)sched->on_task_complete(*entry.slot_state, local_bufs);
 #endif
-            // Drain deferred_release in place when the buffer fills — same
-            // overflow-drain idiom used by complete_slot_task's inline path
-            // and by try_inline_complete_locked. Without this, large bursts
-            // of completable wait_list entries in a single poll surfaced as
-            // ASYNC_WAIT_OVERFLOW under the MPSC model.
-            if (deferred_release_count >= deferred_release_capacity) {
-                while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
-                    (void)sched->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                    sched->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-                }
-            }
-            deferred_release_slot_states[deferred_release_count++] = entry.slot_state;
             result.completed++;
 
             int32_t last = count - 1;

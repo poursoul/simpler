@@ -40,10 +40,6 @@
 // Dispatch helpers
 // =============================================================================
 
-namespace {
-inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
-}
-
 // The speculative core bitmask (PTO2_SPEC_CORE_MASK_WORDS * 64 bits) must cover
 // every global core_id, and the per-core doorbell table is sized to match.
 static_assert(
@@ -845,13 +841,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     for (int32_t i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         local_bufs[i].reset(local_ptrs[i], LOCAL_READY_CAP_PER_TYPE);
     }
-    // Deferred-release queue: it still batches slots for on_task_release, but
-    // on_task_release is now a no-op (slot reclaim was dropped in the single-shot
-    // replay model), so this machinery spins idle. Kept intact pending the wider
-    // reclaim removal.
-    PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
-    int32_t deferred_release_count = 0;
-
     bool cores_released = false;
 
     // PMU runs require single-issue dispatch — overlapping in-flight tasks
@@ -937,11 +926,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         CYCLE_COUNT_START();
         l2_swimlane.sched_loop_count++;
         uint64_t _t0_phase = _t0;
-        // Release is the only "no Complete/Dispatch bar" attribution we keep —
-        // emitted with its own span in the idle branch below. Iterations that
-        // only scan/poll show as blank gaps; the per-loop Poll/Scan bars (PR
-        // #1079 debug overlay) were removed since "scheduler is polling when
-        // there's nothing to do" carries no actionable signal.
+        // Iterations that only scan/poll show as blank gaps; the per-loop
+        // Poll/Scan bars (PR #1079 debug overlay) were removed since "scheduler
+        // is polling when there's nothing to do" carries no actionable signal.
         // Per-iter lazy shared-queue snapshot: first phase emit in this iter
         // pays the atomic-load cost, subsequent emits in the same iter reuse
         // the cached value. Reset here so we re-sample exactly once per iter
@@ -969,8 +956,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool try_completed = tracker.has_any_running_cores();
         if (try_completed) {
             check_running_cores_for_completion(
-                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count, local_bufs
+                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, local_bufs
             );
         }
         if (completed_this_turn > 0) {
@@ -994,8 +980,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_, local_bufs, deferred_release_slot_states, deferred_release_count,
-                PTO2_DEFERRED_RELEASE_CAP
+                rt_->aicore_mailbox, sched_, local_bufs
 #if PTO2_SCHED_PROFILING
                 ,
                 thread_idx
@@ -1157,21 +1142,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     }
                 }
 #endif
-                // Dummy tasks have no subtasks to retire and no fanout pre-conditions
-                // beyond their own producers; release self-reference so the slot can
-                // reach CONSUMED once all consumers drain.
-                deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
-                if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
-                    while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
-                        (void)sched_->on_task_release(
-                            *deferred_release_slot_states[--deferred_release_count], thread_idx
-                        );
-#else
-                        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-                    }
-                }
                 int32_t prev = completed_tasks_.fetch_add(1, std::memory_order_relaxed);
                 last_progress_count = prev + 1;
                 cur_thread_completed++;
@@ -1298,8 +1268,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (tracker.has_any_running_cores()) {
             int32_t completed_2nd = 0;
             check_running_cores_for_completion(
-                thread_idx, hank, completed_2nd, cur_thread_completed, made_progress, deferred_release_slot_states,
-                deferred_release_count, local_bufs
+                thread_idx, hank, completed_2nd, cur_thread_completed, made_progress, local_bufs
             );
             if (completed_2nd > 0) {
 #if PTO2_SCHED_PROFILING
@@ -1307,15 +1276,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
                 completed_tasks_.fetch_add(completed_2nd, std::memory_order_relaxed);
                 last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
-            }
-            // Eager drain so the second poll can't push deferred_release toward
-            // its cap between idle iterations.
-            while (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP - 96) {
-#if PTO2_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
             }
         }
 #if PTO2_PROFILING
@@ -1361,30 +1321,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             idle_iterations = 0;
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
-#if PTO2_PROFILING
-            uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
-                                  get_sys_cnt_aicpu() :
-                                  0;
-#endif
-            while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-            }
-#if PTO2_PROFILING
-            // Release is a distinct operation from the poll scan — emit it with
-            // its own span (Perfetto nests it inside the surrounding poll/idle
-            // run by time-containment) rather than competing with poll for one
-            // per-iteration label.
-            if (rel_t0 != 0) {
-                l2_swimlane_aicpu_record_sched_phase(
-                    thread_idx, L2SwimlaneSchedPhaseKind::Release, rel_t0, get_sys_cnt_aicpu(),
-                    l2_swimlane.sched_loop_count, /*tasks_processed=*/0
-                );
-            }
-#endif
             idle_iterations++;
 
             if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
@@ -1446,19 +1382,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 #endif
         }
-    }
-
-    // Drain any entries left in the deferred-release batch. The in-loop flush
-    // only fires on idle iterations and on buffer-full; a loop exit while the
-    // last iteration made progress can leave entries un-released. Drop them
-    // here so every consumed producer slot completes its on_task_release
-    // regardless of which loop-exit path fired.
-    while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
-        (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
     }
 
 #if PTO2_PROFILING

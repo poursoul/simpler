@@ -589,7 +589,6 @@ struct PTO2SchedulerState {
 
         void advance_ring_pointers() {
             int32_t current_task_index = ring->fc.current_task_index.load(std::memory_order_acquire);
-            int32_t old_last_task_alive = last_task_alive;
 
             while (last_task_alive < current_task_index) {
                 PTO2TaskSlotState &slot_state = ring->get_slot_state_by_task_id(last_task_alive);
@@ -599,15 +598,10 @@ struct PTO2SchedulerState {
                 last_task_alive++;
             }
 
-            // Eager reset: prepare reclaimed slots for reuse while still hot in cache.
-            // Safe because last_task_alive has advanced past these slots but
-            // sync_to_sm has not yet published — the orchestrator cannot reuse
-            // them until the release store below.
-            // Skips payload, task, ring_id — immutable after RingSchedState::init().
-            for (int32_t id = old_last_task_alive; id < last_task_alive; id++) {
-                ring->get_slot_state_by_task_id(id).reset_for_reuse();
-            }
-
+            // No slot reclaim: replay_graph fills the window exactly once and never
+            // wraps, so each slot is allocated once and stays in the state left by
+            // the one-time reset_for_reuse at SM init. (reset_for_reuse is kept for
+            // the future multi-layer ping-pong path.)
             sync_to_sm();
         }
     } ring_sched_state;

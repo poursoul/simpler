@@ -384,29 +384,6 @@ TEST_F(WiringTest, AdvanceRingPointersStopsAtNonConsumed) {
     EXPECT_EQ(rss.last_task_alive, 2) << "Should stop at first non-CONSUMED slot";
 }
 
-TEST_F(WiringTest, AdvanceRingPointersResetsSlots) {
-    auto &rss = sched.ring_sched_state;
-    auto *ring = rss.ring;
-
-    ring->fc.current_task_index.store(1, std::memory_order_release);
-
-    auto &slot = ring->get_slot_state_by_task_id(0);
-    slot.task_state.store(PTO2_TASK_CONSUMED);
-    slot.fanout_count = 5;
-    slot.fanin_refcount.store(3);
-    slot.fanout_refcount.store(2);
-    slot.completed_subtasks.store(1);
-
-    rss.advance_ring_pointers();
-
-    // After reset_for_reuse: fanout_count=1, fanin_refcount=0, etc.
-    EXPECT_EQ(slot.fanout_count, 1);
-    EXPECT_EQ(slot.fanin_refcount.load(), 0);
-    EXPECT_EQ(slot.fanout_refcount.load(), 0);
-    EXPECT_EQ(slot.completed_subtasks.load(), 0);
-    EXPECT_EQ(slot.fanout_head, nullptr);
-}
-
 // =============================================================================
 // drain_wiring_queue: pushes tasks through SPSC queue
 // =============================================================================

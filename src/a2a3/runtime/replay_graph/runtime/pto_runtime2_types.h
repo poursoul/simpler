@@ -316,7 +316,7 @@ struct PTO2TaskPayload {
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
 
         // Speculative early-dispatch metadata — the single init point for these
-        // fields. reset_for_reuse skips the payload by contract; prepare_task only
+        // fields. The SM-init slot reset skips the payload; prepare_task only
         // allocates/binds. prefetch() warms this line (offset 512) so these writes
         // land in warm cache.
         //
@@ -435,28 +435,6 @@ struct alignas(64) PTO2TaskSlotState {
     void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t) {
         payload = p;
         task = t;
-    }
-
-    /**
-     * Reset dynamic scheduling fields to the one-time clean state established at
-     * SM init. The single-shot replay model fills the window exactly once and
-     * never reuses a slot, so this runs only during PTO2SharedMemoryHandle::
-     * init_header; it leaves the slot ready for its single allocation.
-     *
-     * Skips payload, task, ring_id (immutable, bound once at init).
-     * task_state is set to PENDING by the orchestrator when it allocates the slot.
-     */
-    void reset_for_reuse() {
-        fanout_lock.store(0, std::memory_order_relaxed);
-        fanout_head = nullptr;
-        fanin_refcount.store(0, std::memory_order_relaxed);
-        completed_subtasks.store(0, std::memory_order_relaxed);
-        next_block_idx.store(0, std::memory_order_relaxed);
-        any_subtask_deferred.store(false, std::memory_order_relaxed);
-        // Note: payload spec fields (spec_state / staged_core_mask / dispatch_fanin /
-        // spec_chain_*) are NOT reset here — this method skips the payload by
-        // contract. They are (re)initialized in PTO2TaskPayload::init on every
-        // submit, before the slot becomes visible to the scheduler.
     }
 
     // === Per-task fanout spinlock ===

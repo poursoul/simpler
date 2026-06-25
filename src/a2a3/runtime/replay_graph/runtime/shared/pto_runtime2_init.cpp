@@ -77,7 +77,7 @@ bool PTO2SchedulerState::RingSchedState::init_data_from_layout(void *sm_dev_base
     // arithmetic, no SM load.
     ring = pto2_sm_layout::ring_header_addr(sm_dev_base);
 
-    // Per-slot SM-side initialization (bind_ring + reset_for_reuse +
+    // Per-slot SM-side initialization (bind_ring + dynamic-field reset +
     // fanin_count/active_mask zero) lives in PTO2SharedMemoryHandle::
     // init_header so the AICPU performs it during SM reset; host
     // prebuilt-arena init skips SM access here.

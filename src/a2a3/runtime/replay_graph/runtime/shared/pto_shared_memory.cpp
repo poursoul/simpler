@@ -131,18 +131,25 @@ void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t hea
     header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_thread.store(-1, std::memory_order_relaxed);
 
-    // Per-slot slot_states reset. Previously lived in
-    // PTO2SchedulerState::RingSchedState::init(), but it writes into
-    // ring->slot_states[] which is SM-side storage — keeping it here lets
-    // host-side prebuilt-arena init skip all SM dereferences.
-    // bind_ring() pins the ring_id (slot-invariant after this point);
-    // reset_for_reuse() prepares dynamic fanout/refcount fields so the first
-    // submit doesn't need an explicit reset.
+    // Per-slot one-time init. Lives here (not in RingSchedState::init) because it
+    // writes SM-side ring->slot_states[], so host-side prebuilt-arena init skips
+    // all SM dereferences. The single-shot replay model fills the window exactly
+    // once and never reuses a slot, so this one-time init of the dynamic
+    // scheduling fields leaves each slot ready for its single allocation.
+    // bind_ring() pins ring_id (slot-invariant); payload spec fields are (re)set
+    // by PTO2TaskPayload::init on every submit.
     for (uint64_t i = 0; i < task_window_size; i++) {
-        ring.slot_states[i].bind_ring(0);
-        ring.slot_states[i].reset_for_reuse();
-        ring.slot_states[i].fanin_count = 0;
-        ring.slot_states[i].active_mask = ActiveMask{};
+        PTO2TaskSlotState &s = ring.slot_states[i];
+        s.bind_ring(0);
+        s.fanout_lock.store(0, std::memory_order_relaxed);
+        s.fanout_head = nullptr;
+        s.fanin_refcount.store(0, std::memory_order_relaxed);
+        s.completed_subtasks.store(0, std::memory_order_relaxed);
+        s.next_block_idx.store(0, std::memory_order_relaxed);
+        s.any_subtask_deferred.store(false, std::memory_order_relaxed);
+        s.fanin_count = 0;
+        s.active_mask = ActiveMask{};
+        s.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     }
 }
 

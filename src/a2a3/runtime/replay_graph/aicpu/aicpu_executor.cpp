@@ -487,7 +487,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             // Reset SM state. setup_pointers + init_header restore
             // ring flow-control counters, layout metadata, error flags, and
-            // the per-slot ring->slot_states[] (bind_ring + reset_for_reuse +
+            // the per-slot ring->slot_states[] (bind_ring + dynamic-field reset +
             // fanin_count/active_mask zero — previously done inside
             // RingSchedState::init).
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));

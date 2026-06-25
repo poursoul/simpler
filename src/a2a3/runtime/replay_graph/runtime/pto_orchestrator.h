@@ -189,14 +189,16 @@ struct PTO2OrchestratorState {
         if (wfanin != 0) {
             int32_t early_finished = 0;
             for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-                producer->lock_fanout();
+                // single-shot: fanout_head is frozen before sched starts, so no
+                // lock is needed. MUST restore this lock before any orch/sched
+                // time-overlap (stage-3 ping-pong). wire_task is the sole writer
+                // and runs single-threaded in the orch phase.
                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
                 if (pstate >= PTO2_TASK_COMPLETED) {
                     early_finished++;
                 } else {
                     producer->fanout_head = dep_pool.prepend(producer->fanout_head, ws);
                 }
-                producer->unlock_fanout();
             });
 
             if (early_finished != 0) {
@@ -312,7 +314,7 @@ struct PTO2OrchProfilingData {
     uint64_t scope_end_cycle;
     int64_t submit_count;
     // Wait time tracking for blocking phases
-    uint64_t fanin_wait_cycle;  // Cycles spent waiting in fanout_lock
+    uint64_t fanin_wait_cycle;  // Cycles spent waiting on fanin (was fanout_lock spin)
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
 };

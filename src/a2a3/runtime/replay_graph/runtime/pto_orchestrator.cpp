@@ -341,7 +341,7 @@ static bool prepare_task(
     // single payload-init point, which runs before the scheduler wiring push.
 
     // The single-shot replay model fills each slot exactly once. Dynamic slot
-    // fields (fanout_lock, fanout_head, fanin_refcount, completed_subtasks,
+    // fields (fanout_head, fanin_refcount, completed_subtasks,
     // next_block_idx) are at their one-time SM-init clean state; ring_id is
     // immutable after RingSchedState::init(). Only task_state is set here, to
     // PENDING, as the orchestrator takes ownership of the slot.
@@ -594,8 +594,8 @@ static TaskOutputTensors submit_task_common(
 
     // === STEP 6: push to the orchestrator-owned wiring queue ===
     // submit_task only stores dependency metadata; it pushes the task into the
-    // orchestrator's own wiring queue. The actual fanout_head wiring (lock +
-    // dep_pool + early_finished) runs later in run_wiring(), after orchestration
+    // orchestrator's own wiring queue. The actual fanout_head wiring (dep_pool +
+    // early_finished) runs later in run_wiring(), after orchestration
     // completes (replay_graph stage 1).
     while (!orch->wiring.queue.push(&cur_slot_state)) {
         SPIN_WAIT_HINT();
@@ -779,7 +779,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         // Hidden alloc tasks complete inline in the orchestrator before any
         // consumer can exist, so they have no fanout to notify and no worker
         // subtasks to retire. Running the full on_task_complete path
-        // would only pay unnecessary fanout_lock / traversal overhead here.
+        // would only pay unnecessary fanout traversal overhead here.
         // The generic slot initialization done in prepare_task() is still
         // required so scope_end can release the producer-side reference and
         // drive the slot to CONSUMED, but worker dispatch fields are never

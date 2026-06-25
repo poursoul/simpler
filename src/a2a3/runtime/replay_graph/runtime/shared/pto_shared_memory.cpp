@@ -141,7 +141,6 @@ void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t hea
     for (uint64_t i = 0; i < task_window_size; i++) {
         PTO2TaskSlotState &s = ring.slot_states[i];
         s.bind_ring(0);
-        s.fanout_lock.store(0, std::memory_order_relaxed);
         s.fanout_head = nullptr;
         s.fanin_refcount.store(0, std::memory_order_relaxed);
         s.completed_subtasks.store(0, std::memory_order_relaxed);

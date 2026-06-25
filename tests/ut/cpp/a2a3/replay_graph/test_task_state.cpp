@@ -64,7 +64,6 @@ protected:
         slot.task_state.store(state);
         slot.fanin_count = fanin_count;
         slot.fanin_refcount.store(0);
-        slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = 0;
         slot.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);

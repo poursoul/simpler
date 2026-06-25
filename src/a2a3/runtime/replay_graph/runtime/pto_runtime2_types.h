@@ -360,17 +360,21 @@ static_assert(
  * slot state brings all related fields into the same cache line.
  *
  * Concurrency notes:
- * - fanout_head protected by fanout_lock (per-task spinlock)
+ * - fanout_head is built solely by the orchestrator's wire_task during the
+ *   orch phase (single-threaded) and frozen before the scheduler starts, so
+ *   it is read lock-free in the sched phase. No spinlock guards it.
+ *   single-shot: fanout_head is frozen before sched starts, so no lock is
+ *   needed. MUST restore this lock before any orch/sched time-overlap
+ *   (stage-3 ping-pong).
  * - fanin_count set once at submission, read-only after (hot path for ready check)
  * - task_state, fanin_refcount updated atomically
  */
 struct alignas(64) PTO2TaskSlotState {
-    // Fanout lock + list (accessed together under lock in on_task_complete)
-    std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
-    // Reclaim/reuse-lifecycle field fanout_count was removed in the single-shot
-    // replay model; this 4-byte padding preserves the original field offsets
-    // (fanout_head stays at offset 8).
-    uint8_t _pad_reclaim0[4];
+    // Reclaim/reuse-lifecycle fields fanout_count and fanout_lock were removed
+    // (the latter dropped in the single-shot replay model, where fanout_head is
+    // frozen before sched starts); this 8-byte padding preserves the original
+    // field offsets (fanout_head stays at offset 8).
+    uint8_t _pad_reclaim0[8];
 
     PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
@@ -437,53 +441,12 @@ struct alignas(64) PTO2TaskSlotState {
         task = t;
     }
 
-    // === Per-task fanout spinlock ===
-    //
-    // Used by BOTH the orchestrator and the scheduler. The fanout_lock MUST
-    // be held whenever reading or writing fanout_head, because the orchestrator
-    // adds consumers concurrently with the scheduler traversing the list after
-    // task completion.
-
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    void lock_fanout(uint64_t &atomic_count, uint64_t &wait_cycle) {
-        uint64_t t0 = get_sys_cnt_aicpu();
-        bool contended = false;
-        uint32_t atomic_ops = 0;
-
-        for (;;) {
-            while (fanout_lock.load(std::memory_order_acquire) != 0) {
-                contended = true;
-                atomic_ops++;
-                SPIN_WAIT_HINT();
-            }
-            int32_t expected = 0;
-            if (fanout_lock.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-                atomic_ops++;
-                atomic_count += atomic_ops;
-                if (contended) {
-                    wait_cycle += (get_sys_cnt_aicpu() - t0);
-                }
-                return;
-            }
-            contended = true;
-            atomic_ops++;
-        }
-    }
-#endif
-
-    void lock_fanout() {
-        for (;;) {
-            while (fanout_lock.load(std::memory_order_acquire) != 0) {
-                SPIN_WAIT_HINT();
-            }
-            int32_t expected = 0;
-            if (fanout_lock.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-                return;
-            }
-        }
-    }
-
-    void unlock_fanout() { fanout_lock.store(0, std::memory_order_release); }
+    // single-shot: fanout_head is frozen before sched starts, so no lock is
+    // needed. MUST restore this lock before any orch/sched time-overlap
+    // (stage-3 ping-pong). The orchestrator's wire_task is the sole writer and
+    // runs single-threaded in the orch phase, strictly before orchestrator_done_
+    // is released; scheduler threads only read frozen head snapshots after that
+    // acquire barrier.
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);

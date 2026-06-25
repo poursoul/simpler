@@ -279,8 +279,7 @@ retired, every entry is valid and no chain truncation is needed.
 | `active_mask` | Active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `completed_subtasks` | Atomic counter; trigger condition: `completed_subtasks == total_required_subtasks` |
 | `fanin_count` | Number of producer dependencies + 1 sentinel (set during wiring) |
-| `fanout_lock` | Per-task spinlock guarding `fanout_head` (orchestrator wiring + scheduler completion) |
-| `fanout_head` | Head of the fanout consumer list (pointer, under `fanout_lock`) |
+| `fanout_head` | Head of the fanout consumer list (pointer; written only by orch wiring, read-only in sched) |
 | `packed_buffer_base` | Start of packed output buffer in GM heap |
 | `packed_buffer_end` | End of packed output buffer |
 
@@ -354,7 +353,7 @@ the user-provided orchestration function. Key members:
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
 | 5 | **Push to wiring queue**: push the task into the orchestrator's own `wiring.queue` (SPSC). Fanout wiring is deferred to `run_wiring()`. |
 
-`submit_task` never acquires `fanout_lock` or allocates from `dep_pool` —
+`submit_task` never touches `fanout_head` or allocates from `dep_pool` —
 all of that happens in the wiring pass after orchestration finishes.
 
 ### 7.3 Wiring (`run_wiring`, orchestrator-owned)
@@ -368,12 +367,12 @@ the scheduler — schedulers only read the result.
 1. Set `fanin_count = wfanin + 1` (the +1 sentinel prevents premature
    readiness).
 2. For each producer in the task's fanin slot states:
-   - Acquire the producer's `fanout_lock`.
    - If the producer is already `>= COMPLETED` (only inline-completed alloc
      tasks during this phase), count it as `early_finished`.
    - Otherwise prepend this consumer to the producer's `fanout_head` via
-     `dep_pool.prepend`.
-   - Release `fanout_lock`.
+     `dep_pool.prepend`. No lock is taken: wiring is single-threaded and runs
+     entirely before the scheduler starts, so `fanout_head` has no concurrent
+     reader (the orch→sched barrier is §8.2).
 3. Release `early_finished + 1` into `fanin_refcount` via `fetch_add`.
 4. If `fanin_refcount >= fanin_count`, append the task to `initial_ready[]`.
 
@@ -445,7 +444,11 @@ Each scheduler thread runs a tight loop with two phases:
   `completed_subtasks == total_required_subtasks`, call `on_task_complete`,
   which:
   1. Stores `task_state = COMPLETED`.
-  2. Acquires `fanout_lock`, reads `fanout_head`, releases the lock.
+  2. Reads `fanout_head` directly (lock-free): it was frozen by the orch
+     wiring pass before `orchestrator_done_` was released, so there is no
+     concurrent writer. The per-task spinlock that previously guarded it was
+     dropped in the single-shot model — it MUST be restored before any
+     orch/sched time-overlap (stage-3 ping-pong).
   3. Walks the fanout list, releasing one fanin from each consumer
      (`release_fanin_and_check_ready`); a consumer whose `fanin_refcount`
      reaches `fanin_count` is pushed to its ready queue.

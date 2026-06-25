@@ -680,9 +680,10 @@ struct PTO2SchedulerState {
         if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
             return;  // already propagated once
         uint8_t child_depth = static_cast<uint8_t>(p.payload->spec_chain_depth + 1);
-        p.lock_fanout();
-        PTO2DepListEntry *edge = p.fanout_head;  // snapshot head, walk lock-free (fanout stable by dispatch)
-        p.unlock_fanout();
+        // single-shot: fanout_head is frozen before sched starts, so no lock is
+        // needed. MUST restore this lock before any orch/sched time-overlap
+        // (stage-3 ping-pong). Read the frozen head directly and walk lock-free.
+        PTO2DepListEntry *edge = p.fanout_head;
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
             // Compare to fanin_actual_count (the real producer-edge count), NOT
@@ -901,23 +902,20 @@ struct PTO2SchedulerState {
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
         extern uint64_t g_sched_lock_atomic_count[], g_sched_lock_wait_cycle[];
         extern uint64_t g_sched_fanout_atomic_count[], g_sched_push_wait_cycle[];
-        uint64_t lock_atomics = 0, lock_wait = 0;
         PTO2_SCHED_CYCLE_START();
 #endif
 
-#if PTO2_SCHED_PROFILING
-        slot_state.lock_fanout(lock_atomics, lock_wait);
-#else
-        slot_state.lock_fanout();
-#endif
+        // single-shot: fanout_head is frozen before sched starts, so no lock is
+        // needed. MUST restore this lock before any orch/sched time-overlap
+        // (stage-3 ping-pong). wire_task built the fanout list single-threaded
+        // in the orch phase; here we only publish completion and read the frozen
+        // head snapshot, with no concurrent writer to exclude.
         slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-        PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
-        slot_state.unlock_fanout();
+        PTO2DepListEntry *current = slot_state.fanout_head;  // frozen after orch phase
 
 #if PTO2_SCHED_PROFILING
-        lock_atomics += 2;  // state.store + unlock.store
-        g_sched_lock_atomic_count[thread_idx] += lock_atomics;
-        g_sched_lock_wait_cycle[thread_idx] += lock_wait;
+        g_sched_lock_atomic_count[thread_idx] += 1;  // task_state.store
+        g_sched_lock_wait_cycle[thread_idx] += 0;
         PTO2_SCHED_CYCLE_LAP(g_sched_lock_cycle[thread_idx]);
 #endif
 
@@ -1096,12 +1094,12 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 #if PTO2_SCHED_PROFILING
 struct PTO2SchedProfilingData {
     // Sub-phase cycle breakdown within on_task_complete
-    uint64_t lock_cycle;    // lock_fanout + state store + unlock
+    uint64_t lock_cycle;    // task_state store + head snapshot (was lock+store+unlock)
     uint64_t fanout_cycle;  // fanout traversal
     uint64_t fanin_cycle;   // fanin traversal
 
     // Wait times
-    uint64_t lock_wait_cycle;  // spin-wait in fanout_lock
+    uint64_t lock_wait_cycle;  // always 0 now (was spin-wait in fanout_lock)
     uint64_t push_wait_cycle;  // CAS contention in push()
     uint64_t pop_wait_cycle;   // CAS contention in pop()
 

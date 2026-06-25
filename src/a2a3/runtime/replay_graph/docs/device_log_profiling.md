@@ -37,7 +37,6 @@ Thread 3 loads the orchestration `.so` via `dlopen`, calls `aicpu_orchestration_
 Thread 3: Calling aicpu_orchestration_entry from SO
 Thread 3: aicpu_orchestration_entry returned, cost 20943.940us
 Thread 3: === Orchestrator Profiling: 16704 tasks, total=14601.580us ===
-Thread 3:   sync_tensormap : 286.300us (2.0%)
 Thread 3:   task_ring_alloc: 380.400us (2.6%)
 Thread 3:   param_copy     : 2147.800us (14.7%)
 Thread 3:   lookup+dep     : 7290.300us (49.9%)
@@ -56,7 +55,6 @@ Thread 3: PTO2 total submitted tasks = 16704
 | ----- | ------------------------------- | ----------- |
 | **cost** | Wall-clock around `orch_func()` call | Total time including orchestration logic + scope overhead |
 | **total** | Sum of all sub-steps below | Accumulated time inside `submit_task` across all tasks |
-| **sync_tensormap** | `g_orch_sync_cycle` | TensorMap validity sync and optional cleanup before each submission |
 | **task_ring_alloc** | `g_orch_alloc_cycle` | Allocating a task slot from the task ring buffer |
 | **param_copy** | `g_orch_args_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
 | **lookup+dep** | `g_orch_lookup_cycle` | TensorMap lookup for inputs/inouts + building fanin/fanout dependency edges |

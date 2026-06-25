@@ -590,22 +590,15 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = orchestrator_get_profiling();
-            uint64_t total =
-                p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
+            uint64_t total = p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
             LOG_INFO_V9(
                 "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", thread_idx,
                 static_cast<int64_t>(p.submit_count), cycles_to_us(total)
             );
             LOG_INFO_V9(
-                "Thread %d:   task+heap_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
-                thread_idx, cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
-                cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
-                static_cast<uint64_t>(p.alloc_atomic_count)
-            );
-            LOG_INFO_V9(
-                "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.sync_cycle),
-                p.sync_cycle * 100.0 / total
+                "Thread %d:   task+heap_alloc: %.3fus (%.1f%%)  atomics=%" PRIu64 "", thread_idx,
+                cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total, static_cast<uint64_t>(p.alloc_atomic_count)
             );
             LOG_INFO_V9(
                 "Thread %d:   lookup+dep     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.lookup_cycle),
@@ -616,8 +609,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 p.insert_cycle * 100.0 / total
             );
             LOG_INFO_V9(
-                "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", thread_idx,
-                cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
+                "Thread %d:   param_copy     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.args_cycle),
+                p.args_cycle * 100.0 / total
             );
             LOG_INFO_V9(
                 "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", thread_idx,

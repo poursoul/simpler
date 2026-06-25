@@ -197,15 +197,14 @@ captured at l2_swimlane_level >= 3) and `deps.json`; consume them via
 
 ```text
 Thread X: === Orchestrator Profiling: XXX tasks, total=XXXus ===
-Thread X:   sync_tensormap : XXXus (XX.X%)
-Thread X:   task_ring_alloc: XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
-Thread X:   param_copy     : XXXus (XX.X%)  atomics=XXX
+Thread X:   task_ring_alloc: XXXus (XX.X%)  atomics=XXX
+Thread X:   param_copy     : XXXus (XX.X%)
 Thread X:   lookup+dep     : XXXus (XX.X%)
 Thread X:   heap_alloc     : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:   tensormap_ins  : XXXus (XX.X%)
 Thread X:   fanin+ready    : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:   finalize+SM    : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
-Thread X:   scope_end      : XXXus  atomics=XXX
+Thread X:   scope_end      : XXXus
 Thread X:   avg/task       : XXXus
 ```
 

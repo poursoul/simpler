@@ -96,7 +96,6 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 __attribute__((weak, visibility("hidden"))) void
 l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
-static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
 static uint64_t g_orch_args_cycle = 0;       // param copy
 static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
@@ -105,11 +104,8 @@ static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
 static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
 static int64_t g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
-uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
-uint64_t g_orch_args_atomic_count = 0;
-uint64_t g_orch_scope_end_atomic_count = 0;
 // Cycle accumulation is unconditional under PTO2_ORCH_PROFILING (that's what
 // the flag is for) and feeds the per-sub-step `g_orch_*_cycle` cumulatives
 // printed in the cold-path log.
@@ -579,8 +575,6 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    CYCLE_COUNT_LAP(g_orch_sync_cycle);
-
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
         if (!dep_task_id.is_valid()) {
@@ -901,7 +895,6 @@ void PTO2OrchestratorState::mark_done() {
 #if PTO2_ORCH_PROFILING
 PTO2OrchProfilingData orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
-    d.sync_cycle = g_orch_sync_cycle;
     d.alloc_cycle = g_orch_alloc_cycle;
     d.args_cycle = g_orch_args_cycle;
     d.lookup_cycle = g_orch_lookup_cycle;
@@ -909,23 +902,17 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.fanin_cycle = g_orch_fanin_cycle;
     d.scope_end_cycle = g_orch_scope_end_cycle;
     d.submit_count = g_orch_submit_count;
-    d.alloc_wait_cycle = g_orch_alloc_wait_cycle;
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
     d.alloc_atomic_count = g_orch_alloc_atomic_count;
-    d.args_atomic_count = g_orch_args_atomic_count;
-    d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
-    g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
+    g_orch_alloc_cycle = g_orch_args_cycle = 0;
     g_orch_lookup_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
     g_orch_submit_idx = 0;
-    g_orch_alloc_wait_cycle = 0;
     g_orch_fanin_wait_cycle = 0;
     g_orch_alloc_atomic_count = 0;
-    g_orch_args_atomic_count = 0;
-    g_orch_scope_end_atomic_count = 0;
     return d;
 }
 #endif

@@ -53,14 +53,13 @@ void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
     ptr += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
 
     // Task descriptors, payloads, and slot states
-    auto &ring = header->ring;
-    ring.task_descriptors = (PTO2TaskDescriptor *)ptr;
+    header->task_descriptors = (PTO2TaskDescriptor *)ptr;
     ptr += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
 
-    ring.task_payloads = (PTO2TaskPayload *)ptr;
+    header->task_payloads = (PTO2TaskPayload *)ptr;
     ptr += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
 
-    ring.slot_states = (PTO2TaskSlotState *)ptr;
+    header->slot_states = (PTO2TaskSlotState *)ptr;
     ptr += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
 }
 
@@ -107,19 +106,17 @@ void PTO2SharedMemoryHandle::destroy() {
 //
 // no need init data in pool, init pool data when used
 void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_size) {
-    auto &ring = header->ring;
-
     // Flow control (start at 0)
-    ring.fc.init();
+    header->fc.init();
 
     header->orchestrator_done.store(0, std::memory_order_relaxed);
 
     // Layout info
     uint64_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
-    ring.task_window_size = task_window_size;
-    ring.task_window_mask = static_cast<int32_t>(task_window_size - 1);
-    ring.heap_size = heap_size;
-    ring.task_descriptors_offset = offset;
+    header->task_window_size = task_window_size;
+    header->task_window_mask = static_cast<int32_t>(task_window_size - 1);
+    header->heap_size = heap_size;
+    header->task_descriptors_offset = offset;
 
     header->total_size = sm_size;
     header->graph_output_ptr.store(0, std::memory_order_relaxed);
@@ -131,15 +128,15 @@ void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t hea
     header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_thread.store(-1, std::memory_order_relaxed);
 
-    // Per-slot one-time init. Lives here (not in RingSchedState::init) because it
-    // writes SM-side ring->slot_states[], so host-side prebuilt-arena init skips
+    // Per-slot one-time init. Lives here (not in scheduler init) because it
+    // writes SM-side slot_states[], so host-side prebuilt-arena init skips
     // all SM dereferences. The single-shot replay model fills the window exactly
     // once and never reuses a slot, so this one-time init of the dynamic
     // scheduling fields leaves each slot ready for its single allocation.
     // bind_ring() pins ring_id (slot-invariant); payload spec fields are (re)set
     // by PTO2TaskPayload::init on every submit.
     for (uint64_t i = 0; i < task_window_size; i++) {
-        PTO2TaskSlotState &s = ring.slot_states[i];
+        PTO2TaskSlotState &s = header->slot_states[i];
         s.bind_ring(0);
         s.fanout_head = nullptr;
         s.fanin_refcount.store(0, std::memory_order_relaxed);
@@ -165,13 +162,12 @@ void PTO2SharedMemoryHandle::print_layout() {
     LOG_INFO_V0("Base address:       %p", sm_base);
     LOG_INFO_V0("Total size:         %" PRIu64 " bytes", h->total_size);
     LOG_INFO_V0("Ring:");
-    LOG_INFO_V0("  task_window_size: %" PRIu64, h->ring.task_window_size);
-    LOG_INFO_V0("  heap_size:        %" PRIu64 " bytes", h->ring.heap_size);
+    LOG_INFO_V0("  task_window_size: %" PRIu64, h->task_window_size);
+    LOG_INFO_V0("  heap_size:        %" PRIu64 " bytes", h->heap_size);
     LOG_INFO_V0(
-        "  descriptors_off:  %" PRIu64 " (0x%" PRIx64 ")", h->ring.task_descriptors_offset,
-        h->ring.task_descriptors_offset
+        "  descriptors_off:  %" PRIu64 " (0x%" PRIx64 ")", h->task_descriptors_offset, h->task_descriptors_offset
     );
-    LOG_INFO_V0("  task_count:       %d", h->ring.fc.task_count.load(std::memory_order_acquire));
+    LOG_INFO_V0("  task_count:       %d", h->fc.task_count.load(std::memory_order_acquire));
     LOG_INFO_V0("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
     LOG_INFO_V0("Error state:");
     LOG_INFO_V0("  orch_error_code:    %d", h->orch_error_code.load(std::memory_order_relaxed));
@@ -187,22 +183,22 @@ bool PTO2SharedMemoryHandle::validate() {
 
     PTO2SharedMemoryHeader *h = header;
 
-    if (!h->ring.fc.validate(this)) return false;
+    if (!h->fc.validate(this)) return false;
 
     return true;
 }
 
-bool PTO2RingFlowControl::validate(PTO2SharedMemoryHandle *handle) const {
+bool PTO2FlowControl::validate(PTO2SharedMemoryHandle *handle) const {
     if (!handle) return false;
     if (!handle->header) return false;
 
     const PTO2SharedMemoryHeader *h = handle->header;
 
     // Check that offsets are within bounds
-    if (h->ring.task_descriptors_offset >= h->total_size) return false;
+    if (h->task_descriptors_offset >= h->total_size) return false;
 
     // Check pointer alignment
-    if ((uintptr_t)h->ring.task_descriptors % PTO2_ALIGN_SIZE != 0) return false;
+    if ((uintptr_t)h->task_descriptors % PTO2_ALIGN_SIZE != 0) return false;
 
     // Check flow control pointer sanity
     int32_t current = task_count.load(std::memory_order_acquire);

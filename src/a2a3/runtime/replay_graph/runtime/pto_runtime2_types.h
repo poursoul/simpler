@@ -425,7 +425,7 @@ struct alignas(64) PTO2TaskSlotState {
 
     /**
      * Bind the slot-invariant ring id. Called once per slot during
-     * RingSchedState::init(); ring_id never changes across reuses.
+     * PTO2SharedMemoryHandle::init_header(); ring_id never changes.
      */
     void bind_ring(uint8_t rid) { ring_id = rid; }
 

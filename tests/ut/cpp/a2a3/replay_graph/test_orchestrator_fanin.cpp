@@ -67,8 +67,8 @@ TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
     ASSERT_TRUE(consumer.task_id().is_valid());
 
-    auto &producer_slot = sm_handle->header->ring.get_slot_state_by_task_id(producer.task_id().local());
-    auto &consumer_slot = sm_handle->header->ring.get_slot_state_by_task_id(consumer.task_id().local());
+    auto &producer_slot = sm_handle->header->get_slot_state_by_task_id(producer.task_id().local());
+    auto &consumer_slot = sm_handle->header->get_slot_state_by_task_id(consumer.task_id().local());
 
     ASSERT_NE(consumer_slot.payload, nullptr);
     EXPECT_EQ(consumer_slot.payload->fanin_actual_count, 1);

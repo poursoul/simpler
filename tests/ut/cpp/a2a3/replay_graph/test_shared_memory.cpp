@@ -86,19 +86,19 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     EXPECT_EQ(hdr->sched_error_bitmap.load(), 0);
     EXPECT_EQ(hdr->sched_error_code.load(), 0);
 
-    auto &fc = hdr->ring.fc;
+    auto &fc = hdr->fc;
     EXPECT_EQ(fc.task_count.load(), 0);
 }
 
 TEST_F(SharedMemoryTest, Validate) { EXPECT_TRUE(handle->validate()); }
 
 TEST_F(SharedMemoryTest, RingPointersInitialized) {
-    EXPECT_NE(handle->header->ring.task_descriptors, nullptr);
-    EXPECT_NE(handle->header->ring.task_payloads, nullptr);
+    EXPECT_NE(handle->header->task_descriptors, nullptr);
+    EXPECT_NE(handle->header->task_payloads, nullptr);
 }
 
 TEST_F(SharedMemoryTest, PointerAlignment) {
-    auto addr = reinterpret_cast<uintptr_t>(handle->header->ring.task_descriptors);
+    auto addr = reinterpret_cast<uintptr_t>(handle->header->task_descriptors);
     EXPECT_EQ(addr % PTO2_ALIGN_SIZE, 0u) << "descriptors not aligned";
 }
 
@@ -113,9 +113,9 @@ TEST(SharedMemoryLayout, RegionsNonOverlapping) {
     PTO2SharedMemoryHandle *h = make_handle(arena, /*ws=*/64, /*heap=*/4096);
     ASSERT_NE(h, nullptr);
 
-    uintptr_t desc_start = (uintptr_t)h->header->ring.task_descriptors;
+    uintptr_t desc_start = (uintptr_t)h->header->task_descriptors;
     uintptr_t desc_end = desc_start + 64 * sizeof(PTO2TaskDescriptor);
-    uintptr_t payload_start = (uintptr_t)h->header->ring.task_payloads;
+    uintptr_t payload_start = (uintptr_t)h->header->task_payloads;
 
     EXPECT_GE(payload_start, desc_end) << "payload region should not overlap descriptors";
 }
@@ -153,9 +153,9 @@ TEST(SharedMemoryLayout, InitWritesHeaderValues) {
     std::memset(buffer, 0, static_cast<size_t>(sm_size));
     ASSERT_TRUE(handle->init(buffer, sm_size, ws, heap));
 
-    EXPECT_EQ(handle->header->ring.task_window_size, ws);
-    EXPECT_EQ(handle->header->ring.heap_size, heap);
-    EXPECT_EQ(handle->header->ring.task_window_mask, static_cast<int32_t>(ws - 1));
+    EXPECT_EQ(handle->header->task_window_size, ws);
+    EXPECT_EQ(handle->header->heap_size, heap);
+    EXPECT_EQ(handle->header->task_window_mask, static_cast<int32_t>(ws - 1));
 }
 
 TEST(RuntimeArenaLayout, ConfigInitializesRuntimeComponents) {
@@ -184,10 +184,10 @@ TEST(RuntimeArenaLayout, ConfigInitializesRuntimeComponents) {
     EXPECT_EQ(layout.task_window_size, ws);
     EXPECT_EQ(layout.heap_size, heap);
     EXPECT_EQ(layout.dep_pool_capacity, dep_cap);
-    EXPECT_EQ(rt->orchestrator.ring.task_allocator.window_size(), static_cast<int32_t>(ws));
-    EXPECT_EQ(rt->orchestrator.ring.task_allocator.heap_capacity(), heap);
-    EXPECT_EQ(rt->orchestrator.ring.fanin_pool.capacity, dep_cap);
-    EXPECT_EQ(rt->orchestrator.ring.dep_pool.capacity, dep_cap);
+    EXPECT_EQ(rt->orchestrator.task_allocator.window_size(), static_cast<int32_t>(ws));
+    EXPECT_EQ(rt->orchestrator.task_allocator.heap_capacity(), heap);
+    EXPECT_EQ(rt->orchestrator.fanin_pool.capacity, dep_cap);
+    EXPECT_EQ(rt->orchestrator.dep_pool.capacity, dep_cap);
 }
 
 // =============================================================================
@@ -207,7 +207,7 @@ TEST(SharedMemoryBoundary, ValidateDetectsCorruption) {
     ASSERT_NE(h, nullptr);
     EXPECT_TRUE(h->validate());
 
-    h->header->ring.fc.task_count.store(-1);
+    h->header->fc.task_count.store(-1);
     EXPECT_FALSE(h->validate());
 }
 

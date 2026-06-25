@@ -115,7 +115,7 @@ TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    orch.wire_task(orch.ring.dep_pool, &task_slot, 0);
+    orch.wire_task(orch.dep_pool, &task_slot, 0);
 
     // fanin_count set to 0 + 1 = 1 (the wiring "+1" sentinel)
     EXPECT_EQ(task_slot.fanin_count, 1);
@@ -153,7 +153,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    orch.wire_task(orch.ring.dep_pool, &task_slot, 2);
+    orch.wire_task(orch.dep_pool, &task_slot, 2);
 
     // fanin_count = 2 + 1 = 3
     EXPECT_EQ(task_slot.fanin_count, 3);
@@ -188,7 +188,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    orch.wire_task(orch.ring.dep_pool, &task_slot, 2);
+    orch.wire_task(orch.dep_pool, &task_slot, 2);
 
     // fanin_count = 3 (2 + 1)
     EXPECT_EQ(task_slot.fanin_count, 3);
@@ -229,7 +229,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    orch.wire_task(orch.ring.dep_pool, &task_slot, 3);
+    orch.wire_task(orch.dep_pool, &task_slot, 3);
 
     // fanin_count = 4 (3 + 1)
     EXPECT_EQ(task_slot.fanin_count, 4);

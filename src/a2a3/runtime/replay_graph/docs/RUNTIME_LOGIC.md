@@ -116,8 +116,8 @@ common interface.
 ## 3. Shared Memory Layout
 
 The orchestrator and schedulers communicate through one contiguous shared
-memory region in Global Memory (GM). There is a single ring, so the header
-holds one `PTO2SharedMemoryRingHeader`.
+memory region in Global Memory (GM). There is a single ring, so flow control,
+layout metadata, and data pointers live flat in `PTO2SharedMemoryHeader`.
 
 ```text
 ┌─────────────────────────────┐  offset 0
@@ -135,8 +135,8 @@ holds one `PTO2SharedMemoryRingHeader`.
 | ----- | ------ | ------ | ------- |
 | `task_count` | Orchestrator | Scheduler | Total tasks submitted (frozen after orch; equals next task ID during orch) |
 | `orchestrator_done` | Orchestrator | Scheduler | Gates the scheduler exit check |
-| `task_window_size` | Init | Both | Number of task slots (in `PTO2SharedMemoryRingHeader`) |
-| `heap_size` | Init | Both | Heap total size (in `PTO2SharedMemoryRingHeader`) |
+| `task_window_size` | Init | Both | Number of task slots |
+| `heap_size` | Init | Both | Heap total size |
 | `task_descriptors_offset` | Init | Both | Offset to the TaskDescriptor array in SM |
 | `total_size` | Init | Both | Total shared memory size |
 | `graph_output_ptr` | Orchestrator | Host | Address of final output (packed buffer) |
@@ -332,8 +332,8 @@ rather than narrowed so the shared submit/dispatch types match
 The orchestrator runs on AICPU Thread 3 and builds the task graph by calling
 the user-provided orchestration function. Key members:
 
-- `ring`: the single `PTO2RingSet` (`task_allocator` + `fanin_pool` +
-  `dep_pool`).
+- `task_allocator`, `fanin_pool`, `dep_pool`: the single-shot bump allocators
+  (task slots + heap, fanin spill, fanout dependency lists).
 - `tensor_map`: producer lookup.
 - `scope_stack_top`, `manual_begin_depth`: scope nesting depth + manual-scope
   bookkeeping (no per-scope task lists — slot reclaim was dropped).

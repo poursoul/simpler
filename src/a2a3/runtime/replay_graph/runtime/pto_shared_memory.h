@@ -42,10 +42,12 @@
 struct PTO2SharedMemoryHandle;
 
 /**
- * Per-ring flow control state in shared memory.
- * Written/read by Orchestrator and Scheduler for synchronization.
+ * Flow control state in shared memory.
+ * Written/read by Orchestrator and Scheduler for synchronization. Kept in its
+ * own 64B cache line so the Orchestrator-write / Scheduler-read of task_count
+ * does not false-share with the layout metadata in the rest of the header.
  */
-struct alignas(64) PTO2RingFlowControl {
+struct alignas(64) PTO2FlowControl {
     // Written by Orchestrator, Read by Scheduler. Frozen after the orch phase
     // completes to the total task count (single-shot: tasks are bump-allocated
     // once and never reclaimed).
@@ -63,24 +65,29 @@ struct alignas(64) PTO2RingFlowControl {
     bool validate(PTO2SharedMemoryHandle *handle) const;
 };
 
-static_assert(sizeof(PTO2RingFlowControl) == 64, "PTO2RingFlowControl must be exactly 1 cache line (64B)");
+static_assert(sizeof(PTO2FlowControl) == 64, "PTO2FlowControl must be exactly 1 cache line (64B)");
 
 /**
- * Per-ring shared memory header section.
+ * Shared memory header structure
  *
- * Groups flow-control, layout info, and per-ring data pointers for a single ring.
- * Pointers are host-side only (set by setup_pointers, invalid on device).
+ * Holds flow control, layout metadata, per-task data pointers, and global
+ * sync/error fields. fc is kept first (its own cache line) so the
+ * Orchestrator-write / Scheduler-read of task_count stays isolated.
+ *
+ * Pointers (task_descriptors/task_payloads/slot_states) are host-side only
+ * (set by setup_pointers, invalid on device).
  */
-struct alignas(64) PTO2SharedMemoryRingHeader {
-    PTO2RingFlowControl fc;
+struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
+    // === FLOW CONTROL (own cache line) ===
+    PTO2FlowControl fc;
 
-    // Layout metadata (set once at init)
+    // === LAYOUT METADATA (set once at init) ===
     uint64_t task_window_size;
     int32_t task_window_mask;
     uint64_t heap_size;
     uint64_t task_descriptors_offset;  // Offset from SM base, in bytes
 
-    // Per-ring data pointers (host-side, set by setup_pointers)
+    // === DATA POINTERS (host-side, set by setup_pointers) ===
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
@@ -102,19 +109,15 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) {
         return slot_states[get_slot_by_task_id(local_id)];
     }
-};
-
-/**
- * Shared memory header structure
- *
- * Contains per-ring flow control and global layout information.
- */
-struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
-    // === FLOW CONTROL + LAYOUT INFO (set once at init) ===
-    PTO2SharedMemoryRingHeader ring;
 
     // === GLOBAL FIELDS ===
-    std::atomic<int32_t> orchestrator_done;  // Flag: orchestration complete
+    // alignas(64) preserves the historical layout: the fc + layout/pointer block
+    // formerly lived inside an alignas(64) ring sub-struct that rounded up to 128
+    // bytes, so the global fields started at offset 128. Flattening removed that
+    // sub-struct; this alignas restores the same 128-byte boundary. The SM image
+    // is shared between the host-prebuilt arena and the AICPU runtime, so these
+    // offsets must not move (a mismatch surfaces as an onboard 507018).
+    alignas(64) std::atomic<int32_t> orchestrator_done;  // Flag: orchestration complete
 
     // Total shared memory size (for validation)
     uint64_t total_size;
@@ -140,6 +143,25 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
 static_assert(
     (sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0) && (sizeof(PTO2SharedMemoryHeader) < 4096),
     "PTO2SharedMemoryHeader should be reasonably sized"
+);
+
+// SM image is shared verbatim between the host-prebuilt arena and the AICPU
+// runtime, so flattening the former PTO2SharedMemoryRingHeader sub-struct into
+// this header MUST NOT move any field offset (a mismatch surfaces as an onboard
+// 507018). Anchor the layout that both sides depend on: fc/task_count at 0,
+// task_descriptors_offset at 88, and the global block starting at 128.
+static_assert(offsetof(PTO2SharedMemoryHeader, fc) == 0, "fc must be the first member (offset 0)");
+static_assert(
+    offsetof(PTO2SharedMemoryHeader, fc) + offsetof(PTO2FlowControl, task_count) == 0,
+    "task_count must sit at SM offset 0 (host/AICPU task_count_addr depends on it)"
+);
+static_assert(offsetof(PTO2SharedMemoryHeader, task_descriptors_offset) == 88, "task_descriptors_offset moved");
+static_assert(
+    offsetof(PTO2SharedMemoryHeader, orchestrator_done) == 128, "global field block must start at offset 128"
+);
+static_assert(
+    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 160,
+    "orch_error_code moved (orch_error_code_addr depends on it)"
 );
 
 // =============================================================================
@@ -191,7 +213,7 @@ private:
 // =============================================================================
 //
 // When the host pre-builds a runtime-arena image, it needs the device-side
-// addresses of several SM sub-fields (ring flow-control counters,
+// addresses of several SM sub-fields (flow-control counter,
 // task_descriptors arrays, orch_error_code) so it can wire them into the
 // orchestrator / scheduler init_data path without dereferencing the SM —
 // the SM lives in device memory and cannot be touched from host.
@@ -208,16 +230,9 @@ inline std::atomic<int32_t> *orch_error_code_addr(void *sm_dev_base) noexcept {
     );
 }
 
-inline PTO2SharedMemoryRingHeader *ring_header_addr(void *sm_dev_base) noexcept {
-    return reinterpret_cast<PTO2SharedMemoryRingHeader *>(
-        static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, ring)
-    );
-}
-
-inline std::atomic<int32_t> *ring_task_count_addr(void *sm_dev_base) noexcept {
+inline std::atomic<int32_t> *task_count_addr(void *sm_dev_base) noexcept {
     return reinterpret_cast<std::atomic<int32_t> *>(
-        reinterpret_cast<char *>(ring_header_addr(sm_dev_base)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
-        offsetof(PTO2RingFlowControl, task_count)
+        static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, fc) + offsetof(PTO2FlowControl, task_count)
     );
 }
 

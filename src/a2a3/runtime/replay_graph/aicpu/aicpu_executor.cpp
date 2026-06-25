@@ -486,10 +486,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             );
 
             // Reset SM state. setup_pointers + init_header restore
-            // ring flow-control counters, layout metadata, error flags, and
-            // the per-slot ring->slot_states[] (bind_ring + dynamic-field reset +
-            // fanin_count/active_mask zero — previously done inside
-            // RingSchedState::init).
+            // flow-control counters, layout metadata, error flags, and
+            // the per-slot slot_states[] (bind_ring + dynamic-field reset +
+            // fanin_count/active_mask zero — all done in init_header).
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
             if (!rt->sm_handle->init(
                     sm_ptr, sm_size, rt->prebuilt_layout.task_window_size, rt->prebuilt_layout.heap_size
@@ -512,7 +511,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
             {
                 auto &orch = rt->orchestrator;
-                auto &alloc = orch.ring.task_allocator;
+                auto &alloc = orch.task_allocator;
                 scope_stats_set_ring_capacity(
                     0, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacity
                 );
@@ -520,7 +519,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 #endif
 
-            // With multi-ring, slot_states are per-ring inside the scheduler.
+            // The scheduler reaches slot_states through the SM header, so the
+            // runtime holds no separate slot_states pointer.
             runtime->set_slot_states_ptr(nullptr);
 
             // Wire scheduler context to the newly created PTO2Runtime before
@@ -653,7 +653,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // streams that already cover everything inside submit_task().
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {
-                total_tasks = rt->orchestrator.sm_header->ring.fc.task_count.load(std::memory_order_acquire);
+                total_tasks = rt->orchestrator.sm_header->fc.task_count.load(std::memory_order_acquire);
             }
 
 #if PTO2_PROFILING

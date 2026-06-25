@@ -11,6 +11,11 @@
 /**
  * PTO Runtime2 - Ring Buffer Data Structures
  *
+ * "Ring buffer" here is a historical name: replay_graph is single-shot, so
+ * these allocators fill once and never wrap (overflow is fatal, not a
+ * wrap-around). The name is kept because renaming the file would churn a large
+ * set of includes; the structures below are plain bump allocators.
+ *
  * Implements ring buffer designs for zero-overhead memory management:
  *
  * 1. TaskAllocator - Unified task slot + output buffer allocation
@@ -69,7 +74,7 @@ public:
      *
      * Production callers leave `initial_local_task_id` at 0: the SM ring
      * flow-control counter that task_count_ptr points at starts at zero
-     * (PTO2RingFlowControl::init() runs on the AICPU during SM reset), so we
+     * (PTO2FlowControl::init() runs on the AICPU during SM reset), so we
      * keep local_task_id_ aligned with that without reading the SM. Tests that
      * drive SM state directly may pass a non-zero in-window seed.
      */
@@ -452,24 +457,6 @@ struct PTO2DepListPool {
     int32_t used() const { return top - tail; }
 
     int32_t available() const { return capacity - used(); }
-};
-
-// =============================================================================
-// Ring Set (per-depth aggregate)
-// =============================================================================
-
-/**
- * Groups a TaskAllocator and DepPool into one ring unit. replay_graph uses a
- * single instance (the orchestrator's PTO2OrchestratorState::ring).
- */
-struct PTO2RingSet {
-    PTO2TaskAllocator task_allocator;
-    PTO2FaninPool fanin_pool;
-    // Fanout dependency-list pool. Owned by the orchestrator: wiring builds the
-    // fanout linked list here during the orch phase; the scheduler only reads it
-    // (read-only traversal in on_task_complete). Moved off the scheduler's
-    // RingSchedState so wiring is fully decoupled from the scheduler.
-    PTO2DepListPool dep_pool;
 };
 
 #endif  // PTO_RING_BUFFER_H

@@ -216,9 +216,7 @@ void PTO2OrchestratorState::report_fatal(int32_t error_code, const char *func, c
 static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
     uint32_t next = orch->fanin_seen_current_epoch + 1;
     if (next == 0) {
-        memset(
-            orch->fanin_seen_epoch, 0, static_cast<size_t>(orch->sm_header->ring.task_window_size) * sizeof(uint32_t)
-        );
+        memset(orch->fanin_seen_epoch, 0, static_cast<size_t>(orch->sm_header->task_window_size) * sizeof(uint32_t));
         next = 1;
     }
     orch->fanin_seen_current_epoch = next;
@@ -311,7 +309,7 @@ static bool prepare_task(
     PTO2OrchestratorState *orch, const L0TaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
     PTO2PreparedTask *out
 ) {
-    auto &allocator = orch->ring.task_allocator;
+    auto &allocator = orch->task_allocator;
 
     out->alloc_result = allocator.alloc(total_output_size);
     if (out->alloc_result.failed()) {
@@ -320,15 +318,15 @@ static bool prepare_task(
     }
 
     out->task_id = PTO2TaskId::make(0, static_cast<uint32_t>(out->alloc_result.task_id));
-    out->slot_state = &orch->sm_header->ring.get_slot_state_by_slot(out->alloc_result.slot);
-    out->task = &orch->sm_header->ring.task_descriptors[out->alloc_result.slot];
-    out->payload = &orch->sm_header->ring.task_payloads[out->alloc_result.slot];
+    out->slot_state = &orch->sm_header->get_slot_state_by_slot(out->alloc_result.slot);
+    out->task = &orch->sm_header->task_descriptors[out->alloc_result.slot];
+    out->payload = &orch->sm_header->task_payloads[out->alloc_result.slot];
 
     out->payload->prefetch(args.tensor_count(), args.scalar_count());
 
     // Re-bind payload/task pointers each submit. Value is per-slot constant
     // (same as &task_payloads[slot] / &task_descriptors[slot]), but writing
-    // here lets RingSchedState::init() skip the O(window_size) bind loop.
+    // here lets SM init skip the O(window_size) bind loop.
     // Both writes hit the same 64B slot_state cache line we're about to
     // dirty below, so the extra cost is two stores on an already-hot line.
     // Must precede the scheduler wiring.queue.push at the end of
@@ -343,7 +341,7 @@ static bool prepare_task(
     // The single-shot replay model fills each slot exactly once. Dynamic slot
     // fields (fanout_head, fanin_refcount, completed_subtasks,
     // next_block_idx) are at their one-time SM-init clean state; ring_id is
-    // immutable after RingSchedState::init(). Only task_state is set here, to
+    // immutable after PTO2SharedMemoryHandle::init_header(). Only task_state is set here, to
     // PENDING, as the orchestrator takes ownership of the slot.
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     int16_t block_num = args.launch_spec.block_num();
@@ -381,13 +379,13 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     // collector call: when disabled we pay nothing. Sample the current ring's
     // task/heap start-end and tensormap usage at the scope boundary.
     if (is_scope_stats_enabled()) {
-        auto &alloc = orch->ring.task_allocator;
+        auto &alloc = orch->task_allocator;
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
         // dep_pool is orchestrator-owned now (replay_graph stage 1) — read it
         // directly instead of via the scheduler's atomic snapshot.
-        dep_pool_tail = orch->ring.dep_pool.tail;
-        dep_pool_top = orch->ring.dep_pool.top;
+        dep_pool_tail = orch->dep_pool.tail;
+        dep_pool_top = orch->dep_pool.top;
         scope_stats_begin(
             0, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail, dep_pool_top,
             orch->tensor_map.current_used()
@@ -410,13 +408,13 @@ void PTO2OrchestratorState::end_scope() {
     // Gate via is_scope_stats_enabled() (see begin_scope). One collector call
     // emits the end-boundary record and tears down bookkeeping.
     if (is_scope_stats_enabled()) {
-        auto &alloc = orch->ring.task_allocator;
+        auto &alloc = orch->task_allocator;
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
         // dep_pool is orchestrator-owned now (replay_graph stage 1) — read it
         // directly instead of via the scheduler's atomic snapshot.
-        dep_pool_tail = orch->ring.dep_pool.tail;
-        dep_pool_top = orch->ring.dep_pool.top;
+        dep_pool_tail = orch->dep_pool.tail;
+        dep_pool_top = orch->dep_pool.top;
         scope_stats_end(
             0, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail, dep_pool_top,
             orch->tensor_map.current_used()
@@ -500,7 +498,7 @@ static TaskOutputTensors submit_task_common(
         );
     }
 
-    PTO2FaninBuilder fanin_builder(orch, orch->ring.fanin_pool, next_fanin_seen_epoch(orch));
+    PTO2FaninBuilder fanin_builder(orch, orch->fanin_pool, next_fanin_seen_epoch(orch));
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
@@ -519,10 +517,10 @@ static TaskOutputTensors submit_task_common(
             );
             return result;
         }
-        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->ring;
+        PTO2SharedMemoryHeader &dep_hdr = *orch->sm_header;
         int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
-        int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
-        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
+        int32_t dep_slot = dep_hdr.get_slot_by_task_id(dep_local_task_id);
+        PTO2TaskSlotState *producer_slot_state = &dep_hdr.get_slot_state_by_slot(dep_slot);
         if (!append_fanin_or_fail(orch, dep_slot, producer_slot_state, &fanin_builder)) {
             return result;
         }
@@ -535,9 +533,9 @@ static TaskOutputTensors submit_task_common(
     };
 
     auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
-        PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->ring;
-        int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
-        PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
+        PTO2SharedMemoryHeader &producer_hdr = *orch->sm_header;
+        int32_t prod_slot = producer_hdr.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
+        PTO2TaskSlotState *prod_state = &producer_hdr.get_slot_state_by_slot(prod_slot);
         return append_fanin_or_fail(orch, prod_slot, prod_state, &fanin_builder);
     };
 
@@ -772,7 +770,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     payload.init(args, outputs, prepared.alloc_result, layout);
     payload.fanin_actual_count = 0;
     payload.fanin_spill_start = 0;
-    payload.fanin_spill_pool = &orch->ring.fanin_pool;
+    payload.fanin_spill_pool = &orch->fanin_pool;
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {
@@ -808,11 +806,11 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 
 void PTO2OrchestratorState::mark_done() {
     auto *orch = this;
-    int32_t total_tasks = orch->ring.task_allocator.active_count();
+    int32_t total_tasks = orch->task_allocator.active_count();
     if (total_tasks > 0) {
         LOG_INFO_V0("=== [Orchestrator] total_tasks=%d ===", total_tasks);
     }
-    auto &fanin_pool = orch->ring.fanin_pool;
+    auto &fanin_pool = orch->fanin_pool;
     if (fanin_pool.top > 1) {
         LOG_INFO_V0(
             "=== [FaninPool] top=%d tail=%d used=%d high_water=%d capacity=%d ===", fanin_pool.top, fanin_pool.tail,

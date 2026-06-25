@@ -568,19 +568,6 @@ struct PTO2SchedulerState {
     // Shared memory access
     PTO2SharedMemoryHeader *sm_header;
 
-    // Per-ring state
-    struct alignas(64) RingSchedState {
-        // --- Cache Line 0: ring pointer (read-only) ---
-        PTO2SharedMemoryRingHeader *ring;
-
-        // Initialize arena-internal data + arena-external pointers. The `ring`
-        // field stores the device address of the SM ring header — computed via
-        // offset arithmetic, no SM dereference. (The fanout dep_pool moved to the
-        // orchestrator's PTO2RingSet; replay_graph stage 1.)
-        bool init_data_from_layout(void *sm_dev_base);
-        void destroy();
-    } ring_sched_state;
-
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
@@ -977,14 +964,14 @@ struct PTO2SchedulerState {
     // `sm_dev_base` is the device address of the SM (only stored, never
     // dereferenced here). Safe to call on a host arena that holds the
     // prebuilt image buffer. (The orchestrator counterpart takes
-    // task_window_size for ring task_descriptors address arithmetic; the
-    // scheduler only needs the SM header / ring header base addresses,
-    // both window-size-independent.)
+    // task_window_size for the task_descriptors address arithmetic; the
+    // scheduler only needs the SM header base address,
+    // window-size-independent.)
     bool init_data_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base);
 
     // Phase 3b: write the arena-internal pointer fields
-    // (ready_queues[].slots, dummy_ready_queue.slots, dep_pool.base for each
-    // ring, wiring.queue.buffer_). Called on both host and device sides.
+    // (ready_queues[].slots, dummy_ready_queue.slots). Called on both host and
+    // device sides. (dep_pool + wiring SPSC buffer moved to the orchestrator.)
     void wire_arena_pointers(const PTO2SchedulerLayout &layout, DeviceArena &arena);
 
     // Forget per-region pointers; arena owns the backing memory.

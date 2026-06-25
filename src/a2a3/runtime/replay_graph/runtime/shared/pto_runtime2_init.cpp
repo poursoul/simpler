@@ -72,21 +72,6 @@ void ready_queue_destroy(PTO2ReadyQueue *queue) {
 // Scheduler
 // =============================================================================
 
-bool PTO2SchedulerState::RingSchedState::init_data_from_layout(void *sm_dev_base) {
-    // ring stores the device address of the SM ring header — pure offset
-    // arithmetic, no SM load.
-    ring = pto2_sm_layout::ring_header_addr(sm_dev_base);
-
-    // Per-slot SM-side initialization (bind_ring + dynamic-field reset +
-    // fanin_count/active_mask zero) lives in PTO2SharedMemoryHandle::
-    // init_header so the AICPU performs it during SM reset; host
-    // prebuilt-arena init skips SM access here.
-
-    return true;
-}
-
-void PTO2SchedulerState::RingSchedState::destroy() { ring = nullptr; }
-
 PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(DeviceArena &arena) {
     PTO2SchedulerLayout layout{};
     layout.ready_queue_capacity = PTO2_READY_QUEUE_SIZE;
@@ -105,14 +90,14 @@ bool PTO2SchedulerState::init_data_from_layout(
     const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base
 ) {
     PTO2SchedulerState *sched = this;
+    // sm_header is the SM device base. Pure pointer math, no SM load — per-slot
+    // SM-side init (bind_ring + dynamic-field reset + fanin_count/active_mask
+    // zero) lives in PTO2SharedMemoryHandle::init_header so the AICPU performs
+    // it during SM reset; host prebuilt-arena init skips SM access here.
     sched->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
 #if PTO2_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
 #endif
-
-    if (!sched->ring_sched_state.init_data_from_layout(sm_dev_base)) {
-        return false;
-    }
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
@@ -146,7 +131,7 @@ void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, 
 
 void PTO2SchedulerState::destroy() {
     PTO2SchedulerState *sched = this;
-    sched->ring_sched_state.destroy();
+    sched->sm_header = nullptr;
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->ready_queues[i]);
     }
@@ -210,22 +195,20 @@ bool PTO2OrchestratorState::init_data_from_layout(
     orch->fatal = false;
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
-    auto *task_count_dev = pto2_sm_layout::ring_task_count_addr(sm_dev_base);
+    auto *task_count_dev = pto2_sm_layout::task_count_addr(sm_dev_base);
 
-    orch->ring.task_allocator.init(
-        static_cast<int32_t>(task_window_size), task_count_dev, gm_heap, heap_size, orch_err
-    );
+    orch->task_allocator.init(static_cast<int32_t>(task_window_size), task_count_dev, gm_heap, heap_size, orch_err);
 
     const size_t fanin_pool_bytes =
         PTO2_ALIGN_UP(static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
     auto *fanin_entries = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool));
     memset(fanin_entries, 0, fanin_pool_bytes);
-    orch->ring.fanin_pool.init(fanin_entries, layout.dep_pool_capacity, orch_err);
+    orch->fanin_pool.init(fanin_entries, layout.dep_pool_capacity, orch_err);
 
     // Fanout dep_pool, moved off the scheduler (replay_graph stage 1).
     auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
     memset(dep_entries, 0, static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2DepListEntry));
-    orch->ring.dep_pool.init(dep_entries, layout.dep_pool_capacity, orch_err);
+    orch->dep_pool.init(dep_entries, layout.dep_pool_capacity, orch_err);
 
     const size_t seen_epoch_bytes =
         PTO2_ALIGN_UP(static_cast<size_t>(task_window_size) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
@@ -258,8 +241,8 @@ void PTO2OrchestratorState::wire_arena_pointers(
     const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler_arg
 ) {
     auto *orch = this;
-    orch->ring.fanin_pool.base = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool));
-    orch->ring.dep_pool.base = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
+    orch->fanin_pool.base = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool));
+    orch->dep_pool.base = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
     orch->fanin_seen_epoch = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch));
     orch->wiring.queue.wire_arena_pointers(arena, layout.off_wiring_spsc_buffer);
     orch->initial_ready = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_initial_ready));
@@ -270,8 +253,8 @@ void PTO2OrchestratorState::wire_arena_pointers(
 void PTO2OrchestratorState::destroy() {
     auto *orch = this;
     orch->tensor_map.destroy();
-    orch->ring.fanin_pool.base = nullptr;
-    orch->ring.dep_pool.base = nullptr;
+    orch->fanin_pool.base = nullptr;
+    orch->dep_pool.base = nullptr;
     orch->fanin_seen_epoch = nullptr;
     orch->wiring.queue.destroy();
     orch->initial_ready = nullptr;

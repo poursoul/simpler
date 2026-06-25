@@ -72,8 +72,13 @@ struct PTO2OrchestratorState {
     // === SHARED MEMORY ACCESS ===
     PTO2SharedMemoryHeader *sm_header;
 
-    // === RING RESOURCES (single ring) ===
-    PTO2RingSet ring;
+    // === ALLOCATOR RESOURCES (single-shot bump allocators) ===
+    PTO2TaskAllocator task_allocator;
+    PTO2FaninPool fanin_pool;
+    // Fanout dependency-list pool. Owned by the orchestrator: wiring builds the
+    // fanout linked list here during the orch phase; the scheduler only reads it
+    // (read-only traversal in on_task_complete).
+    PTO2DepListPool dep_pool;
     uint32_t *fanin_seen_epoch;
     uint32_t fanin_seen_current_epoch{1};
 
@@ -96,7 +101,7 @@ struct PTO2OrchestratorState {
     // === WIRING (orchestrator-owned) ===
     // replay_graph stage 1: wiring is fully owned by the orchestrator. submit_task
     // only pushes into this queue; run_wiring() drains it after orchestration,
-    // builds the fanout linked lists in rings[].dep_pool, and produces the
+    // builds the fanout linked lists in dep_pool, and produces the
     // initial-ready handoff array consumed by the scheduler. The SPSC queue is
     // kept (not collapsed into submit_task) so submit and wiring can be pipelined
     // once the orchestrator runs multi-threaded.
@@ -177,7 +182,7 @@ struct PTO2OrchestratorState {
         initial_ready[initial_ready_count++] = ws;
     }
 
-    // Wire one task's fanout edges into the given ring's dep_pool and seed its
+    // Wire one task's fanout edges into the given dep_pool and seed its
     // fanin refcount. Moved off the scheduler (was PTO2SchedulerState::wire_task):
     // builds fanout linked lists the scheduler later traverses read-only. Producers
     // are still PENDING during the orch phase except for inline-completed alloc
@@ -238,7 +243,7 @@ struct PTO2OrchestratorState {
 
         while (wiring.batch_index < wiring.batch_count) {
             PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            PTO2DepListPool &dep_pool = ring.dep_pool;
+            PTO2DepListPool &dep_pool = this->dep_pool;
             int32_t wfanin = ws->payload->fanin_actual_count;
             if (wfanin > 0 && dep_pool.available() < wfanin) {
                 report_fatal(
@@ -282,7 +287,7 @@ struct PTO2OrchestratorState {
         uint64_t task_window_size
     );
 
-    // Phase 3b: write the arena-internal pointer fields (rings[].fanin_pool.base,
+    // Phase 3b: write the arena-internal pointer fields (fanin_pool.base,
     // tensor_map.{buckets,entry_pool,free_entry_list},
     // scheduler reference).
     // Idempotent — host runs once on the image, AICPU runs once after attach.

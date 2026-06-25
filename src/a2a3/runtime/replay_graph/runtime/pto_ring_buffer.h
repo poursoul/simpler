@@ -19,14 +19,14 @@
  *    - O(1) bump allocation for both task slots and heap buffers
  *
  * 2. FaninPool - Fanin spill entry allocation
- *    - Ring buffer for spilled fanin entries
+ *    - Linear bump allocator for spilled fanin entries
  *    - O(1) append allocation
- *    - Implicit reclamation with task ring
+ *    - Single-shot: filled once, never reclaimed (overflow is fatal)
  *
  * 3. DepListPool - Dependency list entry allocation
- *    - Ring buffer for linked list entries
+ *    - Linear bump allocator for linked list entries
  *    - O(1) prepend operation
- *    - Implicit reclamation with task ring
+ *    - Single-shot: filled once, never reclaimed (overflow is fatal)
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
@@ -41,9 +41,6 @@
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
-
-// Dep pool spin limit - if exceeded, dep pool capacity too small for workload
-#define PTO2_DEP_POOL_SPIN_LIMIT 100000
 
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
@@ -220,19 +217,20 @@ private:
 /**
  * Fanin spill pool structure
  *
- * True ring buffer for allocating spilled fanin entries.
- * Entries are reclaimed when their consumer tasks become CONSUMED.
+ * Single-shot linear bump allocator for spilled fanin entries. The orch phase
+ * fills it exactly once and never wraps, and the scheduler does not run during
+ * orch, so nothing is ever reclaimed — overflow is a fatal sizing error.
  *
  * Linear counters (top, tail) grow monotonically; the physical index
- * is obtained via modulo: base[linear_index % capacity].
+ * is obtained via modulo: base[linear_index % capacity]. tail stays at its
+ * initial value (no reclamation) so used() == top - 1.
  */
 struct PTO2FaninPool {
-    PTO2FaninSpillEntry *base;       // Pool base address
-    int32_t capacity;                // Total number of entries
-    int32_t top;                     // Linear next-allocation counter (starts from 1)
-    int32_t tail;                    // Linear first-alive counter (entries before this are dead)
-    int32_t high_water;              // Peak concurrent usage (top - tail)
-    int32_t reclaim_task_cursor{0};  // Last task id scanned for reclaim on this pool
+    PTO2FaninSpillEntry *base;  // Pool base address
+    int32_t capacity;           // Total number of entries
+    int32_t top;                // Linear next-allocation counter (starts from 1)
+    int32_t tail;               // Linear first-alive counter (fixed; nothing is reclaimed)
+    int32_t high_water;         // Peak usage (top - tail)
 
     std::atomic<int32_t> *error_code_ptr = nullptr;
 
@@ -242,14 +240,9 @@ struct PTO2FaninPool {
         top = 1;
         tail = 1;
         high_water = 0;
-        reclaim_task_cursor = 0;
         base[0].slot_state = nullptr;
         error_code_ptr = in_error_code_ptr;
     }
-
-    void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
-
-    bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
     PTO2FaninSpillEntry *alloc() {
         int32_t used = top - tail;
@@ -276,12 +269,6 @@ struct PTO2FaninPool {
         used++;
         if (used > high_water) high_water = used;
         return &base[idx];
-    }
-
-    void advance_tail(int32_t new_tail) {
-        if (new_tail > tail) {
-            tail = new_tail;
-        }
     }
 
     int32_t used() const { return top - tail; }
@@ -375,20 +362,21 @@ inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayloa
 /**
  * Dependency list pool structure
  *
- * True ring buffer for allocating linked list entries.
- * Entries are reclaimed when their producer tasks become CONSUMED,
- * as tracked by the orchestrator via dep_pool_mark per task.
+ * Single-shot linear bump allocator for fanout linked-list entries. Wiring
+ * builds the whole graph's fanout lists here during the orch phase; the
+ * scheduler only reads them and never runs during orch, so nothing is ever
+ * reclaimed — capacity must hold every fanout edge and overflow is fatal.
  *
  * Linear counters (top, tail) grow monotonically; the physical index
- * is obtained via modulo: base[linear_index % capacity].
+ * is obtained via modulo: base[linear_index % capacity]. tail stays at its
+ * initial value (no reclamation) so used() == top - 1.
  */
 struct PTO2DepListPool {
-    PTO2DepListEntry *base;     // Pool base address
-    int32_t capacity;           // Total number of entries
-    int32_t top;                // Linear next-allocation counter (starts from 1)
-    int32_t tail;               // Linear first-alive counter (entries before this are dead)
-    int32_t high_water;         // Peak concurrent usage (top - tail)
-    int32_t last_reclaimed{0};  // last_task_alive at last successful reclamation
+    PTO2DepListEntry *base;  // Pool base address
+    int32_t capacity;        // Total number of entries
+    int32_t top;             // Linear next-allocation counter (starts from 1)
+    int32_t tail;            // Linear first-alive counter (fixed; nothing is reclaimed)
+    int32_t high_water;      // Peak usage (top - tail)
 
     // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
     std::atomic<int32_t> *error_code_ptr = nullptr;
@@ -403,9 +391,9 @@ struct PTO2DepListPool {
         base = in_base;
         capacity = in_capacity;
         top = 1;   // Start from 1, 0 means NULL/empty
-        tail = 1;  // Match initial top (no reclaimable entries yet)
+        tail = 1;  // Fixed; nothing is reclaimed in the single-shot model
+
         high_water = 0;
-        last_reclaimed = 0;
 
         // Initialize entry 0 as NULL marker
         base[0].slot_state = nullptr;
@@ -413,21 +401,6 @@ struct PTO2DepListPool {
 
         error_code_ptr = in_error_code_ptr;
     }
-
-    /**
-     * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
-     * Safe to call multiple times — only advances tail forward.
-     *
-     * @param ring             Ring header (for reading slot dep_pool_mark)
-     * @param sm_last_task_alive Current last_task_alive from shared memory
-     */
-    void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
-
-    /**
-     * Ensure dep pool for a specific ring has at least `needed` entries available.
-     * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
-     */
-    bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)
@@ -459,16 +432,6 @@ struct PTO2DepListPool {
         used++;
         if (used > high_water) high_water = used;
         return &base[idx];
-    }
-
-    /**
-     * Advance the tail pointer, reclaiming dead entries.
-     * Called by the orchestrator based on last_task_alive advancement.
-     */
-    void advance_tail(int32_t new_tail) {
-        if (new_tail > tail) {
-            tail = new_tail;
-        }
     }
 
     /**

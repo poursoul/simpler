@@ -13,12 +13,15 @@
  *
  * Tests hash-table-based producer lookup with overlap detection:
  * - Hash function distribution (golden-ratio multiplicative hash)
- * - Insert / lookup / cleanup lifecycle
+ * - Insert / lookup lifecycle
  * - Overlap detection: fast-path (is_all_offset_zero) and slow-path (offsets)
- * - Lazy invalidation (stale entries skipped, not truncated)
  * - Lookup returns all matches (no silent 16-result cap post-#669)
- * - Entry pool allocation and free-list recycling
- * - cleanup_retired correctness across task windows
+ * - Entry pool allocation and free-list recycling (via remove_entry)
+ * - Bucket-chain and per-task-chain integrity under entry removal
+ *
+ * The single-shot replay model never retires tasks, so lazy invalidation and
+ * cleanup_retired no longer exist — every inserted entry stays valid. Removal
+ * is now exercised through the surviving remove_entry() API.
  */
 
 #include <gtest/gtest.h>
@@ -63,6 +66,23 @@ static Tensor make_test_tensor(uint64_t addr, uint32_t shape0, uint32_t ndims = 
 static Tensor make_test_tensor_2d(uint64_t addr, uint32_t s0, uint32_t s1, int32_t version = 0) {
     uint32_t shapes[MAX_TENSOR_DIMS] = {s0, s1};
     return make_tensor_external(reinterpret_cast<void *>(addr), shapes, 2, DataType::FLOAT32, false, version);
+}
+
+// Remove every entry a given local task id produced. The single-shot replay
+// model has no cleanup_retired path anymore; this walks the per-task chain and
+// calls the surviving remove_entry() API so bucket/free-list/task-chain
+// integrity stays under test.
+static int remove_task_entries(PTO2TensorMap &tmap, uint32_t local_id) {
+    int removed = 0;
+    int32_t slot = static_cast<int32_t>(tmap.get_task_local_id_slot(local_id));
+    PTO2TensorMapEntry *cur = tmap.task_entry_heads[slot];
+    while (cur != nullptr) {
+        PTO2TensorMapEntry *next = cur->next_in_task;
+        tmap.remove_entry(*cur);
+        removed++;
+        cur = next;
+    }
+    return removed;
 }
 
 // =============================================================================
@@ -315,115 +335,23 @@ TEST_F(TensorMapTest, VersionMismatchReturnsOther) {
 }
 
 // =============================================================================
-// Lazy invalidation
+// Entry removal frees to pool (remove_entry path)
 // =============================================================================
 
-TEST_F(TensorMapTest, StaleEntriesSkippedDuringLookup) {
-    Tensor t = make_test_tensor(0x1000, 256);
-    tmap.insert(t, PTO2TaskId::make(0, 0));
-    tmap.insert(t, PTO2TaskId::make(0, 1));
-
-    // Advance validity to skip task 0
-    tmap.sync_validity(1);
-
-    TestLookupResult result;
-    run_lookup(tmap, t, result);
-    ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 1));
-}
-
-TEST_F(TensorMapTest, StaleEntryDoesNotTruncateChain) {
-    Tensor t = make_test_tensor(0x1000, 256);
-    // Two tasks in the same bucket; the older one will become stale. Lookup
-    // must skip the stale entry without truncating traversal of the chain.
-    tmap.insert(t, PTO2TaskId::make(0, 0));
-    tmap.insert(t, PTO2TaskId::make(0, 1));
-
-    // Invalidate task 0 only
-    tmap.sync_validity(1);
-
-    TestLookupResult result;
-    run_lookup(tmap, t, result);
-    // Task 1 still valid, task 0 invalidated
-    ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 1));
-}
-
-// =============================================================================
-// cleanup_retired
-// =============================================================================
-
-TEST_F(TensorMapTest, CleanupRetiredRemovesEntriesForRetiredTasks) {
-    Tensor t = make_test_tensor(0x1000, 256);
-    tmap.insert(t, PTO2TaskId::make(0, 0));
-    tmap.insert(t, PTO2TaskId::make(0, 1));
-    tmap.insert(t, PTO2TaskId::make(0, 2));
-    EXPECT_EQ(tmap.valid_count(), 3);
-
-    // Cleanup tasks [0, 2) on ring 0
-    tmap.cleanup_retired(0, 2);
-
-    EXPECT_EQ(tmap.valid_count(), 1);
-
-    TestLookupResult result;
-    run_lookup(tmap, t, result);
-    ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 2));
-}
-
-TEST_F(TensorMapTest, CleanupRetiredPreservesUnretiredTasks) {
-    Tensor t = make_test_tensor(0x1000, 256);
-    tmap.insert(t, PTO2TaskId::make(0, 0));
-    tmap.insert(t, PTO2TaskId::make(0, 1));
-
-    // Retire only task 0; task 1 (a distinct task slot) must survive.
-    tmap.cleanup_retired(0, 1);
-
-    EXPECT_EQ(tmap.valid_count(), 1);
-
-    TestLookupResult result;
-    run_lookup(tmap, t, result);
-    ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 1));
-}
-
-TEST_F(TensorMapTest, CleanupRetiredFreesEntriesToPool) {
+TEST_F(TensorMapTest, RemoveEntryFreesEntriesToPool) {
     Tensor t = make_test_tensor(0x1000, 256);
     tmap.insert(t, PTO2TaskId::make(0, 0));
     EXPECT_EQ(tmap.free_num, 0);
     EXPECT_EQ(tmap.next_entry_idx, 1);
 
-    tmap.cleanup_retired(0, 1);
+    EXPECT_EQ(remove_task_entries(tmap, 0), 1);
 
-    EXPECT_EQ(tmap.free_num, 1) << "Cleaned entry should be in free list";
+    EXPECT_EQ(tmap.free_num, 1) << "Removed entry should be in free list";
 
     // New insert should reuse free entry instead of allocating fresh
     tmap.insert(t, PTO2TaskId::make(0, 1));
     EXPECT_EQ(tmap.free_num, 0);
     EXPECT_EQ(tmap.next_entry_idx, 1) << "Should reuse freed entry, not allocate new";
-}
-
-// =============================================================================
-// Lazy invalidation by threshold
-// =============================================================================
-
-TEST_F(TensorMapTest, LookupHonorsValidityThreshold) {
-    Tensor t = make_test_tensor(0x1000, 256);
-    tmap.insert(t, PTO2TaskId::make(0, 3));
-    tmap.insert(t, PTO2TaskId::make(0, 5));
-    tmap.insert(t, PTO2TaskId::make(0, 7));
-
-    TestLookupResult result;
-    run_lookup(tmap, t, result);
-    EXPECT_EQ(result.count, 3);
-
-    // Advance validity past tasks 3 and 5; only task 7 stays valid.
-    tmap.sync_validity(7);
-
-    TestLookupResult result2;
-    run_lookup(tmap, t, result2);
-    EXPECT_EQ(result2.count, 1);
-    EXPECT_EQ(result2.entries[0].entry->producer_task_id, PTO2TaskId::make(0, 7));
 }
 
 // =============================================================================
@@ -462,11 +390,13 @@ TEST_F(TensorMapTest, PoolExhaustionAsserts) {
 
 TEST_F(TensorMapTest, FreeListRecycling) {
     Tensor t = make_test_tensor(0x1000, 256);
-    // Insert and cleanup 10 entries
+    // Insert and remove 10 entries
     for (int i = 0; i < 10; i++) {
         tmap.insert(t, PTO2TaskId::make(0, i));
     }
-    tmap.cleanup_retired(0, 10);
+    for (uint32_t i = 0; i < 10; i++) {
+        remove_task_entries(tmap, i);
+    }
     EXPECT_EQ(tmap.free_num, 10);
 
     // Re-insert should use free list
@@ -490,8 +420,8 @@ TEST_F(TensorMapTest, PerTaskEntryListTracksMultipleOutputs) {
     tmap.insert(t2, tid);
     EXPECT_EQ(tmap.valid_count(), 2);
 
-    // Cleanup task 5 should remove both entries
-    tmap.cleanup_retired(5, 6);
+    // Removing task 5 should remove both of its entries
+    EXPECT_EQ(remove_task_entries(tmap, 5), 2);
     EXPECT_EQ(tmap.valid_count(), 0);
     EXPECT_EQ(tmap.free_num, 2);
 }
@@ -511,7 +441,7 @@ TEST_F(TensorMapTest, RemoveMiddleEntryPreservesChain) {
     tmap.insert(t, tid2);
 
     // Remove middle entry (task 1)
-    tmap.cleanup_retired(1, 2);
+    EXPECT_EQ(remove_task_entries(tmap, 1), 1);
 
     TestLookupResult result;
     run_lookup(tmap, t, result);

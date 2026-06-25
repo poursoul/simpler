@@ -219,8 +219,6 @@ struct PTO2OrchestratorState {
             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
             push_initial_ready(ws);
         }
-
-        ws->dep_pool_mark = dep_pool.top;
     }
 
     // Drain a batch of submitted tasks from the wiring queue and wire each. No

@@ -115,8 +115,6 @@ bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, Dev
         heads_arena[i] = nullptr;
     }
     task_window_size = layout.task_window_size;
-    last_task_alive = 0;
-    last_cleanup = 0;
 
     return true;
 }
@@ -192,7 +190,6 @@ void PTO2TensorMap::print_stats() {
     LOG_INFO_V0("Empty buckets:       %d", empty_buckets);
     LOG_INFO_V0("Max chain len:       %d", max_chain);
     LOG_INFO_V0("Avg chain len:       %.2f", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
-    LOG_INFO_V0("Last task alive:     %d", last_task_alive);
     LOG_INFO_V0("============================");
 }
 
@@ -206,19 +203,6 @@ int32_t PTO2TensorMap::valid_count() {
     }
 
     return count;
-}
-
-void PTO2TensorMap::sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_alive) {
-    auto local_id = task_id.local();
-    sync_validity(sm_last_task_alive);
-
-    // Only attempt cleanup when last_task_alive has actually advanced;
-    // otherwise cleanup_retired would empty-loop and we'd spin forever.
-    auto overlap = get_task_local_id_slot(local_id) == get_task_local_id_slot(last_cleanup);
-    if (sm_last_task_alive - last_cleanup >= PTO2_TENSORMAP_CLEANUP_INTERVAL || overlap) {
-        cleanup_retired(last_cleanup, sm_last_task_alive);
-        last_cleanup = sm_last_task_alive;
-    }
 }
 
 // =============================================================================

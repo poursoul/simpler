@@ -13,8 +13,8 @@
  * from pto_ring_buffer.h / pto_ring_buffer.cpp
  *
  * Tests:
- * 1. PTO2FaninPool — ring buffer allocation, overflow, tail advance,
- *    high-water tracking
+ * 1. PTO2FaninPool — single-shot bump allocation and fatal overflow
+ *    (the pool is never reclaimed, so there is no tail advance to test)
  * 2. for_each_fanin_storage — inline-only, spill without wrap,
  *    spill with wrap, callback early return
  */
@@ -84,70 +84,6 @@ TEST_F(FaninPoolTest, OverflowReturnsNullptr) {
     auto *overflow = pool.alloc();
     EXPECT_EQ(overflow, nullptr);
     EXPECT_EQ(error_code.load(), PTO2_ERROR_DEP_POOL_OVERFLOW);
-}
-
-TEST_F(FaninPoolTest, EnsureSpaceDeadlockReturnsFalseAndLatchesError) {
-    for (int i = 0; i < POOL_CAP; i++) {
-        ASSERT_NE(pool.alloc(), nullptr);
-    }
-
-    PTO2SharedMemoryRingHeader ring{};
-    ring.fc.init();
-    ring.fc.current_task_index.store(POOL_CAP + 1, std::memory_order_release);
-    ring.fc.last_task_alive.store(0, std::memory_order_release);
-
-    EXPECT_FALSE(pool.ensure_space(ring, 1));
-    EXPECT_EQ(error_code.load(), PTO2_ERROR_DEP_POOL_OVERFLOW);
-}
-
-TEST_F(FaninPoolTest, AdvanceTailFreesSpace) {
-    for (int i = 0; i < 10; i++) {
-        pool.alloc();
-    }
-    EXPECT_EQ(pool.used(), 10);
-
-    pool.advance_tail(pool.tail + 5);
-    EXPECT_EQ(pool.used(), 5);
-    EXPECT_EQ(pool.available(), POOL_CAP - 5);
-}
-
-TEST_F(FaninPoolTest, AdvanceTailBackwardsIsNoop) {
-    for (int i = 0; i < 10; i++) {
-        pool.alloc();
-    }
-    int32_t old_tail = pool.tail;
-    pool.advance_tail(old_tail - 1);
-    EXPECT_EQ(pool.tail, old_tail);
-    EXPECT_EQ(pool.used(), 10);
-}
-
-TEST_F(FaninPoolTest, HighWaterNeverDecreases) {
-    for (int i = 0; i < 10; i++) {
-        pool.alloc();
-    }
-    EXPECT_EQ(pool.high_water, 10);
-
-    pool.advance_tail(pool.tail + 5);
-    EXPECT_EQ(pool.high_water, 10) << "high_water must never decrease";
-}
-
-TEST_F(FaninPoolTest, WrapAroundAllocation) {
-    // Fill and drain, then fill again to wrap
-    for (int i = 0; i < POOL_CAP; i++) {
-        pool.alloc();
-    }
-    pool.advance_tail(pool.top);
-    EXPECT_EQ(pool.used(), 0);
-
-    // New allocations wrap around
-    for (int i = 0; i < 5; i++) {
-        auto *e = pool.alloc();
-        ASSERT_NE(e, nullptr);
-        // Verify modulo indexing
-        int32_t expected_idx = (pool.top - 1) % POOL_CAP;
-        EXPECT_EQ(e, &entries[expected_idx]);
-    }
-    EXPECT_EQ(pool.used(), 5);
 }
 
 // =============================================================================

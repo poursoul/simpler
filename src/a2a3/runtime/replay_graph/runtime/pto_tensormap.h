@@ -17,9 +17,10 @@
  * - Used by pto_submit_task() to find dependencies
  *
  * Key design features:
- * 1. Ring buffer pool for entries (no malloc/free)
- * 2. Lazy invalidation (entries become stale when producer retires)
- * 3. Per-task per-ring entry tracking for efficient cleanup
+ * 1. Bump-allocated entry pool with a free list (no malloc/free)
+ * 2. Single-shot lifetime: the orch phase never retires tasks, so every
+ *    inserted entry stays valid for the life of the map (no lazy invalidation)
+ * 3. Per-task entry tracking for O(1) per-entry removal
  * 4. OVERLAP DETECTION: Detects dependencies for overlapping sub-regions
  *
  * Hash table with chaining:
@@ -373,12 +374,6 @@ struct PTO2TensorMap {
     PTO2TensorMapEntry **task_entry_heads;
     int32_t task_window_size;  // Task window size (for slot masking)
 
-    // Validity threshold (for lazy invalidation)
-    int32_t last_task_alive;  // Cached from shared memory
-
-    // Cleanup progress (for periodic cleanup_retired)
-    int32_t last_cleanup{};
-
     uint32_t get_task_local_id_slot(uint32_t task_local_id) const { return task_local_id & (task_window_size - 1); }
 
     // Accessors read by scope_stats_collector. Declared unconditionally so the
@@ -467,14 +462,6 @@ struct PTO2TensorMap {
     void destroy();
 
     /**
-     * Update validity threshold from shared memory
-     * Called periodically to refresh the lazy invalidation threshold.
-     *
-     * @param last_task_alive  Current value from shared memory
-     */
-    void sync_validity(int32_t new_last_task_alive) { this->last_task_alive = new_last_task_alive; }
-
-    /**
      * Lookup producer for a tensor region
      *
      * Searches the hash table for matching regions and invokes the callback
@@ -559,35 +546,6 @@ struct PTO2TensorMap {
         link_entry(entry, tensor.buffer.addr, producer_task_id);
     }
 
-    /**
-     * Cleanup stale entries for retired tasks
-     *
-     * Called periodically by Orchestrator when last_task_alive advances.
-     * Removes entries from bucket chains for tasks in [old, new) range.
-     *
-     * @param old_last_task_alive  Previous threshold
-     * @param new_last_task_alive  New threshold
-     */
-    void cleanup_retired(int32_t old_last_task_alive, int32_t new_last_task_alive) {
-        // Iterate through retired tasks and remove their entries
-        for (int32_t local_id = old_last_task_alive; local_id < new_last_task_alive; local_id++) {
-            int32_t task_slot = local_id & (task_window_size - 1);
-            PTO2TensorMapEntry *cur_entry = task_entry_heads[task_slot];
-
-            while (cur_entry != nullptr) {
-                PTO2TensorMapEntry *next_entry = cur_entry->next_in_task;  // Save before clearing
-                // Only remove if this entry belongs to the retiring task
-                // (slot may have been reused by a newer task)
-                debug_assert(cur_entry->producer_task_id == PTO2TaskId::make(0, static_cast<uint32_t>(local_id)));
-                free_entry(*cur_entry);
-                cur_entry = next_entry;
-            }
-
-            // Clear task's entry head (slot will be reused by local_id + task_window_size)
-            task_entry_heads[task_slot] = nullptr;
-        }
-    }
-
     // =============================================================================
     // Internal Helpers (exposed for testing)
     // =============================================================================
@@ -637,10 +595,15 @@ struct PTO2TensorMap {
     }
 
     /**
-     * Check if entry is valid (producer has not retired)
+     * Check if entry is valid (producer has not retired).
+     *
+     * In the single-shot replay model the scheduler never advances
+     * last_task_alive during the orch phase, so no entry is ever retired —
+     * every inserted entry stays valid for the life of the map.
      */
     bool entry_valid(const PTO2TensorMapEntry &entry) const {
-        return static_cast<int32_t>(entry.producer_task_id.local()) >= last_task_alive;
+        (void)entry;
+        return true;
     }
 
     void remove_entry(PTO2TensorMapEntry &entry) {
@@ -686,18 +649,6 @@ struct PTO2TensorMap {
      * Get count of valid entries
      */
     int32_t valid_count();
-
-    // =============================================================================
-    // TensorMap Synchronization
-    // =============================================================================
-
-    /**
-     * Sync TensorMap validity threshold from shared memory
-     *
-     * Called periodically to refresh the lazy invalidation threshold.
-     * Also triggers cleanup if threshold has advanced significantly.
-     */
-    void sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_alive);
 };
 
 #if PTO2_TENSORMAP_PROFILING

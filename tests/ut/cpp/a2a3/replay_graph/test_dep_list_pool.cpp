@@ -11,14 +11,12 @@
 /**
  * Unit tests for PTO2DepListPool from pto_ring_buffer.h
  *
- * Tests dependency list pool allocation, prepend chaining, overflow detection,
- * tail advancement, and high-water mark tracking.
+ * Tests dependency list pool allocation, prepend chaining, and overflow
+ * detection. The single-shot replay model never reclaims the pool, so there
+ * is no tail advancement or back-pressure path to exercise — overflow is a
+ * fatal sizing error surfaced by alloc() returning nullptr.
  *
- * Design contracts:
- *
- * - advance_tail(new_tail) only advances if new_tail > tail; it does
- *   not validate new_tail <= top.  Caller contract (monotonic,
- *   top-bounded).
+ * Design contract:
  *
  * - The list terminator is literal nullptr.  base[0] is a normal pool entry;
  *   init clearing it is incidental, not an invariant.
@@ -79,20 +77,6 @@ TEST_F(DepListPoolTest, OverflowDetection) {
     EXPECT_EQ(error_code.load(), PTO2_ERROR_DEP_POOL_OVERFLOW);
 }
 
-TEST_F(DepListPoolTest, EnsureSpaceDeadlockReturnsFalseAndLatchesError) {
-    for (int i = 0; i < POOL_CAP; i++) {
-        ASSERT_NE(pool.alloc(), nullptr);
-    }
-
-    PTO2SharedMemoryRingHeader ring{};
-    ring.fc.init();
-    ring.fc.current_task_index.store(POOL_CAP + 1, std::memory_order_release);
-    ring.fc.last_task_alive.store(0, std::memory_order_release);
-
-    EXPECT_FALSE(pool.ensure_space(ring, 1));
-    EXPECT_EQ(error_code.load(), PTO2_ERROR_DEP_POOL_OVERFLOW);
-}
-
 // Prepend builds LIFO linked list: verify each slot_state pointer.
 TEST_F(DepListPoolTest, PrependChainCorrectness) {
     PTO2TaskSlotState slots[5]{};
@@ -111,44 +95,6 @@ TEST_F(DepListPoolTest, PrependChainCorrectness) {
         cur = cur->next;
     }
     EXPECT_EQ(cur, nullptr) << "Chain should terminate with nullptr";
-}
-
-TEST_F(DepListPoolTest, AdvanceTail) {
-    for (int i = 0; i < 4; i++) {
-        pool.alloc();
-    }
-    EXPECT_EQ(pool.used(), 4);
-    EXPECT_EQ(pool.available(), POOL_CAP - 4);
-
-    pool.advance_tail(4);
-    EXPECT_EQ(pool.used(), 1);
-    EXPECT_EQ(pool.available(), POOL_CAP - 1);
-}
-
-TEST_F(DepListPoolTest, AdvanceTailBackwardsNoop) {
-    pool.alloc();
-    pool.alloc();
-    pool.advance_tail(3);
-    int32_t used_after = pool.used();
-
-    pool.advance_tail(2);
-    EXPECT_EQ(pool.used(), used_after);
-
-    pool.advance_tail(3);
-    EXPECT_EQ(pool.used(), used_after);
-}
-
-TEST_F(DepListPoolTest, HighWaterAccuracy) {
-    for (int i = 0; i < 5; i++)
-        pool.alloc();
-    EXPECT_EQ(pool.high_water, 5);
-
-    pool.advance_tail(4);
-    EXPECT_EQ(pool.high_water, 5) << "High water never decreases";
-
-    for (int i = 0; i < 3; i++)
-        pool.alloc();
-    EXPECT_GE(pool.high_water, 5);
 }
 
 // =============================================================================

@@ -275,10 +275,6 @@ static bool append_fanin_or_fail(
     }
 
     PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
-    if (!fanin_pool.ensure_space(orch->sm_header->ring, 1)) {
-        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
-        return false;
-    }
     int32_t spill_idx = fanin_pool.top;
     PTO2FaninSpillEntry *entry = fanin_pool.alloc();
     if (entry == nullptr) {
@@ -532,7 +528,6 @@ static TaskOutputTensors submit_task_common(
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) {
         return result;
     }
-    PTO2RingFlowControl &fc = orch->sm_header->ring.fc;
     PTO2TaskId task_id = prepared.task_id;
     PTO2TaskSlotState &cur_slot_state = *prepared.slot_state;
     PTO2TaskDescriptor &task = *prepared.task;
@@ -583,12 +578,6 @@ static TaskOutputTensors submit_task_common(
         orch->bytes_allocated += layout.total_output_size;
     }
 #endif
-
-    // === STEP 2: Sync TensorMap validity and optional cleanup ===
-    // Read current last_task_alive from shared memory for this ring
-    int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
-
-    orch->tensor_map.sync_tensormap(task_id, sm_last_task_alive);
 
     CYCLE_COUNT_LAP(g_orch_sync_cycle);
 

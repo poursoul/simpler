@@ -89,10 +89,6 @@
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64
 
-// TensorMap cleanup interval
-#define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
-#define PTO2_DEP_POOL_CLEANUP_INTERVAL 64   // Cleanup every N retired tasks
-
 // get_tensor_data/set_tensor_data spin wait timeout in cycles.
 // ~10s on hardware (1.5 GHz counter), ~10s on simulation (chrono-based).
 constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
@@ -403,13 +399,16 @@ struct alignas(64) PTO2TaskSlotState {
     // Set by any subtask FIN that pushed deferred-completion CONDITIONs to
     // the runtime mailbox; read by the last subtask FIN to decide whether
     // the task needs MPSC-deferred completion or can complete inline on this
-    // thread. Carved out of the otherwise-padding byte between ring_id and
-    // dep_pool_mark to keep PTO2TaskSlotState at 64 bytes. The write is
-    // sequenced before on_subtask_complete's acq_rel fetch_add and the read
-    // after, so all earlier subtasks' writes are visible to the last subtask.
+    // thread. Carved out of the otherwise-padding byte after ring_id to keep
+    // PTO2TaskSlotState at 64 bytes. The write is sequenced before
+    // on_subtask_complete's acq_rel fetch_add and the read after, so all
+    // earlier subtasks' writes are visible to the last subtask.
     std::atomic<bool> any_subtask_deferred{false};
     uint8_t _async_pad{0};
-    int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
+    // The reclaim/reuse-lifecycle field dep_pool_mark was removed in the
+    // single-shot replay model (the dep pool is never reclaimed); this 4-byte
+    // padding preserves the 64-byte layout.
+    uint8_t _pad_reclaim2[4];
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)

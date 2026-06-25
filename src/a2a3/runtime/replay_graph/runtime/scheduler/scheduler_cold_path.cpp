@@ -245,7 +245,7 @@ void SchedulerContext::log_stall_diagnostics(
         int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, submitted_in_ring = 0;
         {
             PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
-            int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
+            int32_t ring_task_count = ring.fc.task_count.load(std::memory_order_relaxed);
             submitted_in_ring += ring_task_count;
             for (int32_t si = 0; si < ring_task_count; si++) {
                 PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
@@ -907,7 +907,7 @@ int32_t SchedulerContext::init(
         // so an uninitialized ring contributes 0 (the correct boot count) while
         // a valid count still applies, with no signed overflow.
         int64_t pto2_count = 0;
-        int32_t ring_tasks = header->ring.fc.current_task_index.load(std::memory_order_acquire);
+        int32_t ring_tasks = header->ring.fc.task_count.load(std::memory_order_acquire);
         if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) pto2_count += ring_tasks;
         total_tasks_ = static_cast<int32_t>(pto2_count);
     } else {

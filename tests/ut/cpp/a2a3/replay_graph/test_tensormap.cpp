@@ -17,7 +17,7 @@
  * - Overlap detection: fast-path (is_all_offset_zero) and slow-path (offsets)
  * - Lookup returns all matches (no silent 16-result cap post-#669)
  * - Entry pool allocation and free-list recycling (via remove_entry)
- * - Bucket-chain and per-task-chain integrity under entry removal
+ * - Bucket-chain integrity under entry removal
  *
  * The single-shot replay model never retires tasks, so lazy invalidation and
  * cleanup_retired no longer exist — every inserted entry stays valid. Removal
@@ -69,18 +69,18 @@ static Tensor make_test_tensor_2d(uint64_t addr, uint32_t s0, uint32_t s1, int32
 }
 
 // Remove every entry a given local task id produced. The single-shot replay
-// model has no cleanup_retired path anymore; this walks the per-task chain and
-// calls the surviving remove_entry() API so bucket/free-list/task-chain
+// model has no cleanup_retired path and no per-task chain anymore; this scans
+// the entry pool for still-linked entries (bucket_index != -1) whose producer
+// matches and calls the surviving remove_entry() API so bucket/free-list
 // integrity stays under test.
 static int remove_task_entries(PTO2TensorMap &tmap, uint32_t local_id) {
     int removed = 0;
-    int32_t slot = static_cast<int32_t>(tmap.get_task_local_id_slot(local_id));
-    PTO2TensorMapEntry *cur = tmap.task_entry_heads[slot];
-    while (cur != nullptr) {
-        PTO2TensorMapEntry *next = cur->next_in_task;
-        tmap.remove_entry(*cur);
-        removed++;
-        cur = next;
+    for (int32_t i = 0; i < tmap.next_entry_idx; i++) {
+        PTO2TensorMapEntry &e = tmap.entry_pool[i];
+        if (e.bucket_index != -1 && e.producer_task_id.local() == local_id) {
+            tmap.remove_entry(e);
+            removed++;
+        }
     }
     return removed;
 }
@@ -93,13 +93,12 @@ class TensorMapTest : public ::testing::Test {
 protected:
     static constexpr int32_t NUM_BUCKETS = 16;
     static constexpr int32_t POOL_SIZE = 64;
-    static constexpr int32_t WINDOW_SIZE = 32;
 
     PTO2TensorMap tmap{};
     DeviceArena arena;
 
     void SetUp() override {
-        auto layout = PTO2TensorMap::reserve_layout(arena, NUM_BUCKETS, POOL_SIZE, WINDOW_SIZE);
+        auto layout = PTO2TensorMap::reserve_layout(arena, NUM_BUCKETS, POOL_SIZE);
         ASSERT_NE(arena.commit(), nullptr);
         ASSERT_TRUE(tmap.init_data_from_layout(layout, arena));
         tmap.wire_arena_pointers(layout, arena);
@@ -120,7 +119,7 @@ TEST_F(TensorMapTest, InitValidState) {
     EXPECT_EQ(tmap.pool_size, POOL_SIZE);
     EXPECT_EQ(tmap.next_entry_idx, 0);
     EXPECT_EQ(tmap.free_num, 0);
-    EXPECT_EQ(tmap.valid_count(), 0);
+    EXPECT_EQ(tmap.current_used(), 0);
 }
 
 TEST_F(TensorMapTest, InitRequiresPowerOfTwoBuckets) {
@@ -129,7 +128,7 @@ TEST_F(TensorMapTest, InitRequiresPowerOfTwoBuckets) {
     // always_assert may compile out). Smoke-test only the success path here.
     PTO2TensorMap bad{};
     DeviceArena bad_arena;
-    auto layout = PTO2TensorMap::reserve_layout(bad_arena, 8, 64, WINDOW_SIZE);
+    auto layout = PTO2TensorMap::reserve_layout(bad_arena, 8, 64);
     ASSERT_NE(bad_arena.commit(), nullptr);
     EXPECT_TRUE(bad.init_data_from_layout(layout, bad_arena));
     bad.wire_arena_pointers(layout, bad_arena);
@@ -408,21 +407,21 @@ TEST_F(TensorMapTest, FreeListRecycling) {
 }
 
 // =============================================================================
-// Task chain integrity (per-task entry list)
+// Removing a multi-output task frees all of its entries
 // =============================================================================
 
-TEST_F(TensorMapTest, PerTaskEntryListTracksMultipleOutputs) {
+TEST_F(TensorMapTest, RemoveTaskFreesAllItsOutputs) {
     Tensor t1 = make_test_tensor(0x1000, 256);
     Tensor t2 = make_test_tensor(0x2000, 128);
     PTO2TaskId tid = PTO2TaskId::make(0, 5);
 
     tmap.insert(t1, tid);
     tmap.insert(t2, tid);
-    EXPECT_EQ(tmap.valid_count(), 2);
+    EXPECT_EQ(tmap.current_used(), 2);
 
     // Removing task 5 should remove both of its entries
     EXPECT_EQ(remove_task_entries(tmap, 5), 2);
-    EXPECT_EQ(tmap.valid_count(), 0);
+    EXPECT_EQ(tmap.current_used(), 0);
     EXPECT_EQ(tmap.free_num, 2);
 }
 

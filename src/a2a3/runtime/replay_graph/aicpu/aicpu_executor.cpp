@@ -653,7 +653,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // streams that already cover everything inside submit_task().
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {
-                total_tasks = rt->orchestrator.sm_header->ring.fc.current_task_index.load(std::memory_order_acquire);
+                total_tasks = rt->orchestrator.sm_header->ring.fc.task_count.load(std::memory_order_acquire);
             }
 
 #if PTO2_PROFILING

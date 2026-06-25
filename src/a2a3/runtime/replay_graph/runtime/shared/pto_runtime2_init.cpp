@@ -190,7 +190,7 @@ PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_window_si
     layout.off_initial_ready = arena.reserve(
         static_cast<size_t>(layout.initial_ready_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
     );
-    layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena, task_window_size);
+    layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena);
     return layout;
 }
 
@@ -210,9 +210,11 @@ bool PTO2OrchestratorState::init_data_from_layout(
     orch->fatal = false;
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
-    auto *cur_idx_dev = pto2_sm_layout::ring_current_task_index_addr(sm_dev_base);
+    auto *task_count_dev = pto2_sm_layout::ring_task_count_addr(sm_dev_base);
 
-    orch->ring.task_allocator.init(static_cast<int32_t>(task_window_size), cur_idx_dev, gm_heap, heap_size, orch_err);
+    orch->ring.task_allocator.init(
+        static_cast<int32_t>(task_window_size), task_count_dev, gm_heap, heap_size, orch_err
+    );
 
     const size_t fanin_pool_bytes =
         PTO2_ALIGN_UP(static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
@@ -226,7 +228,7 @@ bool PTO2OrchestratorState::init_data_from_layout(
     orch->ring.dep_pool.init(dep_entries, layout.dep_pool_capacity, orch_err);
 
     const size_t seen_epoch_bytes =
-        PTO2_ALIGN_UP(static_cast<size_t>(layout.tensor_map.task_window_size) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
+        PTO2_ALIGN_UP(static_cast<size_t>(task_window_size) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
     auto *seen_epoch = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch));
     memset(seen_epoch, 0, seen_epoch_bytes);
     orch->fanin_seen_epoch = seen_epoch;

@@ -133,8 +133,7 @@ holds one `PTO2SharedMemoryRingHeader`.
 
 | Field | Writer | Reader | Purpose |
 | ----- | ------ | ------ | ------- |
-| `current_task_index` | Orchestrator | Scheduler | Next task ID to allocate (task ring head) |
-| `last_task_alive` | Init only | — | Ring tail; stays 0 (single-shot never reclaims) |
+| `task_count` | Orchestrator | Scheduler | Total tasks submitted (frozen after orch; equals next task ID during orch) |
 | `orchestrator_done` | Orchestrator | Scheduler | Gates the scheduler exit check |
 | `task_window_size` | Init | Both | Number of task slots (in `PTO2SharedMemoryRingHeader`) |
 | `heap_size` | Init | Both | Heap total size (in `PTO2SharedMemoryRingHeader`) |
@@ -143,10 +142,6 @@ holds one `PTO2SharedMemoryRingHeader`.
 | `graph_output_ptr` | Orchestrator | Host | Address of final output (packed buffer) |
 | `graph_output_size` | Orchestrator | Host | Size of final output in bytes |
 | `orch_error_code` | Orchestrator | Scheduler/Host | Fatal-error channel |
-
-`last_task_alive` is initialized to 0 and never advanced — it survives only
-as the ring tail anchor for slot-index arithmetic. The two-phase model means
-no scheduler ever advances it.
 
 ### 3.2 Size Calculation
 
@@ -173,7 +168,7 @@ spin-wait.
 
 A unified task-slot + heap-buffer bump allocator. The orchestrator is single
 threaded, so it tracks both the next task id and the heap top locally and
-publishes `current_task_index` with a plain release store — no CAS.
+publishes `task_count` with a plain release store — no CAS.
 
 ```text
 alloc(output_size):
@@ -184,7 +179,7 @@ alloc(output_size):
     p = heap_base + heap_top
     heap_top += ALIGN(output_size)
     task_id = local_task_id++
-    current_task_index.store(local_task_id)   # release
+    task_count.store(local_task_id)   # release
     return {task_id, slot = task_id, p, p + ALIGN(output_size)}
 ```
 
@@ -249,7 +244,7 @@ establishes a dependency edge.
 
 TensorMap entries are allocated from a fixed pool by bump (`entry_pool[
 next_entry_idx++]`). In the single-shot model there is no retirement: the
-orchestrator never advances `last_task_alive`, so no entry is ever freed
+orchestrator never retires a task, so no entry is ever freed
 during the orch phase, and the schedulers never touch the map. The pool is
 bounded by `PTO2_TENSORMAP_POOL_SIZE` (65536) and must hold every entry the
 graph produces; exhaustion is fatal.

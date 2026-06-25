@@ -68,17 +68,17 @@ public:
      * from host code that constructs a prebuilt arena image.
      *
      * Production callers leave `initial_local_task_id` at 0: the SM ring
-     * flow-control counters that current_index_ptr points at start at zero
+     * flow-control counter that task_count_ptr points at starts at zero
      * (PTO2RingFlowControl::init() runs on the AICPU during SM reset), so we
      * keep local_task_id_ aligned with that without reading the SM. Tests that
      * drive SM state directly may pass a non-zero in-window seed.
      */
     void init(
-        int32_t window_size, std::atomic<int32_t> *current_index_ptr, void *heap_base, uint64_t heap_size,
+        int32_t window_size, std::atomic<int32_t> *task_count_ptr, void *heap_base, uint64_t heap_size,
         std::atomic<int32_t> *error_code_ptr, int32_t initial_local_task_id = 0
     ) {
         window_size_ = window_size;
-        current_index_ptr_ = current_index_ptr;
+        task_count_ptr_ = task_count_ptr;
         heap_base_ = heap_base;
         heap_size_ = heap_size;
         error_code_ptr_ = error_code_ptr;
@@ -112,7 +112,7 @@ public:
         void *p = static_cast<char *>(heap_base_) + heap_top_;
         heap_top_ += aligned;
         int32_t task_id = local_task_id_++;
-        current_index_ptr_->store(local_task_id_, std::memory_order_release);
+        task_count_ptr_->store(local_task_id_, std::memory_order_release);
 #if PTO2_ORCH_PROFILING
         extern uint64_t g_orch_alloc_atomic_count;
         g_orch_alloc_atomic_count += 1;
@@ -146,7 +146,7 @@ public:
 private:
     // --- Task Ring ---
     int32_t window_size_ = 0;
-    std::atomic<int32_t> *current_index_ptr_ = nullptr;
+    std::atomic<int32_t> *task_count_ptr_ = nullptr;
 
     // --- Heap ---
     void *heap_base_ = nullptr;

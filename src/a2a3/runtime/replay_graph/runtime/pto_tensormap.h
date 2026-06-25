@@ -20,8 +20,7 @@
  * 1. Bump-allocated entry pool with a free list (no malloc/free)
  * 2. Single-shot lifetime: the orch phase never retires tasks, so every
  *    inserted entry stays valid for the life of the map (no lazy invalidation)
- * 3. Per-task entry tracking for O(1) per-entry removal
- * 4. OVERLAP DETECTION: Detects dependencies for overlapping sub-regions
+ * 3. OVERLAP DETECTION: Detects dependencies for overlapping sub-regions
  *
  * Hash table with chaining:
  * - buckets[] array of head offsets
@@ -77,10 +76,8 @@ struct PTO2TensorMapLayout {
     size_t off_buckets;
     size_t off_entry_pool;
     size_t off_free_entry_list;
-    size_t off_task_entry_heads;
     int32_t num_buckets;
     int32_t pool_size;
-    int32_t task_window_size;
 };
 
 // TensorMap Lookup Profiling (must precede inline lookup/insert methods).
@@ -113,7 +110,7 @@ extern uint64_t g_insert_count;
  *   shapes[5]                                          — overlap comparison (line 1)
  *
  * Cache line 2 (64B, slow-path / non-contiguous overlap):
- *   prev_in_bucket / next_in_task / prev_in_task       — chain manipulation
+ *   prev_in_bucket                                     — chain manipulation
  *   bucket_index                                       — bookkeeping
  *   extent_elem_cache                                  — overlap byte range end
  *   strides[5]                                          — reserved for L2 overlap (PR-2)
@@ -139,13 +136,15 @@ struct alignas(64) PTO2TensorMapEntry {
 
     // === Cache line 2 (64B) — chain manipulation + non-contiguous overlap data ===
     PTO2TensorMapEntry *prev_in_bucket;  // 8B [64, 72)
-    PTO2TensorMapEntry *next_in_task;    // 8B [72, 80)
-    PTO2TensorMapEntry *prev_in_task;    // 8B [80, 88)
-    int32_t bucket_index;                // 4B [88, 92): -1 when unlinked
-    uint32_t __padding2__;               // 4B [92, 96)
-    uint64_t extent_elem_cache;          // 8B [96,104): non-contiguous extent (mirrors Tensor)
-    uint32_t strides[MAX_TENSOR_DIMS];   // 20B [104,124): element strides, mirrors Tensor::strides
-    uint8_t __padding3__[4];             // 4B [124,128)
+    PTO2TensorMapEntry *next_in_task;   // 8B [72, 80): [reserved] per-task chain removed in single-shot model; kept for
+                                        // 128B Tensor-mirror layout
+    PTO2TensorMapEntry *prev_in_task;   // 8B [80, 88): [reserved] per-task chain removed in single-shot model; kept for
+                                        // 128B Tensor-mirror layout
+    int32_t bucket_index;               // 4B [88, 92): -1 when unlinked
+    uint32_t __padding2__;              // 4B [92, 96)
+    uint64_t extent_elem_cache;         // 8B [96,104): non-contiguous extent (mirrors Tensor)
+    uint32_t strides[MAX_TENSOR_DIMS];  // 20B [104,124): element strides, mirrors Tensor::strides
+    uint8_t __padding3__[4];            // 4B [124,128)
 
     /**
      * Copy overlap-relevant fields from a Tensor into this entry.
@@ -369,13 +368,6 @@ struct PTO2TensorMap {
     int32_t next_entry_idx;                // id when next entry insert
     int32_t free_num;                      // free entry number in entry pool
 
-    // Per-task entry tracking (for efficient bucket cleanup)
-    // Indexed by [local_id & (task_window_size - 1)]
-    PTO2TensorMapEntry **task_entry_heads;
-    int32_t task_window_size;  // Task window size (for slot masking)
-
-    uint32_t get_task_local_id_slot(uint32_t task_local_id) const { return task_local_id & (task_window_size - 1); }
-
     // Accessors read by scope_stats_collector. Declared unconditionally so the
     // collector .cpp compiles at PTO2_PROFILING=0 (collector is unconditional —
     // setter symbols must export for host dlsym; the probe call sites that use
@@ -426,23 +418,21 @@ struct PTO2TensorMap {
     // =============================================================================
 
     /**
-     * Phase 1: reserve every sub-region (buckets, entry_pool, free list, per-ring
-     * task_entry_heads) on the supplied arena. Records the resulting offsets in
-     * the returned layout descriptor. Must be called before the arena is
-     * committed.
+     * Phase 1: reserve every sub-region (buckets, entry_pool, free list) on the
+     * supplied arena. Records the resulting offsets in the returned layout
+     * descriptor. Must be called before the arena is committed.
      */
-    static PTO2TensorMapLayout
-    reserve_layout(DeviceArena &arena, int32_t num_buckets, int32_t pool_size, int32_t task_window_size);
+    static PTO2TensorMapLayout reserve_layout(DeviceArena &arena, int32_t num_buckets, int32_t pool_size);
 
     /**
      * Same as reserve_layout() with default sizes (PTO2_TENSORMAP_NUM_BUCKETS,
      * PTO2_TENSORMAP_POOL_SIZE).
      */
-    static PTO2TensorMapLayout reserve_layout_default(DeviceArena &arena, int32_t task_window_size);
+    static PTO2TensorMapLayout reserve_layout_default(DeviceArena &arena);
 
     /**
      * Phase 3a: write everything *except* arena-internal pointer fields
-     * (buckets, entry_pool, free_entry_list, task_entry_heads[r]).
+     * (buckets, entry_pool, free_entry_list).
      * Uses arena.region_ptr to address the arena regions for data writes,
      * but does not store those addresses in struct fields. Safe to call on
      * a host arena that holds the prebuilt image.
@@ -564,15 +554,13 @@ struct PTO2TensorMap {
     }
 
     /**
-     * Link an initialized entry into bucket and task chains.
+     * Link an initialized entry into its hash bucket chain.
      */
     void link_entry(PTO2TensorMapEntry *entry, uint64_t addr, PTO2TaskId producer_task_id) {
 #if PTO2_TENSORMAP_PROFILING
         g_insert_count++;
 #endif
         uint32_t bucket_index = hash(addr);
-        auto local_id = producer_task_id.local();
-        int32_t task_slot = local_id & (task_window_size - 1);
 
         entry->producer_task_id = producer_task_id;
 
@@ -584,71 +572,21 @@ struct PTO2TensorMap {
         }
         buckets[bucket_index] = entry;
         entry->prev_in_bucket = nullptr;
-
-        // Link to task's entry list
-        entry->next_in_task = task_entry_heads[task_slot];
-        entry->prev_in_task = nullptr;
-        if (entry->next_in_task != nullptr) {
-            entry->next_in_task->prev_in_task = entry;
-        }
-        task_entry_heads[task_slot] = entry;
     }
 
     /**
      * Check if entry is valid (producer has not retired).
      *
-     * In the single-shot replay model the scheduler never advances
-     * last_task_alive during the orch phase, so no entry is ever retired —
-     * every inserted entry stays valid for the life of the map.
+     * In the single-shot replay model the orch phase never retires tasks, so
+     * no entry is ever invalidated — every inserted entry stays valid for the
+     * life of the map.
      */
     bool entry_valid(const PTO2TensorMapEntry &entry) const {
         (void)entry;
         return true;
     }
 
-    void remove_entry(PTO2TensorMapEntry &entry) {
-        remove_from_task(entry);
-        free_entry(entry);
-    }
-
-    /**
-     * Remove entry from its task chain (O(1) with prev pointer)
-     * Called during pool wrap-around to unlink reused entries.
-     */
-    void remove_from_task(PTO2TensorMapEntry &entry) {
-        always_assert(entry.bucket_index != -1);  // must still be in a bucket
-        // Update predecessor's next pointer (O(1) via prev_in_task)
-        if (entry.prev_in_task == nullptr) {
-            // Entry is the head of its task chain, update task_entry_heads
-            int32_t local_id = static_cast<int32_t>(entry.producer_task_id.local());
-            int32_t task_slot = local_id & (task_window_size - 1);
-            task_entry_heads[task_slot] = entry.next_in_task;
-        } else {
-            entry.prev_in_task->next_in_task = entry.next_in_task;
-        }
-
-        // Update successor's prev pointer
-        if (entry.next_in_task != nullptr) {
-            entry.next_in_task->prev_in_task = entry.prev_in_task;
-        }
-
-        entry.next_in_task = nullptr;
-        entry.prev_in_task = nullptr;
-    }
-
-    // =============================================================================
-    // Debug Utilities
-    // =============================================================================
-
-    /**
-     * Print TensorMap statistics
-     */
-    void print_stats();
-
-    /**
-     * Get count of valid entries
-     */
-    int32_t valid_count();
+    void remove_entry(PTO2TensorMapEntry &entry) { free_entry(entry); }
 };
 
 #if PTO2_TENSORMAP_PROFILING

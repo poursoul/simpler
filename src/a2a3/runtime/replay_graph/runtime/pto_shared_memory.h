@@ -46,28 +46,24 @@ struct PTO2SharedMemoryHandle;
  * Written/read by Orchestrator and Scheduler for synchronization.
  */
 struct alignas(64) PTO2RingFlowControl {
-    // === Cache Line 0: Written by Orchestrator, Read by Scheduler ===
-    alignas(64) std::atomic<int32_t> current_task_index;  // Task ring head (next to allocate)
-
-    // === Cache Line 1: Written by Scheduler, Read by Orchestrator (for back-pressure) ===
-    alignas(64) std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
+    // Written by Orchestrator, Read by Scheduler. Frozen after the orch phase
+    // completes to the total task count (single-shot: tasks are bump-allocated
+    // once and never reclaimed).
+    alignas(64) std::atomic<int32_t> task_count;
 
     // Per-boot SM reset. PTO2TaskAllocator::init() seeds its private
     // local_task_id_ from initial_local_task_id (default 0 in production)
-    // *without* dereferencing current_task_index — it relies on this reset
+    // *without* dereferencing task_count — it relies on this reset
     // running on every AICPU boot so 0 stays in sync. If you ever change
     // the initial fc value or the boot ordering, update the default in
     // PTO2TaskAllocator::init (pto_ring_buffer.h) in the same change, or
     // submit IDs will be off by the divergence.
-    void init() {
-        current_task_index.store(0, std::memory_order_relaxed);
-        last_task_alive.store(0, std::memory_order_relaxed);
-    }
+    void init() { task_count.store(0, std::memory_order_relaxed); }
 
     bool validate(PTO2SharedMemoryHandle *handle) const;
 };
 
-static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be exactly 2 cache lines (128B)");
+static_assert(sizeof(PTO2RingFlowControl) == 64, "PTO2RingFlowControl must be exactly 1 cache line (64B)");
 
 /**
  * Per-ring shared memory header section.
@@ -218,17 +214,10 @@ inline PTO2SharedMemoryRingHeader *ring_header_addr(void *sm_dev_base) noexcept 
     );
 }
 
-inline std::atomic<int32_t> *ring_current_task_index_addr(void *sm_dev_base) noexcept {
+inline std::atomic<int32_t> *ring_task_count_addr(void *sm_dev_base) noexcept {
     return reinterpret_cast<std::atomic<int32_t> *>(
         reinterpret_cast<char *>(ring_header_addr(sm_dev_base)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
-        offsetof(PTO2RingFlowControl, current_task_index)
-    );
-}
-
-inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base) noexcept {
-    return reinterpret_cast<std::atomic<int32_t> *>(
-        reinterpret_cast<char *>(ring_header_addr(sm_dev_base)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
-        offsetof(PTO2RingFlowControl, last_task_alive)
+        offsetof(PTO2RingFlowControl, task_count)
     );
 }
 

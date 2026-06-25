@@ -172,8 +172,7 @@ void PTO2SharedMemoryHandle::print_layout() {
         "  descriptors_off:  %" PRIu64 " (0x%" PRIx64 ")", h->ring.task_descriptors_offset,
         h->ring.task_descriptors_offset
     );
-    LOG_INFO_V0("  current_task_idx: %d", h->ring.fc.current_task_index.load(std::memory_order_acquire));
-    LOG_INFO_V0("  last_task_alive:  %d", h->ring.fc.last_task_alive.load(std::memory_order_acquire));
+    LOG_INFO_V0("  task_count:       %d", h->ring.fc.task_count.load(std::memory_order_acquire));
     LOG_INFO_V0("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
     LOG_INFO_V0("Error state:");
     LOG_INFO_V0("  orch_error_code:    %d", h->orch_error_code.load(std::memory_order_relaxed));
@@ -207,10 +206,8 @@ bool PTO2RingFlowControl::validate(PTO2SharedMemoryHandle *handle) const {
     if ((uintptr_t)h->ring.task_descriptors % PTO2_ALIGN_SIZE != 0) return false;
 
     // Check flow control pointer sanity
-    int32_t current = current_task_index.load(std::memory_order_acquire);
-    int32_t last_alive = last_task_alive.load(std::memory_order_acquire);
+    int32_t current = task_count.load(std::memory_order_acquire);
     if (current < 0) return false;
-    if (last_alive < 0) return false;
 
     return true;
 }

@@ -87,8 +87,7 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     EXPECT_EQ(hdr->sched_error_code.load(), 0);
 
     auto &fc = hdr->ring.fc;
-    EXPECT_EQ(fc.current_task_index.load(), 0);
-    EXPECT_EQ(fc.last_task_alive.load(), 0);
+    EXPECT_EQ(fc.task_count.load(), 0);
 }
 
 TEST_F(SharedMemoryTest, Validate) { EXPECT_TRUE(handle->validate()); }
@@ -208,7 +207,7 @@ TEST(SharedMemoryBoundary, ValidateDetectsCorruption) {
     ASSERT_NE(h, nullptr);
     EXPECT_TRUE(h->validate());
 
-    h->header->ring.fc.current_task_index.store(-1);
+    h->header->ring.fc.task_count.store(-1);
     EXPECT_FALSE(h->validate());
 }
 

@@ -76,8 +76,6 @@ bool PTO2SchedulerState::RingSchedState::init_data_from_layout(void *sm_dev_base
     // ring stores the device address of the SM ring header — pure offset
     // arithmetic, no SM load.
     ring = pto2_sm_layout::ring_header_addr(sm_dev_base);
-    last_task_alive = 0;
-    advance_lock.store(0, std::memory_order_relaxed);
 
     // Per-slot SM-side initialization (bind_ring + reset_for_reuse +
     // fanin_count/active_mask zero) lives in PTO2SharedMemoryHandle::
@@ -110,7 +108,6 @@ bool PTO2SchedulerState::init_data_from_layout(
     sched->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
 #if PTO2_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
-    sched->tasks_consumed.store(0, std::memory_order_relaxed);
 #endif
 
     if (!sched->ring_sched_state.init_data_from_layout(sm_dev_base)) {

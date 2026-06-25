@@ -15,9 +15,6 @@
  *                          fanin_count initialization, ready push
  * 2. on_task_complete() — COMPLETED transition, fanout traversal,
  *                               consumer fanin release
- * 3. on_task_release()   — fanin traversal, producer release,
- *                          self-CONSUMED check
- * 4. advance_ring_pointers() — CONSUMED slot scan, reset_for_reuse
  *
  * These tests exercise the core scheduling hot-paths that had zero coverage.
  */
@@ -42,9 +39,8 @@ class WiringTest : public ::testing::Test {
 protected:
     // Wiring lives in the orchestrator now (replay_graph), so wire_task /
     // drain_wiring_queue / the SPSC queue are exercised through `orch`. The
-    // completion-path tests (on_task_complete / on_task_release /
-    // advance_ring_pointers) still drive `sched`, so both are set up here,
-    // mirroring test_orchestrator_fanin's fixture.
+    // completion-path test (on_task_complete) still drives `sched`, so both are
+    // set up here, mirroring test_orchestrator_fanin's fixture.
     DeviceArena sm_arena;
     DeviceArena runtime_arena;
     PTO2SharedMemoryHandle *sm_handle = nullptr;
@@ -89,12 +85,11 @@ protected:
     void init_slot(
         PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, int32_t fanout_count, uint8_t ring_id = 0
     ) {
+        (void)fanout_count;  // fanout_count/fanout_refcount removed (single-shot replay)
         memset(&slot, 0, sizeof(slot));
         slot.task_state.store(state);
         slot.fanin_count = fanin_count;
         slot.fanin_refcount.store(0);
-        slot.fanout_count = fanout_count;
-        slot.fanout_refcount.store(0);
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = ring_id;
@@ -229,7 +224,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 
     init_slot(producers[0], PTO2_TASK_COMPLETED, 1, 2);  // early finished
     init_slot(producers[1], PTO2_TASK_PENDING, 1, 2);    // in flight (< COMPLETED)
-    init_slot(producers[2], PTO2_TASK_CONSUMED, 1, 2);   // early finished (>= COMPLETED)
+    init_slot(producers[2], PTO2_TASK_COMPLETED, 1, 2);  // early finished (>= COMPLETED)
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 3;
@@ -243,7 +238,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 
     // fanin_count = 4 (3 + 1)
     EXPECT_EQ(task_slot.fanin_count, 4);
-    // early_finished = 2 (COMPLETED + CONSUMED), init_rc = 3
+    // early_finished = 2 (both COMPLETED producers), init_rc = 3
     // Not yet 4 -> not ready (one producer still running)
     EXPECT_EQ(task_slot.fanin_refcount.load(), 3);
 
@@ -301,87 +296,6 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     auto *r1 = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     auto *r2 = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     EXPECT_TRUE((r1 == &consumer1 && r2 == &consumer2) || (r1 == &consumer2 && r2 == &consumer1));
-}
-
-// =============================================================================
-// on_task_release: releases producers via fanin traversal
-// =============================================================================
-
-TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskSlotState producers[2];
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
-
-    // 2 producers, each COMPLETED with fanout_count=1
-    for (int i = 0; i < 2; i++) {
-        init_slot(producers[i], PTO2_TASK_COMPLETED, 1, 1);
-    }
-
-    init_slot(task_slot, PTO2_TASK_COMPLETED, 3, 1);
-    payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producers[0];
-    payload.fanin_inline_slot_states[1] = &producers[1];
-    // Need a valid fanin_spill_pool even though we don't spill
-    PTO2FaninPool dummy_pool{};
-    PTO2FaninSpillEntry dummy_entries[4];
-    std::atomic<int32_t> dummy_error{PTO2_ERROR_NONE};
-    dummy_pool.init(dummy_entries, 4, &dummy_error);
-    payload.fanin_spill_pool = &dummy_pool;
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
-
-    int32_t fanin_count = sched.on_task_release(task_slot);
-    EXPECT_EQ(fanin_count, 2);
-
-    // Each producer should have fanout_refcount incremented
-    EXPECT_EQ(producers[0].fanout_refcount.load(), 1);
-    EXPECT_EQ(producers[1].fanout_refcount.load(), 1);
-
-    // Producers with fanout_refcount == fanout_count AND COMPLETED -> CONSUMED
-    EXPECT_EQ(producers[0].task_state.load(), PTO2_TASK_CONSUMED);
-    EXPECT_EQ(producers[1].task_state.load(), PTO2_TASK_CONSUMED);
-}
-
-// =============================================================================
-// advance_ring_pointers: scans CONSUMED slots, resets, advances last_alive
-// =============================================================================
-
-TEST_F(WiringTest, AdvanceRingPointersScansConsumed) {
-    auto &rss = sched.ring_sched_state;
-    auto *ring = rss.ring;
-
-    // Submit 3 tasks via flow control
-    ring->fc.current_task_index.store(3, std::memory_order_release);
-
-    // Mark all 3 as CONSUMED
-    for (int i = 0; i < 3; i++) {
-        auto &slot = ring->get_slot_state_by_task_id(i);
-        slot.task_state.store(PTO2_TASK_CONSUMED, std::memory_order_release);
-    }
-
-    EXPECT_EQ(rss.last_task_alive, 0);
-    rss.advance_ring_pointers();
-    EXPECT_EQ(rss.last_task_alive, 3);
-
-    // Verify SM was synced
-    EXPECT_EQ(ring->fc.last_task_alive.load(), 3);
-}
-
-TEST_F(WiringTest, AdvanceRingPointersStopsAtNonConsumed) {
-    auto &rss = sched.ring_sched_state;
-    auto *ring = rss.ring;
-
-    ring->fc.current_task_index.store(5, std::memory_order_release);
-
-    // Tasks 0,1 CONSUMED; task 2 COMPLETED (not consumed)
-    ring->get_slot_state_by_task_id(0).task_state.store(PTO2_TASK_CONSUMED);
-    ring->get_slot_state_by_task_id(1).task_state.store(PTO2_TASK_CONSUMED);
-    ring->get_slot_state_by_task_id(2).task_state.store(PTO2_TASK_COMPLETED);
-
-    rss.advance_ring_pointers();
-    EXPECT_EQ(rss.last_task_alive, 2) << "Should stop at first non-CONSUMED slot";
 }
 
 // =============================================================================

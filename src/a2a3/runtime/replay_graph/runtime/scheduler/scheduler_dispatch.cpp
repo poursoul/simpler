@@ -845,6 +845,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     for (int32_t i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         local_bufs[i].reset(local_ptrs[i], LOCAL_READY_CAP_PER_TYPE);
     }
+    // Deferred-release queue: it still batches slots for on_task_release, but
+    // on_task_release is now a no-op (slot reclaim was dropped in the single-shot
+    // replay model), so this machinery spins idle. Kept intact pending the wider
+    // reclaim removal.
     PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
     int32_t deferred_release_count = 0;
 

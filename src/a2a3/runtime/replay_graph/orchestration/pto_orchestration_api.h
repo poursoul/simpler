@@ -295,15 +295,10 @@ static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint
  * External tensors (make_tensor_external) with no TensorMap entry are
  * written immediately without waiting.
  *
- * Limitation: TensorMap only tracks producers (OUTPUT/INOUT), not consumers
- * that used the tensor as INPUT. If a kernel reads this tensor as INPUT
- * (not INOUT) and the tensor has no TensorMap producer entry, set_tensor_data
- * cannot detect the reader and may cause a data race.
- *
- * To ensure WAR safety for all access patterns, use add_inout() instead of
- * add_input() for kernel parameters that may later be written via
- * set_tensor_data. INOUT creates a TensorMap entry that enables automatic
- * consumer tracking via fanout_refcount.
+ * Limitation: set_tensor_data only waits for the tensor's producer to finish
+ * writing (WAW safety). The single-shot replay model dropped the CONSUMED
+ * lifecycle, so there is no consumer-drain (WAR protection): a concurrent
+ * reader of this tensor is not detected and may race with the write.
  *
  * The tensor must already have an allocated buffer (addr != 0).
  * For runtime-created outputs, call this only on the Tensor returned by

@@ -80,13 +80,13 @@ void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, cons
 
 // Wait for all producers of this tensor to be safe for data access.
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
-// For reads: wait until each producer COMPLETED (done writing).
-// For writes: also wait until all consumers done reading
-//   (fanout_refcount >= fanout_count - 1, excluding scope reference).
+// Waits until each producer COMPLETED (done writing). The single-shot replay
+// model dropped the CONSUMED lifecycle, so there is no consumer-drain (WAR)
+// wait anymore — see set_tensor_data for the implications.
 // Uses cycle-based timeout (checked every 1024 spins).
 // Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
-static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
+static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, const char *caller) {
     PTO2TaskId owner = tensor.owner_task_id;
     PTO2OrchestratorState &orch = rt->orchestrator;
 
@@ -121,31 +121,9 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         }
     };
 
-    auto wait_one_consumers = [&](const PTO2TaskSlotState &slot) {
-        uint8_t ring_id = slot.ring_id;
-        int32_t local_id = slot.task->task_id.local();
-        uint64_t t0 = get_sys_cnt_aicpu();
-        int32_t spin_count = 0;
-        while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1) {
-            SPIN_WAIT_HINT();
-            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                orch.report_fatal(
-                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                    "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
-                );
-                failed = true;
-                return;
-            }
-        }
-    };
-
     auto flush_segment = [&]() {
         for (int i = 0; i < seg_count; i++) {
             wait_one_producer(*seg[i]);
-            if (failed) return;
-            if (!wait_for_consumers) continue;
-            wait_one_consumers(*seg[i]);
             if (failed) return;
         }
         seg_count = 0;
@@ -202,7 +180,7 @@ uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, 
         return 0;
     }
 
-    if (!wait_for_tensor_ready(rt, tensor, false, __FUNCTION__)) {
+    if (!wait_for_tensor_ready(rt, tensor, __FUNCTION__)) {
         return 0;
     }
 
@@ -223,8 +201,11 @@ void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, cons
         return;
     }
 
-    // Wait for producer + all consumers before writing (WAW + WAR safety)
-    if (!wait_for_tensor_ready(rt, tensor, true, __FUNCTION__)) {
+    // Wait for the producer to finish writing before overwriting (WAW safety).
+    // The single-shot replay model has no CONSUMED lifecycle, so we no longer
+    // drain consumers first (WAR protection is dropped). No workload uses
+    // set_tensor_data, so there is nothing to regress; revisit if one ever does.
+    if (!wait_for_tensor_ready(rt, tensor, __FUNCTION__)) {
         return;
     }
 

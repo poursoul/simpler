@@ -37,14 +37,12 @@ extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_hea
 uint64_t g_sched_lock_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_fanout_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_fanin_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
-uint64_t g_sched_self_consumed_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_lock_wait_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_push_wait_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_pop_wait_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_lock_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_fanout_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_fanin_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
-uint64_t g_sched_self_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_pop_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_complete_count[PLATFORM_MAX_AICPU_THREADS] = {};
 
@@ -53,14 +51,12 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
     d.lock_cycle = std::exchange(g_sched_lock_cycle[thread_idx], 0);
     d.fanout_cycle = std::exchange(g_sched_fanout_cycle[thread_idx], 0);
     d.fanin_cycle = std::exchange(g_sched_fanin_cycle[thread_idx], 0);
-    d.self_consumed_cycle = std::exchange(g_sched_self_consumed_cycle[thread_idx], 0);
     d.lock_wait_cycle = std::exchange(g_sched_lock_wait_cycle[thread_idx], 0);
     d.push_wait_cycle = std::exchange(g_sched_push_wait_cycle[thread_idx], 0);
     d.pop_wait_cycle = std::exchange(g_sched_pop_wait_cycle[thread_idx], 0);
     d.lock_atomic_count = std::exchange(g_sched_lock_atomic_count[thread_idx], 0);
     d.fanout_atomic_count = std::exchange(g_sched_fanout_atomic_count[thread_idx], 0);
     d.fanin_atomic_count = std::exchange(g_sched_fanin_atomic_count[thread_idx], 0);
-    d.self_atomic_count = std::exchange(g_sched_self_atomic_count[thread_idx], 0);
     d.pop_atomic_count = std::exchange(g_sched_pop_atomic_count[thread_idx], 0);
     d.complete_count = std::exchange(g_sched_complete_count[thread_idx], 0);
     return d;
@@ -73,14 +69,10 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 
 void PTO2SchedulerState::print_stats() {
     PTO2SchedulerState *sched = this;
+    (void)sched;
     LOG_INFO_V0("=== Scheduler Statistics ===");
-    if (sched->ring_sched_state.last_task_alive > 0) {
-        LOG_INFO_V0("  last_task_alive: %d", sched->ring_sched_state.last_task_alive);
-        // dep_pool moved to the orchestrator (replay_graph stage 1).
-    }
 #if PTO2_SCHED_PROFILING
     LOG_INFO_V0("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));
-    LOG_INFO_V0("tasks_consumed:    %lld", (long long)sched->tasks_consumed.load(std::memory_order_relaxed));
 #endif
     LOG_INFO_V0("============================");
 }

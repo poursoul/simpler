@@ -55,12 +55,11 @@ protected:
     void init_slot(
         PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, int32_t fanout_count, uint8_t ring_id = 0
     ) {
+        (void)fanout_count;  // fanout_count/fanout_refcount removed (single-shot replay)
         memset(&slot, 0, sizeof(slot));
         slot.task_state.store(state);
         slot.fanin_count = fanin_count;
         slot.fanin_refcount.store(0);
-        slot.fanout_count = fanout_count;
-        slot.fanout_refcount.store(0);
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = ring_id;
@@ -73,71 +72,6 @@ protected:
         slot.payload = &slot_pl;
     }
 };
-
-// =============================================================================
-// check_and_handle_consumed
-// =============================================================================
-
-TEST_F(SchedulerStateTest, ConsumedNotReady) {
-    alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_COMPLETED, 1, 2);
-    slot.fanout_refcount.store(1);  // 1 != 2
-
-    sched.check_and_handle_consumed(slot);
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_COMPLETED);
-}
-
-TEST_F(SchedulerStateTest, ConsumedTransition) {
-    alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_COMPLETED, 1, 2);
-    slot.fanout_refcount.store(2);  // matches fanout_count
-
-    sched.check_and_handle_consumed(slot);
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
-}
-
-TEST_F(SchedulerStateTest, ConsumedNotCompletedState) {
-    alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
-    slot.fanout_refcount.store(1);
-
-    sched.check_and_handle_consumed(slot);
-    // CAS fails because state is PENDING, not COMPLETED
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_PENDING);
-}
-
-TEST_F(SchedulerStateTest, ConsumedIdempotent) {
-    alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_CONSUMED, 1, 1);
-    slot.fanout_refcount.store(1);
-
-    sched.check_and_handle_consumed(slot);
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
-}
-
-// =============================================================================
-// release_producer
-// =============================================================================
-
-TEST_F(SchedulerStateTest, ReleaseProducerIncrements) {
-    alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_COMPLETED, 1, 3);
-
-    sched.release_producer(slot);
-    EXPECT_EQ(slot.fanout_refcount.load(), 1);
-
-    sched.release_producer(slot);
-    EXPECT_EQ(slot.fanout_refcount.load(), 2);
-}
-
-TEST_F(SchedulerStateTest, ReleaseProducerTriggersConsumed) {
-    alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_COMPLETED, 1, 2);
-    slot.fanout_refcount.store(1);  // One away
-
-    sched.release_producer(slot);
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
-}
 
 // =============================================================================
 // on_subtask_complete
@@ -178,11 +112,9 @@ TEST_F(SchedulerStateTest, ScopeEndBatchRelease) {
         ptrs[i] = &slots[i];
     }
 
+    // on_scope_end is a no-op in the single-shot replay model (slot reclaim was
+    // dropped); this just exercises that the call is still safe to invoke.
     sched.on_scope_end(ptrs, N);
-
-    for (int i = 0; i < N; i++) {
-        EXPECT_EQ(slots[i].fanout_refcount.load(), 1);
-    }
 }
 
 // =============================================================================

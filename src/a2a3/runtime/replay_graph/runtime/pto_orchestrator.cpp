@@ -335,9 +335,9 @@ static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAll
     LOG_ERROR("  scope_task_count:   %d", scope_task_count);
     LOG_ERROR("  active_tasks:       %d / %d", active_count, allocator.window_size());
     LOG_ERROR("Root Cause:");
-    LOG_ERROR("  Tasks within a scope hold a fanout_count reference that is only");
-    LOG_ERROR("  released at scope_end. When scope task count >= window_size,");
-    LOG_ERROR("  no slots can be reclaimed -> deadlock.");
+    LOG_ERROR("  The single-shot replay model fills the task window exactly once");
+    LOG_ERROR("  and never reclaims slots. When a single scope's task count reaches");
+    LOG_ERROR("  window_size, there are no slots left to allocate -> deadlock.");
     LOG_ERROR("Solution:");
     LOG_ERROR("  1. Reduce tasks per scope (use batching/unroll)");
     LOG_ERROR("  2. Increase task window (current: %d)", allocator.window_size());
@@ -386,13 +386,11 @@ static bool prepare_task(
     // early-dispatch spec fields) is initialized in PTO2TaskPayload::init, the
     // single payload-init point, which runs before the scheduler wiring push.
 
-    // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
-    //   fanout_lock=0, fanout_count=1, fanout_head=nullptr,
-    //   fanin_refcount=0, fanout_refcount=0, completed_subtasks=0, next_block_idx=0
-    // Fields immutable after RingSchedState::init():
-    //   ring_id
-    // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
-    // observers); set to PENDING here when orchestrator actually reuses the slot.
+    // The single-shot replay model fills each slot exactly once. Dynamic slot
+    // fields (fanout_lock, fanout_head, fanin_refcount, completed_subtasks,
+    // next_block_idx) are at their one-time SM-init clean state; ring_id is
+    // immutable after RingSchedState::init(). Only task_state is set here, to
+    // PENDING, as the orchestrator takes ownership of the slot.
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     int16_t block_num = args.launch_spec.block_num();
     out->slot_state->total_required_subtasks =
@@ -650,15 +648,6 @@ static TaskOutputTensors submit_task_common(
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    // Increment fanout_count on each producer (no lock — only orch writes this field).
-    // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
-    for_each_fanin_storage(
-        fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
-        [](PTO2TaskSlotState *producer) {
-            producer->fanout_count++;
-        }
-    );
-
     int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
     // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
@@ -687,15 +676,12 @@ static TaskOutputTensors submit_task_common(
 #endif
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
-#if PTO2_ORCH_PROFILING
-    g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
-#endif
 
     // === STEP 6: push to the orchestrator-owned wiring queue ===
-    // submit_task only stores dependency metadata and increments fanout_count;
-    // it pushes the task into the orchestrator's own wiring queue. The actual
-    // fanout_head wiring (lock + dep_pool + early_finished) runs later in
-    // run_wiring(), after orchestration completes (replay_graph stage 1).
+    // submit_task only stores dependency metadata; it pushes the task into the
+    // orchestrator's own wiring queue. The actual fanout_head wiring (lock +
+    // dep_pool + early_finished) runs later in run_wiring(), after orchestration
+    // completes (replay_graph stage 1).
     while (!orch->wiring.queue.push(&cur_slot_state)) {
         SPIN_WAIT_HINT();
     }

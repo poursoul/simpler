@@ -12,10 +12,9 @@
  * Unit tests for PTO2TaskSlotState lifecycle through PTO2SchedulerState API.
  *
  * These tests drive state transitions via src methods (release_fanin,
- * on_subtask_complete, check_and_handle_consumed) rather than manually
- * operating atomic fields.  For concurrent exactly-once semantics of
- * fanin/subtask/fanout, see test_scheduler_state.cpp which already
- * covers those paths via the same API.
+ * on_subtask_complete) rather than manually operating atomic fields. For
+ * concurrent exactly-once semantics of fanin/subtask, see
+ * test_scheduler_state.cpp which already covers those paths via the same API.
  *
  * This file focuses on:
  * - Full lifecycle through src API
@@ -61,12 +60,11 @@ protected:
     }
 
     void init_slot(PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, int32_t fanout_count) {
+        (void)fanout_count;  // fanout_count/fanout_refcount removed (single-shot replay)
         memset(&slot, 0, sizeof(slot));
         slot.task_state.store(state);
         slot.fanin_count = fanin_count;
         slot.fanin_refcount.store(0);
-        slot.fanout_count = fanout_count;
-        slot.fanout_refcount.store(0);
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = 0;
@@ -82,7 +80,7 @@ protected:
 
 // =============================================================================
 // Full lifecycle through src API: PENDING -> (fanin) -> (queued + dispatched)
-// -> (subtask) -> COMPLETED -> (fanout) -> CONSUMED
+// -> (subtask) -> COMPLETED
 // =============================================================================
 TEST_F(TaskStateTest, FullLifecycleThroughAPI) {
     alignas(64) PTO2TaskSlotState slot;
@@ -98,12 +96,10 @@ TEST_F(TaskStateTest, FullLifecycleThroughAPI) {
     bool done = sched.on_subtask_complete(slot);
     EXPECT_TRUE(done);
 
-    // Manually transition to COMPLETED (normally done by scheduler dispatch loop)
+    // Manually transition to COMPLETED (normally done by scheduler dispatch loop).
+    // COMPLETED is terminal in the single-shot replay model.
     slot.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-
-    // Fanout released -> CONSUMED
-    sched.release_producer(slot);
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_CONSUMED);
+    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_COMPLETED);
 }
 
 // =============================================================================

@@ -73,5 +73,4 @@ TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     ASSERT_NE(consumer_slot.payload, nullptr);
     EXPECT_EQ(consumer_slot.payload->fanin_actual_count, 1);
     EXPECT_EQ(consumer_slot.payload->fanin_inline_slot_states[0], &producer_slot);
-    EXPECT_EQ(producer_slot.fanout_count, 2);
 }

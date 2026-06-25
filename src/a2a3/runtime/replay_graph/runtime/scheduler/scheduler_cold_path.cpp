@@ -433,7 +433,7 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
 #if PTO2_SCHED_PROFILING
     {
         PTO2SchedProfilingData sp = scheduler_get_profiling(thread_idx);
-        uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
+        uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle;
         uint64_t complete_poll =
             (l2_swimlane.sched_complete_cycle > otc_total + l2_swimlane.sched_complete_perf_cycle) ?
                 (l2_swimlane.sched_complete_cycle - otc_total - l2_swimlane.sched_complete_perf_cycle) :
@@ -486,11 +486,6 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
             "Thread %d:     otc_fanin    : %.3fus (%.1f%%)  atomics=%" PRIu64 "", thread_idx,
             cycles_to_us(sp.fanin_cycle), sp.fanin_cycle * 100.0 / c_parent,
             static_cast<uint64_t>(sp.fanin_atomic_count)
-        );
-        LOG_INFO_V9(
-            "Thread %d:     otc_self     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", thread_idx,
-            cycles_to_us(sp.self_consumed_cycle), sp.self_consumed_cycle * 100.0 / c_parent,
-            static_cast<uint64_t>(sp.self_atomic_count)
         );
         LOG_INFO_V9(
             "Thread %d:     perf         : %.3fus (%.1f%%)", thread_idx,

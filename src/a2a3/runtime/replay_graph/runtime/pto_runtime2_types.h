@@ -105,7 +105,7 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
  * Task state enumeration
  *
  * State transitions:
- *   PENDING -> COMPLETED -> CONSUMED
+ *   PENDING -> COMPLETED (terminal)
  *
  * The slot stays in PENDING from submit through "ready in queue" and "running
  * on a worker"; readiness and running-vs-idle are derived from fanin_refcount
@@ -114,12 +114,10 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
  * Conditions:
  *   PENDING->COMPLETED:   all subtasks finish (set by scheduler) or task is a
  *                         hidden alloc completed inline by the orchestrator
- *   COMPLETED->CONSUMED:  fanout_refcount == fanout_count && state == COMPLETED
  */
 typedef enum {
-    PTO2_TASK_PENDING = 0,    // Submitted; awaiting fanin, queued, or dispatched
-    PTO2_TASK_COMPLETED = 1,  // Execution finished, output may still be in use
-    PTO2_TASK_CONSUMED = 2    // Output fully consumed, buffers can be released
+    PTO2_TASK_PENDING = 0,   // Submitted; awaiting fanin, queued, or dispatched
+    PTO2_TASK_COMPLETED = 1  // Execution finished (terminal in the single-shot replay model)
 } PTO2TaskState;
 
 /**
@@ -322,10 +320,9 @@ struct PTO2TaskPayload {
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
 
         // Speculative early-dispatch metadata — the single init point for these
-        // fields. reset_for_reuse MUST NOT touch the payload (it runs on the
-        // scheduler's advance-ring path and would pull this cold cache line across
-        // structures); prepare_task only allocates/binds. prefetch() warms this
-        // line (offset 512) so these writes land in warm cache.
+        // fields. reset_for_reuse skips the payload by contract; prepare_task only
+        // allocates/binds. prefetch() warms this line (offset 512) so these writes
+        // land in warm cache.
         //
         // spec_state / staged_core_mask / dispatch_fanin / spec_chain_* are all
         // CONSUMER-side: a task with allow_early_resolve == false still has them
@@ -367,26 +364,30 @@ static_assert(
  * slot state brings all related fields into the same cache line.
  *
  * Concurrency notes:
- * - fanout_head, fanout_count protected by fanout_lock (per-task spinlock)
+ * - fanout_head protected by fanout_lock (per-task spinlock)
  * - fanin_count set once at submission, read-only after (hot path for ready check)
- * - task_state, fanin_refcount, fanout_refcount updated atomically
+ * - task_state, fanin_refcount updated atomically
  */
 struct alignas(64) PTO2TaskSlotState {
     // Fanout lock + list (accessed together under lock in on_task_complete)
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
-    int32_t fanout_count;              // 1 (owning scope) + number of consumers
+    // Reclaim/reuse-lifecycle field fanout_count was removed in the single-shot
+    // replay model; this 4-byte padding preserves the original field offsets
+    // (fanout_head stays at offset 8).
+    uint8_t _pad_reclaim0[4];
 
     PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
-    // Task state (completion, consumed check, ready check)
-    std::atomic<PTO2TaskState> task_state;  // PENDING/COMPLETED/CONSUMED
+    // Task state (completion, ready check)
+    std::atomic<PTO2TaskState> task_state;  // PENDING/COMPLETED
 
     // Fanin (accessed together in release_fanin_and_check_ready)
     std::atomic<int32_t> fanin_refcount;  // Dynamic: counts completed producers
     int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
 
-    // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
+    // Reclaim-lifecycle field fanout_refcount was removed in the single-shot
+    // replay model; this 4-byte padding preserves the 64-byte layout.
+    uint8_t _pad_reclaim1[4];
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
     // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
@@ -438,22 +439,18 @@ struct alignas(64) PTO2TaskSlotState {
     }
 
     /**
-     * Reset dynamic scheduling fields for slot reuse.
-     * Called by advance_ring_pointers() after a slot transitions to CONSUMED
-     * and last_task_alive advances past it, but before sync_to_sm() publishes
-     * the new last_task_alive to the orchestrator.
+     * Reset dynamic scheduling fields to the one-time clean state established at
+     * SM init. The single-shot replay model fills the window exactly once and
+     * never reuses a slot, so this runs only during PTO2SharedMemoryHandle::
+     * init_header; it leaves the slot ready for its single allocation.
      *
      * Skips payload, task, ring_id (immutable, bound once at init).
-     * Skips task_state: left as CONSUMED so that wait_for_tensor_ready()
-     * callers holding stale owner_task_id still observe a completed state.
-     * task_state is set to PENDING by the orchestrator when it reuses the slot.
+     * task_state is set to PENDING by the orchestrator when it allocates the slot.
      */
     void reset_for_reuse() {
         fanout_lock.store(0, std::memory_order_relaxed);
-        fanout_count = 1;
         fanout_head = nullptr;
         fanin_refcount.store(0, std::memory_order_relaxed);
-        fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);
@@ -466,9 +463,9 @@ struct alignas(64) PTO2TaskSlotState {
     // === Per-task fanout spinlock ===
     //
     // Used by BOTH the orchestrator and the scheduler. The fanout_lock MUST
-    // be held whenever reading or writing fanout_head / fanout_count, because
-    // the orchestrator adds consumers concurrently with the scheduler
-    // traversing the list after task completion.
+    // be held whenever reading or writing fanout_head, because the orchestrator
+    // adds consumers concurrently with the scheduler traversing the list after
+    // task completion.
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     void lock_fanout(uint64_t &atomic_count, uint64_t &wait_cycle) {

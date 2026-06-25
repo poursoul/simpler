@@ -14,15 +14,12 @@
  *
  * The Scheduler is responsible for:
  * 1. Maintaining per-resource-shape ready queues
- * 2. Tracking task state (PENDING -> COMPLETED -> CONSUMED)
- * 3. Managing fanin/fanout refcounts for dependency resolution
- * 4. Advancing last_task_alive for heap reclamation
- * 5. Two-stage mixed-task completion (subtask done bits → mixed-task complete)
+ * 2. Tracking task state (PENDING -> COMPLETED)
+ * 3. Managing fanin refcounts for dependency resolution
+ * 4. Two-stage mixed-task completion (subtask done bits → mixed-task complete)
  *
  * The Scheduler runs on Device AI_CPU and processes:
  * - Task state transitions based on fanin_refcount
- * - Buffer lifecycle based on fanout_refcount
- * - Ring pointer advancement for flow control
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
@@ -573,10 +570,8 @@ struct PTO2SchedulerState {
 
     // Per-ring state
     struct alignas(64) RingSchedState {
-        // --- Cache Line 0: ring pointer (read-only) + hot path (read-write) ---
+        // --- Cache Line 0: ring pointer (read-only) ---
         PTO2SharedMemoryRingHeader *ring;
-        int32_t last_task_alive;
-        std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
         // Initialize arena-internal data + arena-external pointers. The `ring`
         // field stores the device address of the SM ring header — computed via
@@ -584,26 +579,6 @@ struct PTO2SchedulerState {
         // orchestrator's PTO2RingSet; replay_graph stage 1.)
         bool init_data_from_layout(void *sm_dev_base);
         void destroy();
-
-        void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
-
-        void advance_ring_pointers() {
-            int32_t current_task_index = ring->fc.current_task_index.load(std::memory_order_acquire);
-
-            while (last_task_alive < current_task_index) {
-                PTO2TaskSlotState &slot_state = ring->get_slot_state_by_task_id(last_task_alive);
-                if (slot_state.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
-                    break;
-                }
-                last_task_alive++;
-            }
-
-            // No slot reclaim: replay_graph fills the window exactly once and never
-            // wraps, so each slot is allocated once and stays in the state left by
-            // the one-time reset_for_reuse at SM init. (reset_for_reuse is kept for
-            // the future multi-layer ping-pong path.)
-            sync_to_sm();
-        }
     } ring_sched_state;
 
     // Ready queues remain global (scheduling is ring-agnostic)
@@ -623,7 +598,6 @@ struct PTO2SchedulerState {
     // Statistics (cold path, isolated from hot-path fields)
 #if PTO2_SCHED_PROFILING
     alignas(64) std::atomic<int64_t> tasks_completed;
-    std::atomic<int64_t> tasks_consumed;
 #endif
     // =========================================================================
     // Inline hot-path methods
@@ -642,80 +616,6 @@ struct PTO2SchedulerState {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
         }
     }
-
-    void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {
-        if (slot_state.fanout_refcount.load(std::memory_order_acquire) != slot_state.fanout_count) return;
-
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(
-                expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            return;
-        }
-
-#if PTO2_SCHED_PROFILING
-        tasks_consumed.fetch_add(1, std::memory_order_relaxed);
-#endif
-
-        // Try-lock — if another thread is advancing the ring, it will scan our CONSUMED task
-        int32_t expected_lock = 0;
-        if (ring_sched_state.advance_lock.compare_exchange_strong(
-                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-            )) {
-            ring_sched_state.advance_ring_pointers();
-            ring_sched_state.advance_lock.store(0, std::memory_order_release);
-        }
-    }
-
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    void check_and_handle_consumed(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
-        int32_t fc = slot_state.fanout_count;
-        int32_t rc = slot_state.fanout_refcount.load(std::memory_order_acquire);
-
-        atomic_count += 2;  // fanout_count.load + fanout_refcount.load
-
-        if (rc != fc) return;
-
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(
-                expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            atomic_count += 1;  // failed CAS
-            return;
-        }
-
-        atomic_count += 1;  // successful CAS
-
-#if PTO2_SCHED_PROFILING
-        tasks_consumed.fetch_add(1, std::memory_order_relaxed);
-#endif
-
-        // Try-lock — if another thread is advancing the ring, it will scan our CONSUMED task
-        int32_t expected_lock = 0;
-        if (ring_sched_state.advance_lock.compare_exchange_strong(
-                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-            )) {
-            ring_sched_state.advance_ring_pointers();
-            ring_sched_state.advance_lock.store(0, std::memory_order_release);
-            atomic_count += 2;  // try-lock CAS + unlock store
-        } else {
-            atomic_count += 1;  // failed try-lock CAS
-        }
-    }
-#endif
-
-    void release_producer(PTO2TaskSlotState &slot_state) {
-        slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
-        check_and_handle_consumed(slot_state);
-    }
-
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    void release_producer(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
-        slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
-        atomic_count += 1;  // fanout_refcount.fetch_add
-        check_and_handle_consumed(slot_state, atomic_count);
-    }
-#endif
 
     // Speculative early-dispatch release. If the now-ready task was pre-staged
     // (gated on a core), ring its DATA_MAIN_BASE high-32 doorbell RIGHT HERE in
@@ -954,21 +854,12 @@ struct PTO2SchedulerState {
     }
 #endif
 
+    // Scope teardown was the CONSUMED-lifecycle producer-release hook. The
+    // single-shot replay model has no slot reclaim, so this is now a no-op kept
+    // only to preserve the orchestrator's call into the scheduler at scope_end.
     void on_scope_end(PTO2TaskSlotState **task_slot_states, int32_t count) {
-#if PTO2_ORCH_PROFILING
-        extern uint64_t g_orch_scope_end_atomic_count;
-        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
-        for (int32_t i = 0; i < count; i++) {
-            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
-        }
-#else
-        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
-        for (int32_t i = 0; i < count; i++) {
-            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i]);
-        }
-#endif
+        (void)task_slot_states;
+        (void)count;
     }
 
     /**
@@ -1086,44 +977,19 @@ struct PTO2SchedulerState {
     }
 
     /**
-     * Cold path: release producers (fanin traversal) + check self for CONSUMED.
-     * Returns fanin edge count for profiling.
+     * Cold path: formerly released producers (fanin traversal) and ran the
+     * self CONSUMED check. Both serviced slot reclaim, which the single-shot
+     * replay model dropped, so the body is now just the fanin-edge count that
+     * callers feed to profiling. Returns fanin edge count.
      */
 
 #if PTO2_SCHED_PROFILING
     int32_t on_task_release(PTO2TaskSlotState &slot_state, int32_t thread_idx) {
-        PTO2_SCHED_CYCLE_START();
-        extern uint64_t g_sched_fanin_cycle[], g_sched_fanin_atomic_count[];
-        extern uint64_t g_sched_self_atomic_count[];
-        extern uint64_t g_sched_self_consumed_cycle[];
-        extern uint64_t g_sched_complete_count[];
-        uint64_t fanin_atomics = 0;
+        (void)thread_idx;
 #else
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
-        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
-#if PTO2_SCHED_PROFILING
-            release_producer(*producer_slot_state, fanin_atomics);
-#else
-            release_producer(*producer_slot_state);
-#endif
-        });
-#if PTO2_SCHED_PROFILING
-        g_sched_fanin_atomic_count[thread_idx] += fanin_atomics;
-        PTO2_SCHED_CYCLE_LAP(g_sched_fanin_cycle[thread_idx]);
-#endif
-
-        // Self consumed check
-#if PTO2_SCHED_PROFILING
-        uint64_t self_atomics = 0;
-        check_and_handle_consumed(slot_state, self_atomics);
-        g_sched_self_atomic_count[thread_idx] += self_atomics;
-        PTO2_SCHED_CYCLE_LAP(g_sched_self_consumed_cycle[thread_idx]);
-        g_sched_complete_count[thread_idx]++;
-#else
-        check_and_handle_consumed(slot_state);
-#endif
         return payload->fanin_actual_count;
     }
 
@@ -1291,10 +1157,9 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 #if PTO2_SCHED_PROFILING
 struct PTO2SchedProfilingData {
     // Sub-phase cycle breakdown within on_task_complete
-    uint64_t lock_cycle;           // lock_fanout + state store + unlock
-    uint64_t fanout_cycle;         // fanout traversal
-    uint64_t fanin_cycle;          // fanin traversal
-    uint64_t self_consumed_cycle;  // self check_and_handle_consumed
+    uint64_t lock_cycle;    // lock_fanout + state store + unlock
+    uint64_t fanout_cycle;  // fanout traversal
+    uint64_t fanin_cycle;   // fanin traversal
 
     // Wait times
     uint64_t lock_wait_cycle;  // spin-wait in fanout_lock
@@ -1305,7 +1170,6 @@ struct PTO2SchedProfilingData {
     uint64_t lock_atomic_count;
     uint64_t fanout_atomic_count;
     uint64_t fanin_atomic_count;
-    uint64_t self_atomic_count;
     uint64_t pop_atomic_count;
 
     int64_t complete_count;

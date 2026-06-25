@@ -161,14 +161,13 @@ void PTO2SchedulerState::destroy() {
 PTO2OrchestratorLayout
 PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_window_size, int32_t dep_pool_capacity) {
     PTO2OrchestratorLayout layout{};
-    layout.scope_tasks_cap = PTO2_SCOPE_TASKS_CAP;
     layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
     // Under run-orch-fully-then-sched, run_wiring drains the wiring queue only
     // after every task has been submitted, so it must hold the whole-graph task
     // upper bound without wrapping — the same bound used for initial_ready below.
     layout.spsc_capacity = PTO2_SCOPE_TASKS_CAP;
     // Initial-ready upper bound: every task could be initially ready. Bound it by
-    // the scope_tasks capacity (≥ total task count).
+    // the whole-graph task upper bound (PTO2_SCOPE_TASKS_CAP = window size).
     layout.initial_ready_cap = PTO2_SCOPE_TASKS_CAP;
     layout.dep_pool_capacity = dep_pool_capacity;
 
@@ -191,10 +190,6 @@ PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_window_si
     layout.off_initial_ready = arena.reserve(
         static_cast<size_t>(layout.initial_ready_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
     );
-    layout.off_scope_tasks =
-        arena.reserve(static_cast<size_t>(layout.scope_tasks_cap) * sizeof(uintptr_t), alignof(PTO2TaskSlotState *));
-    layout.off_scope_begins =
-        arena.reserve(static_cast<size_t>(layout.scope_stack_capacity) * sizeof(int32_t), alignof(int32_t));
     layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena, task_window_size);
     return layout;
 }
@@ -240,8 +235,6 @@ bool PTO2OrchestratorState::init_data_from_layout(
         return false;
     }
 
-    orch->scope_tasks_size = 0;
-    orch->scope_tasks_capacity = layout.scope_tasks_cap;
     orch->scope_stack_top = -1;
     orch->scope_stack_capacity = layout.scope_stack_capacity;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
@@ -269,8 +262,6 @@ void PTO2OrchestratorState::wire_arena_pointers(
     orch->wiring.queue.wire_arena_pointers(arena, layout.off_wiring_spsc_buffer);
     orch->initial_ready = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_initial_ready));
     orch->tensor_map.wire_arena_pointers(layout.tensor_map, arena);
-    orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
-    orch->scope_begins = static_cast<int32_t *>(arena.region_ptr(layout.off_scope_begins));
     orch->scheduler = scheduler_arg;
 }
 
@@ -282,8 +273,6 @@ void PTO2OrchestratorState::destroy() {
     orch->fanin_seen_epoch = nullptr;
     orch->wiring.queue.destroy();
     orch->initial_ready = nullptr;
-    orch->scope_tasks = nullptr;
-    orch->scope_begins = nullptr;
 }
 
 void PTO2OrchestratorState::set_scheduler(PTO2SchedulerState *scheduler) { this->scheduler = scheduler; }

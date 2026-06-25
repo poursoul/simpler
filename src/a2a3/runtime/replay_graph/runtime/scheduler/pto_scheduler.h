@@ -854,14 +854,6 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    // Scope teardown was the CONSUMED-lifecycle producer-release hook. The
-    // single-shot replay model has no slot reclaim, so this is now a no-op kept
-    // only to preserve the orchestrator's call into the scheduler at scope_end.
-    void on_scope_end(PTO2TaskSlotState **task_slot_states, int32_t count) {
-        (void)task_slot_states;
-        (void)count;
-    }
-
     /**
      * Subtask completion: atomic counter model.
      * Called when a single subtask (AIC, AIV0, or AIV1) finishes on any block.

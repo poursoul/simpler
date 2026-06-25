@@ -73,11 +73,11 @@
 
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
-// Hard cap for the scope_tasks buffer. Equals the total in-flight slot budget
-// (PTO2_TASK_WINDOW_SIZE): once every ring slot is in flight, no more tasks can
-// ever be pushed regardless of buffer size. scope_tasks_push fatals on overflow
-// rather than growing the arena-owned buffer (which would be UB on the arena's
-// malloc'd backing).
+// Upper bound for the wiring SPSC queue and the initial_ready handoff array.
+// Equals the whole-graph task count upper bound = the total in-flight slot
+// budget (PTO2_TASK_WINDOW_SIZE): every submitted task passes through the
+// wiring queue once and may be initially ready, so neither structure can hold
+// more than the window's worth of tasks.
 #define PTO2_SCOPE_TASKS_CAP (PTO2_TASK_WINDOW_SIZE)
 
 // Ready queue

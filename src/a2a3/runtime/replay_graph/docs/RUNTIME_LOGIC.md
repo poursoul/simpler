@@ -341,8 +341,8 @@ the user-provided orchestration function. Key members:
 - `ring`: the single `PTO2RingSet` (`task_allocator` + `fanin_pool` +
   `dep_pool`).
 - `tensor_map`: producer lookup.
-- `scope_tasks[]`, `scope_begins[]`, `scope_stack_top`: scope nesting stack
-  (flat buffer partitioned by level).
+- `scope_stack_top`, `manual_begin_depth`: scope nesting depth + manual-scope
+  bookkeeping (no per-scope task lists — slot reclaim was dropped).
 - `wiring`: orchestrator-owned wiring state — the SPSC queue, a local batch
   buffer, and backoff counters.
 - `initial_ready[]`, `initial_ready_count`: the handoff array of tasks that
@@ -393,11 +393,10 @@ wiring can be pipelined if the orchestrator ever runs multi-threaded.
 
 ### 7.4 Scope Mechanism (`PTO2_SCOPE`)
 
-Scopes group tasks for the orchestrator's bookkeeping via a flat
-`scope_tasks[]` buffer partitioned by `scope_begins[]`. In the single-shot
-model `scope_end` no longer reclaims buffers: the scheduler-side
-`on_scope_end` is a no-op kept only to preserve the call shape. Buffers live
-for the whole run.
+Scopes track nesting depth (`scope_stack_top`) and manual-scope semantics
+(`manual_begin_depth`) only. In the single-shot model `scope_end` reclaims
+nothing — it just pops the depth and resets manual bookkeeping; tasks and
+their buffers live for the whole run.
 
 ```cpp
 PTO2_SCOPE(rt) {

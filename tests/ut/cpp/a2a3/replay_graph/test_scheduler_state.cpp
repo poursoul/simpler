@@ -96,25 +96,6 @@ TEST_F(SchedulerStateTest, SubtaskCompleteMultiBlock) {
 }
 
 // =============================================================================
-// on_scope_end
-// =============================================================================
-
-TEST_F(SchedulerStateTest, ScopeEndBatchRelease) {
-    constexpr int N = 4;
-    alignas(64) PTO2TaskSlotState slots[N];
-    PTO2TaskSlotState *ptrs[N];
-
-    for (int i = 0; i < N; i++) {
-        init_slot(slots[i], PTO2_TASK_COMPLETED, 1);
-        ptrs[i] = &slots[i];
-    }
-
-    // on_scope_end is a no-op in the single-shot replay model (slot reclaim was
-    // dropped); this just exercises that the call is still safe to invoke.
-    sched.on_scope_end(ptrs, N);
-}
-
-// =============================================================================
 // get_ready_tasks_batch: local buffer first
 // =============================================================================
 

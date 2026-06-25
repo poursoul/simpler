@@ -189,7 +189,7 @@ captured at l2_swimlane_level >= 3) and `deps.json`; consume them via
 - Atomic operation counters
 - Wait time tracking
 
-**Log output:** 30 LOG_INFO_V9 logs (11 debug + 2 basic + 1 scheduler summary + 17 orchestrator detailed - 1 replaced)
+**Log output:** 27 LOG_INFO_V9 logs (11 debug + 2 basic + 1 scheduler summary + 14 orchestrator detailed - 1 replaced)
 
 - Replaces basic orchestration completion with detailed breakdown
 
@@ -197,14 +197,11 @@ captured at l2_swimlane_level >= 3) and `deps.json`; consume them via
 
 ```text
 Thread X: === Orchestrator Profiling: XXX tasks, total=XXXus ===
-Thread X:   task_ring_alloc: XXXus (XX.X%)  atomics=XXX
-Thread X:   param_copy     : XXXus (XX.X%)
+Thread X:   task+heap_alloc: XXXus (XX.X%)  atomics=XXX
 Thread X:   lookup+dep     : XXXus (XX.X%)
-Thread X:   heap_alloc     : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:   tensormap_ins  : XXXus (XX.X%)
-Thread X:   fanin+ready    : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
-Thread X:   finalize+SM    : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
-Thread X:   scope_end      : XXXus
+Thread X:   param_copy     : XXXus (XX.X%)
+Thread X:   fanin+ready    : XXXus (XX.X%)  work=XXXus wait=XXXus
 Thread X:   avg/task       : XXXus
 ```
 

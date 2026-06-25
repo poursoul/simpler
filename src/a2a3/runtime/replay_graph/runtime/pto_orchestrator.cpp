@@ -285,8 +285,6 @@ static bool append_fanin_or_fail(
     return true;
 }
 
-static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
-
 struct PTO2PreparedTask {
     PTO2TaskId task_id = PTO2TaskId::invalid();
     PTO2TaskAllocResult alloc_result = {-1, 0, nullptr, nullptr};
@@ -309,47 +307,11 @@ static PTO2OutputLayout calculate_output_layout(const L0TaskArgs &args) {
     return layout;
 }
 
-static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAllocator &allocator) {
-    always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
-
-    int32_t scope_task_count = orch->scope_tasks_size - orch->scope_begins[orch->scope_stack_top];
-    if (scope_task_count < allocator.window_size() - 1) {
-        return true;
-    }
-
-    int32_t active_count = allocator.active_count();
-
-    LOG_ERROR("========================================");
-    LOG_ERROR("FATAL: Scope Deadlock Detected!");
-    LOG_ERROR("========================================");
-    LOG_ERROR("Tasks in current scope (%d) >= task_window_size (%d).", scope_task_count, allocator.window_size());
-    LOG_ERROR("  scope_depth:        %d", orch->scope_stack_top + 1);
-    LOG_ERROR("  scope_task_count:   %d", scope_task_count);
-    LOG_ERROR("  active_tasks:       %d / %d", active_count, allocator.window_size());
-    LOG_ERROR("Root Cause:");
-    LOG_ERROR("  The single-shot replay model fills the task window exactly once");
-    LOG_ERROR("  and never reclaims slots. When a single scope's task count reaches");
-    LOG_ERROR("  window_size, there are no slots left to allocate -> deadlock.");
-    LOG_ERROR("Solution:");
-    LOG_ERROR("  1. Reduce tasks per scope (use batching/unroll)");
-    LOG_ERROR("  2. Increase task window (current: %d)", allocator.window_size());
-    LOG_ERROR("     Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
-    LOG_ERROR("     Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2>");
-    LOG_ERROR("  3. Split work across multiple scopes");
-    LOG_ERROR("========================================");
-    orch_mark_fatal(orch, PTO2_ERROR_SCOPE_DEADLOCK);
-    return false;
-}
-
 static bool prepare_task(
     PTO2OrchestratorState *orch, const L0TaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
     PTO2PreparedTask *out
 ) {
     auto &allocator = orch->ring.task_allocator;
-
-    if (!check_scope_can_accept_task(orch, allocator)) {
-        return false;
-    }
 
     out->alloc_result = allocator.alloc(total_output_size);
     if (out->alloc_result.failed()) {
@@ -390,7 +352,6 @@ static bool prepare_task(
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     // fanin_count is set by scheduler during wiring
-    scope_tasks_push(orch, out->slot_state);
 
     return true;
 }
@@ -398,22 +359,6 @@ static bool prepare_task(
 // =============================================================================
 // Scope Management
 // =============================================================================
-
-static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state) {
-    if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
-        // scope_tasks lives in the per-Worker arena (single backing allocation),
-        // so realloc is not legal. Capacity == PTO2_SCOPE_TASKS_CAP ==
-        // PTO2_TASK_WINDOW_SIZE, the total in-flight slot budget — hitting it
-        // means the ring is saturated, so no further push could succeed
-        // regardless of buffer growth.
-        orch->report_fatal(
-            PTO2_ERROR_SCOPE_TASKS_OVERFLOW, __FUNCTION__, "scope_tasks buffer saturated at %d entries (ring full)",
-            orch->scope_tasks_capacity
-        );
-        return;
-    }
-    orch->scope_tasks[orch->scope_tasks_size++] = task_slot_state;
-}
 
 void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     auto *orch = this;
@@ -428,7 +373,6 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
 
     bool already_in_manual_scope = orch->in_manual_scope();
     ++orch->scope_stack_top;
-    orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
     if (mode == PTO2ScopeMode::MANUAL && !already_in_manual_scope) {
         orch->manual_begin_depth = orch->scope_stack_top;
     }
@@ -459,9 +403,9 @@ void PTO2OrchestratorState::end_scope() {
     }
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
-    // Snapshot the ring start/end BEFORE the orchestrator drains pending tasks
-    // via scheduler->on_scope_end, so the end record reflects the scope's
-    // occupancy at close, not the residual after teardown.
+    // Snapshot the ring start/end at scope close so the end record reflects the
+    // scope's occupancy at close. The single-shot replay model has no slot
+    // reclaim, so end_scope only pops the depth/manual bookkeeping.
 #if PTO2_PROFILING
     // Gate via is_scope_stats_enabled() (see begin_scope). One collector call
     // emits the end-boundary record and tears down bookkeeping.
@@ -485,18 +429,10 @@ void PTO2OrchestratorState::end_scope() {
 #endif
 
     bool ending_manual_scope = orch->scope_stack_top == orch->manual_begin_depth;
-    int32_t begin = orch->scope_begins[orch->scope_stack_top--];
-    int32_t count = orch->scope_tasks_size - begin;
+    orch->scope_stack_top--;
     if (ending_manual_scope) {
         orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
     }
-
-    if (orch->scheduler && count > 0) {
-        orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
-    }
-
-    // Rewind the task buffer — these entries are no longer needed
-    orch->scope_tasks_size = begin;
 
 #if PTO2_ORCH_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();
@@ -884,7 +820,6 @@ void PTO2OrchestratorState::mark_done() {
         );
     }
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
-    orch->scope_tasks_size = 0;
     orch->scope_stack_top = -1;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
 #if !PTO2_ORCH_PROFILING && PTO2_PROFILING

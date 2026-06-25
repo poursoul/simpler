@@ -37,14 +37,11 @@ Thread 3 loads the orchestration `.so` via `dlopen`, calls `aicpu_orchestration_
 Thread 3: Calling aicpu_orchestration_entry from SO
 Thread 3: aicpu_orchestration_entry returned, cost 20943.940us
 Thread 3: === Orchestrator Profiling: 16704 tasks, total=14601.580us ===
-Thread 3:   task_ring_alloc: 380.400us (2.6%)
-Thread 3:   param_copy     : 2147.800us (14.7%)
+Thread 3:   task+heap_alloc: 1081.900us (7.4%)  atomics=16704
 Thread 3:   lookup+dep     : 7290.300us (49.9%)
-Thread 3:   heap_alloc     : 701.500us (4.8%)
 Thread 3:   tensormap_ins  : 1890.380us (12.9%)
-Thread 3:   fanin+ready    : 1207.400us (8.3%)
-Thread 3:   finalize+SM    : 697.500us (4.8%)
-Thread 3:   scope_end      : 364.080us
+Thread 3:   param_copy     : 2147.800us (14.7%)
+Thread 3:   fanin+ready    : 1207.400us (8.3%)  work=843.320us wait=364.080us
 Thread 3:   avg/task       : 0.874us
 Thread 3: PTO2 total submitted tasks = 16704
 ```
@@ -55,13 +52,11 @@ Thread 3: PTO2 total submitted tasks = 16704
 | ----- | ------------------------------- | ----------- |
 | **cost** | Wall-clock around `orch_func()` call | Total time including orchestration logic + scope overhead |
 | **total** | Sum of all sub-steps below | Accumulated time inside `submit_task` across all tasks |
-| **task_ring_alloc** | `g_orch_alloc_cycle` | Allocating a task slot from the task ring buffer |
-| **param_copy** | `g_orch_args_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
+| **task+heap_alloc** | `g_orch_alloc_cycle` | Allocating a task slot plus its packed output buffer (combined task-ring + heap bump); `atomics` counts the slot-reservation CAS |
 | **lookup+dep** | `g_orch_lookup_cycle` | TensorMap lookup for inputs/inouts + building fanin/fanout dependency edges |
-| **heap_alloc** | `g_orch_heap_cycle` | Allocating packed output buffers from the heap ring |
 | **tensormap_ins** | `g_orch_insert_cycle` | Inserting output/inout tensors into the TensorMap |
-| **fanin+ready** | `g_orch_fanin_cycle` | Building the fanin list + checking if task is already ready (Step 5/5b) |
-| **scope_end** | `g_orch_scope_end_cycle` | `end_scope` overhead (notifying scheduler of scope completion) |
+| **param_copy** | `g_orch_args_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
+| **fanin+ready** | `g_orch_fanin_cycle` | Building the fanin list + checking if task is already ready (Step 5/5b); `work`/`wait` split time spent holding vs. waiting on the fanout lock |
 | **avg/task** | `total / submit_count` | Average orchestrator time per task submission |
 
 ### Interpreting the Numbers

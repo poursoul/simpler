@@ -417,122 +417,6 @@ bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena
 void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(PTO2ReadyQueue *queue);
 
-// =============================================================================
-// SPSC Queue (Single-Producer Single-Consumer, wait-free)
-// =============================================================================
-//
-// Bounded ring buffer optimized for the wiring queue use case:
-//   - Producer: orchestrator thread (push)
-//   - Consumer: scheduler thread 0 (pop_batch)
-//
-// Design based on Rigtorp's cached-index technique: each side caches
-// the other's index locally, avoiding cross-core cache line bouncing
-// on the hot path. Only when the local cache says "full" or "empty"
-// does the thread issue an acquire load on the remote index.
-//
-// Memory layout: 5 cache-line-aligned fields ensure zero false sharing.
-
-struct alignas(64) PTO2SpscQueue {
-    // --- Producer cache lines (orchestrator thread) ---
-    alignas(64) std::atomic<uint64_t> head_{0};
-    alignas(64) uint64_t tail_cached_{0};
-
-    // --- Consumer cache lines (scheduler thread 0) ---
-    alignas(64) std::atomic<uint64_t> tail_{0};
-    alignas(64) uint64_t head_cached_{0};
-
-    // --- Shared Cacheline (read only) with mask and data ptr (immutable after init) ---
-    alignas(64) PTO2TaskSlotState **buffer_{nullptr};
-    uint64_t mask_{0};
-
-    // Padding to exactly 5 cache lines
-    char padding[64 - sizeof(PTO2TaskSlotState **) - sizeof(uint64_t)];
-
-    // Reserve the backing buffer region on the supplied arena. Returns the
-    // region offset, to be passed to init_from_layout() after the arena is
-    // committed. Cache-line aligned: the buffer is shared between the
-    // orchestrator (push) and scheduler thread 0 (pop_batch), so its base
-    // must not false-share with neighboring regions.
-    static size_t reserve_layout(DeviceArena &arena, uint64_t capacity) {
-        return arena.reserve(capacity * sizeof(uintptr_t), PTO2_ALIGN_SIZE);
-    }
-
-    // Writes everything except the arena-internal `buffer_` pointer field
-    // (zeros the slot pointer array, mask/head/tail). The host pre-builds the
-    // image without storing a host address in buffer_; the AICPU wires
-    // buffer_ at boot via wire_arena_pointers().
-    bool init_data_from_layout(DeviceArena &arena, size_t buffer_off, uint64_t capacity) {
-        if (capacity == 0 || (capacity & (capacity - 1)) != 0) return false;
-        auto *buf = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
-        // calloc'd-equivalent: zero the slot pointers so spurious early pops
-        // observe nullptr.
-        for (uint64_t i = 0; i < capacity; i++)
-            buf[i] = nullptr;
-        mask_ = capacity - 1;
-        head_.store(0, std::memory_order_relaxed);
-        tail_.store(0, std::memory_order_relaxed);
-        tail_cached_ = 0;
-        head_cached_ = 0;
-        return true;
-    }
-
-    // Wire the arena-internal pointer. Called by both host (with host arena)
-    // and AICPU (with device arena attached to the prebuilt image).
-    void wire_arena_pointers(DeviceArena &arena, size_t buffer_off) {
-        buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
-    }
-
-    // Arena owns the buffer; here we only forget our pointer.
-    void destroy() { buffer_ = nullptr; }
-
-    // Push one item (producer only). Returns false if queue is full.
-    // Full condition: next_h - tail > mask_ (i.e. > capacity-1), so the
-    // effective usable capacity is capacity-1 (one slot is wasted as a
-    // sentinel to distinguish full from empty). uint64_t wrapping is safe
-    // since head and tail are monotonically increasing and subtraction
-    // wraps correctly.
-    bool push(PTO2TaskSlotState *item) {
-        uint64_t h = head_.load(std::memory_order_relaxed);
-        uint64_t next_h = h + 1;
-        if (next_h - tail_cached_ > mask_) {
-            tail_cached_ = tail_.load(std::memory_order_acquire);
-            if (next_h - tail_cached_ > mask_) {
-                return false;
-            }
-        }
-        buffer_[h & mask_] = item;
-        head_.store(next_h, std::memory_order_release);
-        return true;
-    }
-
-    // Pop up to max_count items (consumer only). Returns actual count.
-    int pop_batch(PTO2TaskSlotState **out, int max_count) {
-        uint64_t t = tail_.load(std::memory_order_relaxed);
-        uint64_t avail = head_cached_ - t;
-        if (avail < static_cast<uint64_t>(max_count)) {
-            head_cached_ = head_.load(std::memory_order_acquire);
-            avail = head_cached_ - t;
-            if (avail == 0) return 0;
-        }
-        int count = (avail < static_cast<uint64_t>(max_count)) ? static_cast<int>(avail) : max_count;
-        for (int i = 0; i < count; i++) {
-            out[i] = buffer_[(t + i) & mask_];
-        }
-        tail_.store(t + count, std::memory_order_release);
-        return count;
-    }
-
-    // Approximate size (used for backoff decisions, not exact).
-    uint64_t size() const {
-        uint64_t h = head_.load(std::memory_order_acquire);
-        uint64_t t = tail_.load(std::memory_order_acquire);
-        return h - t;
-    }
-};
-
-static_assert(sizeof(PTO2SpscQueue) == 5 * 64, "PTO2SpscQueue must be exactly 5 cache lines (320B)");
-// =============================================================================
-
 /**
  * Statistics returned by mixed-task completion processing
  */
@@ -575,8 +459,8 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
-    // Wiring (SPSC queue + dep_pool + wire_task/drain_wiring_queue) moved to the
-    // orchestrator (replay_graph stage 1). The scheduler only consumes the
+    // Wiring (dep_pool + fanout list construction) lives in the orchestrator:
+    // submit_task builds the graph in-line. The scheduler only consumes the
     // orchestrator's products: it seeds initial_ready into ready_queues and
     // traverses fanout linked lists read-only during completion.
 
@@ -656,8 +540,8 @@ struct PTO2SchedulerState {
     // Event-driven candidate detection (the dual of fanin_refcount/ready). Call when a
     // FLAGGED producer `p` DISPATCHES (starts running): walk its fanout and bump each
     // consumer's dispatch_fanin. A consumer whose dispatch_fanin reaches
-    // fanin_count (= every producer is either flagged-and-dispatched, or was
-    // already complete when the consumer was wired) is an early-dispatch candidate:
+    // fanin_count (every pending producer is flagged-and-dispatched; already-
+    // complete producers are not counted) is an early-dispatch candidate:
     // CAS NONE->STAGING (exactly-once) and push to early_dispatch_queue for the idle drain to
     // pre-stage. Once-guarded per producer so an SPMD producer's block-by-block
     // dispatch propagates once. Replaces the old per-iteration pass-1 PULL scan.
@@ -673,12 +557,14 @@ struct PTO2SchedulerState {
         PTO2DepListEntry *edge = p.fanout_head;
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
-            // dispatch_fanin (CONSUMER-side early-dispatch counter) starts at the
-            // wiring-time early_finished seed (producers already complete) and is
-            // bumped here by flagged producers; reaching the producer-edge count
-            // means every producer is flagged-dispatched or pre-completed. Read it
-            // off the slot's hot fanin_count (== payload.fanin_count after the
-            // wiring +1 was dropped) instead of the cold payload cache line.
+            // dispatch_fanin (CONSUMER-side early-dispatch counter) starts at 0:
+            // submit-time wiring no longer seeds it, because already-complete
+            // producers are not counted at all (they gate nothing). It is bumped
+            // here by each flagged producer's dispatch; reaching fanin_count (both
+            // counters track only pending producers) means every pending producer
+            // is flagged-dispatched, so the consumer is an early-dispatch
+            // candidate. Read the count off the slot's hot fanin_count, not the
+            // cold payload cache line.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (nf != c->fanin_count) continue;
             if (c->active_mask.requires_sync_start()) continue;  // sync_start can't be block-by-block pre-staged
@@ -894,7 +780,7 @@ struct PTO2SchedulerState {
 
         // single-shot: fanout_head is frozen before sched starts, so no lock is
         // needed. MUST restore this lock before any orch/sched time-overlap
-        // (stage-3 ping-pong). wire_task built the fanout list single-threaded
+        // (stage-3 ping-pong). submit_task built the fanout list single-threaded
         // in the orch phase; here we only publish completion and read the frozen
         // head snapshot, with no concurrent writer to exclude.
         slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);

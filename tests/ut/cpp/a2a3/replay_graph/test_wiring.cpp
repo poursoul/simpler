@@ -9,21 +9,22 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Unit tests for scheduler wiring and completion paths:
+ * Unit tests for the dependency-graph construction and completion paths:
  *
- * 1. wire_task()         — fanout wiring, early-finished detection,
- *                          fanin_count initialization, ready push
+ * 1. submit-time graph wiring — fanout edges, already-completed-producer
+ *    detection, fanin_count/fanin_refcount seeding, initial-ready push.
+ *    Wiring is no longer a deferred pass (wire_task / drain_wiring_queue / the
+ *    SPSC queue are gone): submit_task builds the graph in-line, so these tests
+ *    drive the public submit API (submit_dummy_task / alloc_tensors) and assert
+ *    on the resulting slot state instead of calling a wiring entry point.
  * 2. on_task_complete() — COMPLETED transition, fanout traversal,
- *                               consumer fanin release
- *
- * These tests exercise the core scheduling hot-paths that had zero coverage.
+ *                         consumer fanin release.
  */
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <cstring>
-#include <thread>
 #include <vector>
 
 #include "utils/device_arena.h"
@@ -32,15 +33,14 @@
 #include "scheduler/pto_scheduler.h"
 
 // =============================================================================
-// Fixture: sets up a scheduler with shared memory and provides helpers
+// Fixture: sets up an orchestrator + scheduler over shared memory.
 // =============================================================================
 
 class WiringTest : public ::testing::Test {
 protected:
-    // Wiring lives in the orchestrator now (replay_graph), so wire_task /
-    // drain_wiring_queue / the SPSC queue are exercised through `orch`. The
-    // completion-path test (on_task_complete) still drives `sched`, so both are
-    // set up here, mirroring test_orchestrator_fanin's fixture.
+    // submit_task builds the dependency graph in-line in the orchestrator, so
+    // the wiring tests drive `orch`. The completion-path test (on_task_complete)
+    // drives `sched`; both are set up here, mirroring test_orchestrator_fanin.
     DeviceArena sm_arena;
     DeviceArena runtime_arena;
     PTO2SharedMemoryHandle *sm_handle = nullptr;
@@ -49,13 +49,6 @@ protected:
     PTO2OrchestratorLayout orch_layout{};
     PTO2SchedulerLayout sched_layout{};
     std::vector<char> gm_heap;
-
-    // Each init_slot()'d slot gets a distinct zeroed payload from this pool,
-    // mirroring orch::prepare_task's bind_buffers: every production slot has a
-    // payload, and the scheduler's release/propagate paths dereference it.
-    static constexpr int kSlotPayloadPoolSize = 16;
-    PTO2TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
-    int slot_payload_pool_idx_ = 0;
 
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
@@ -72,6 +65,7 @@ protected:
         ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
         sched.wire_arena_pointers(sched_layout, runtime_arena);
         orch.wire_arena_pointers(orch_layout, runtime_arena, &sched);
+        orch.begin_scope();
     }
 
     void TearDown() override {
@@ -81,165 +75,146 @@ protected:
         sm_arena.release();
     }
 
-    // Initialize a slot for testing wiring/completion
-    void init_slot(PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, uint8_t ring_id = 0) {
-        memset(&slot, 0, sizeof(slot));
-        slot.task_state.store(state);
-        slot.fanin_count = fanin_count;
-        slot.fanin_refcount.store(0);
-        slot.fanout_head = nullptr;
-        slot.ring_id = ring_id;
-        slot.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
-        slot.completed_subtasks.store(0);
-        slot.total_required_subtasks = 1;
-        slot.logical_block_num = 1;
-        PTO2TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
-        memset(&slot_pl, 0, sizeof(slot_pl));
-        slot.payload = &slot_pl;
+    // Submit a PENDING producer (dependency-only task; never completes inline).
+    PTO2TaskId submit_pending_producer() {
+        L0TaskArgs args;
+        TaskOutputTensors out = orch.submit_dummy_task(args);
+        EXPECT_TRUE(out.task_id().is_valid());
+        return out.task_id();
     }
+
+    // Allocate an inline-COMPLETED producer (alloc_tensors completes the slot in
+    // the orchestrator before any consumer can exist).
+    PTO2TaskId alloc_completed_producer() {
+        L0TaskArgs args;
+        const uint32_t shape[] = {16};
+        TensorCreateInfo ci(shape, 1, DataType::FLOAT32);
+        args.add_output(ci);
+        TaskOutputTensors out = orch.alloc_tensors(args);
+        EXPECT_TRUE(out.task_id().is_valid());
+        return out.task_id();
+    }
+
+    PTO2TaskSlotState &slot_of(PTO2TaskId id) { return sm_handle->header->get_slot_state_by_task_id(id.local()); }
 };
 
 // =============================================================================
-// wire_task: no fanin (independent task)
+// submit: no fanin (independent task) -> initially ready
 // =============================================================================
 
-TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
-    // A task with 0 actual fanins should immediately be pushed to ready queue
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
+TEST_F(WiringTest, NoFaninBecomesReady) {
+    int32_t before = orch.initial_ready_count;
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_count = 0;
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
+    L0TaskArgs args;
+    TaskOutputTensors out = orch.submit_dummy_task(args);
+    ASSERT_TRUE(out.task_id().is_valid());
 
-    orch.wire_task(orch.dep_pool, &task_slot, 0);
+    auto &slot = slot_of(out.task_id());
+    EXPECT_EQ(slot.fanin_count, 0);
+    EXPECT_EQ(slot.fanin_refcount.load(), 0);
 
-    // wfanin == 0 -> fanin_count is 0 (no producers); refcount untouched.
-    EXPECT_EQ(task_slot.fanin_count, 0);
-    EXPECT_EQ(task_slot.fanin_refcount.load(), 0);
-
-    // Task should be appended to the orchestrator's initial-ready handoff
-    // (wire_task no longer pushes the scheduler's ready_queues directly).
-    ASSERT_EQ(orch.initial_ready_count, 1);
-    EXPECT_EQ(orch.initial_ready[0], &task_slot);
+    // No producers -> appended to the initial-ready handoff.
+    ASSERT_EQ(orch.initial_ready_count, before + 1);
+    EXPECT_EQ(orch.initial_ready[orch.initial_ready_count - 1], &slot);
 }
 
 // =============================================================================
-// wire_task: with fanin, all producers already completed (early-finished)
+// submit: all producers already inline-completed (alloc) -> ready
 // =============================================================================
 
-TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskSlotState producer_slots[2];
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
+TEST_F(WiringTest, AllProducersEarlyFinished) {
+    PTO2TaskId p0 = alloc_completed_producer();
+    PTO2TaskId p1 = alloc_completed_producer();
 
-    // Set up 2 producers that are already COMPLETED
-    for (int i = 0; i < 2; i++) {
-        init_slot(producer_slots[i], PTO2_TASK_COMPLETED, 1);
-    }
+    int32_t before = orch.initial_ready_count;
 
-    // Consumer task with 2 fanins
-    init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_count = 2;
-    payload.fanin_inline_slot_states[0] = &producer_slots[0];
-    payload.fanin_inline_slot_states[1] = &producer_slots[1];
+    PTO2TaskId deps[] = {p0, p1};
+    L0TaskArgs consumer_args;
+    consumer_args.set_dependencies(deps, 2);
+    TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
+    ASSERT_TRUE(consumer.task_id().is_valid());
 
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
+    auto &cslot = slot_of(consumer.task_id());
+    // Both producers already complete -> not counted at all: fanin_count and
+    // fanin_refcount stay 0, so the consumer is still initially ready (0 == 0).
+    EXPECT_EQ(cslot.fanin_count, 0);
+    EXPECT_EQ(cslot.fanin_refcount.load(), 0);
+    // dispatch_fanin is not seeded for already-complete producers.
+    ASSERT_NE(cslot.payload, nullptr);
+    EXPECT_EQ(cslot.payload->dispatch_fanin.load(), 0);
 
-    orch.wire_task(orch.dep_pool, &task_slot, 2);
+    // No fanout edge built on completed producers.
+    EXPECT_EQ(slot_of(p0).fanout_head, nullptr);
+    EXPECT_EQ(slot_of(p1).fanout_head, nullptr);
 
-    // fanin_count = wfanin = 2 (no +1 sentinel)
-    EXPECT_EQ(task_slot.fanin_count, 2);
-    // early_finished = 2, refcount == 2 == fanin_count -> ready
-    EXPECT_EQ(task_slot.fanin_refcount.load(), 2);
-
-    // All producers early-finished -> task appended to initial-ready.
-    ASSERT_EQ(orch.initial_ready_count, 1);
-    EXPECT_EQ(orch.initial_ready[0], &task_slot);
+    // Every producer already satisfied -> consumer is initially ready.
+    ASSERT_EQ(orch.initial_ready_count, before + 1);
+    EXPECT_EQ(orch.initial_ready[orch.initial_ready_count - 1], &cslot);
 }
 
 // =============================================================================
-// wire_task: with fanin, producers still pending (task NOT ready)
+// submit: producers still pending -> consumer NOT ready, fanout edges built
 // =============================================================================
 
-TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskSlotState producer_slots[2];
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
+TEST_F(WiringTest, ProducersPendingTaskNotReady) {
+    PTO2TaskId p0 = submit_pending_producer();
+    PTO2TaskId p1 = submit_pending_producer();
 
-    // Producers are PENDING (not yet completed)
-    for (int i = 0; i < 2; i++) {
-        init_slot(producer_slots[i], PTO2_TASK_PENDING, 1);
-    }
+    int32_t before = orch.initial_ready_count;
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_count = 2;
-    payload.fanin_inline_slot_states[0] = &producer_slots[0];
-    payload.fanin_inline_slot_states[1] = &producer_slots[1];
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
+    PTO2TaskId deps[] = {p0, p1};
+    L0TaskArgs consumer_args;
+    consumer_args.set_dependencies(deps, 2);
+    TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
+    ASSERT_TRUE(consumer.task_id().is_valid());
 
-    orch.wire_task(orch.dep_pool, &task_slot, 2);
-
-    // fanin_count = wfanin = 2 (no +1 sentinel)
-    EXPECT_EQ(task_slot.fanin_count, 2);
-    // early_finished = 0 -> wire_task leaves refcount untouched -> not ready
-    EXPECT_EQ(task_slot.fanin_refcount.load(), 0);
-    EXPECT_LT(task_slot.fanin_refcount.load(), task_slot.fanin_count);
+    auto &cslot = slot_of(consumer.task_id());
+    EXPECT_EQ(cslot.fanin_count, 2);
+    // Pending producers -> refcount untouched -> not ready.
+    EXPECT_EQ(cslot.fanin_refcount.load(), 0);
+    EXPECT_LT(cslot.fanin_refcount.load(), cslot.fanin_count);
 
     // Not ready -> nothing appended to initial-ready.
-    EXPECT_EQ(orch.initial_ready_count, 0);
+    EXPECT_EQ(orch.initial_ready_count, before);
 
-    // Producers should have fanout_head pointing to task_slot
-    EXPECT_NE(producer_slots[0].fanout_head, nullptr);
-    EXPECT_EQ(producer_slots[0].fanout_head->slot_state, &task_slot);
-    EXPECT_NE(producer_slots[1].fanout_head, nullptr);
-    EXPECT_EQ(producer_slots[1].fanout_head->slot_state, &task_slot);
+    // Each pending producer carries the consumer in its fanout chain.
+    auto &p0slot = slot_of(p0);
+    auto &p1slot = slot_of(p1);
+    ASSERT_NE(p0slot.fanout_head, nullptr);
+    EXPECT_EQ(p0slot.fanout_head->slot_state, &cslot);
+    ASSERT_NE(p1slot.fanout_head, nullptr);
+    EXPECT_EQ(p1slot.fanout_head->slot_state, &cslot);
 }
 
 // =============================================================================
-// wire_task: mixed early-finished and pending producers
+// submit: mixed completed (alloc) and pending producers
 // =============================================================================
 
-TEST_F(WiringTest, WireTaskMixedProducerStates) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskSlotState producers[3];
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
+TEST_F(WiringTest, MixedProducerStates) {
+    PTO2TaskId pa = alloc_completed_producer();  // inline-completed
+    PTO2TaskId pb = submit_pending_producer();   // pending
+    PTO2TaskId pc = alloc_completed_producer();  // inline-completed
 
-    init_slot(producers[0], PTO2_TASK_COMPLETED, 1);  // early finished
-    init_slot(producers[1], PTO2_TASK_PENDING, 1);    // in flight (< COMPLETED)
-    init_slot(producers[2], PTO2_TASK_COMPLETED, 1);  // early finished (>= COMPLETED)
+    int32_t before = orch.initial_ready_count;
 
-    init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_count = 3;
-    for (int i = 0; i < 3; i++) {
-        payload.fanin_inline_slot_states[i] = &producers[i];
-    }
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
+    PTO2TaskId deps[] = {pa, pb, pc};
+    L0TaskArgs consumer_args;
+    consumer_args.set_dependencies(deps, 3);
+    TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
+    ASSERT_TRUE(consumer.task_id().is_valid());
 
-    orch.wire_task(orch.dep_pool, &task_slot, 3);
+    auto &cslot = slot_of(consumer.task_id());
+    // Only the pending producer is counted: fanin_count == 1, refcount stays 0 ->
+    // not ready. The two completed producers contribute nothing.
+    EXPECT_EQ(cslot.fanin_count, 1);
+    EXPECT_EQ(cslot.fanin_refcount.load(), 0);
+    EXPECT_EQ(orch.initial_ready_count, before);  // not ready
 
-    // fanin_count = wfanin = 3 (no +1 sentinel)
-    EXPECT_EQ(task_slot.fanin_count, 3);
-    // early_finished = 2 (both COMPLETED producers) -> refcount = 2
-    // Not yet 3 -> not ready (one producer still running)
-    EXPECT_EQ(task_slot.fanin_refcount.load(), 2);
-
-    // Only the running producer should have the consumer in its fanout chain
-    EXPECT_EQ(producers[0].fanout_head, nullptr);  // early finished, no dep entry added
-    EXPECT_NE(producers[1].fanout_head, nullptr);  // running, dep entry added
-    EXPECT_EQ(producers[2].fanout_head, nullptr);  // early finished
+    // Only the pending producer carries the consumer in its fanout chain.
+    EXPECT_EQ(slot_of(pa).fanout_head, nullptr);
+    ASSERT_NE(slot_of(pb).fanout_head, nullptr);
+    EXPECT_EQ(slot_of(pb).fanout_head->slot_state, &cslot);
+    EXPECT_EQ(slot_of(pc).fanout_head, nullptr);
 }
 
 // =============================================================================
@@ -249,24 +224,36 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     alignas(64) PTO2TaskSlotState producer;
     alignas(64) PTO2TaskSlotState consumer1, consumer2;
-    alignas(64) PTO2TaskPayload prod_payload;
+    alignas(64) PTO2TaskPayload prod_payload, c1_payload, c2_payload;
     memset(&prod_payload, 0, sizeof(prod_payload));
+    memset(&c1_payload, 0, sizeof(c1_payload));
+    memset(&c2_payload, 0, sizeof(c2_payload));
     PTO2TaskDescriptor desc{};
 
-    // Producer in flight (PENDING, not yet COMPLETED) with 2 consumers in fanout chain
-    init_slot(producer, PTO2_TASK_PENDING, 1);
-    producer.payload = &prod_payload;
+    auto init_slot = [](PTO2TaskSlotState &slot, PTO2TaskState state, int32_t fanin_count, PTO2TaskPayload &pl) {
+        memset(&slot, 0, sizeof(slot));
+        slot.task_state.store(state);
+        slot.fanin_count = fanin_count;
+        slot.fanin_refcount.store(0);
+        slot.fanout_head = nullptr;
+        slot.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
+        slot.completed_subtasks.store(0);
+        slot.total_required_subtasks = 1;
+        slot.logical_block_num = 1;
+        slot.payload = &pl;
+    };
+
+    // Producer in flight (PENDING) with 2 consumers in its fanout chain.
+    init_slot(producer, PTO2_TASK_PENDING, 1, prod_payload);
     producer.task = &desc;
 
-    // Consumer1: needs 1 more fanin to become ready
-    init_slot(consumer1, PTO2_TASK_PENDING, 2);
+    // Consumer1: needs 1 more fanin to become ready.
+    init_slot(consumer1, PTO2_TASK_PENDING, 2, c1_payload);
     consumer1.fanin_refcount.store(1);  // 1 of 2 satisfied
-    consumer1.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
 
-    // Consumer2: this release will make it ready
-    init_slot(consumer2, PTO2_TASK_PENDING, 2);
+    // Consumer2: this release will make it ready.
+    init_slot(consumer2, PTO2_TASK_PENDING, 2, c2_payload);
     consumer2.fanin_refcount.store(1);  // 1 of 2 satisfied
-    consumer2.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
 
     // Build fanout chain: producer -> consumer2 -> consumer1
     PTO2DepListEntry dep_entries[2];
@@ -278,82 +265,14 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
 
     sched.on_task_complete(producer);
 
-    // Producer should be COMPLETED
     EXPECT_EQ(producer.task_state.load(), PTO2_TASK_COMPLETED);
 
-    // Both consumers should have fanin_refcount incremented
     EXPECT_EQ(consumer1.fanin_refcount.load(), 2);
     EXPECT_EQ(consumer2.fanin_refcount.load(), 2);
 
-    // Both consumers should be ready (fanin_refcount == fanin_count)
+    // Both consumers should be ready (fanin_refcount == fanin_count).
     PTO2ResourceShape shape = consumer1.active_mask.to_shape();
     auto *r1 = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     auto *r2 = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     EXPECT_TRUE((r1 == &consumer1 && r2 == &consumer2) || (r1 == &consumer2 && r2 == &consumer1));
-}
-
-// =============================================================================
-// drain_wiring_queue: pushes tasks through SPSC queue
-// =============================================================================
-
-TEST_F(WiringTest, DrainWiringQueueProcessesTasks) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
-
-    init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_count = 0;
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
-
-    // Push into the orchestrator's wiring SPSC queue (submit side).
-    ASSERT_TRUE(orch.wiring.queue.push(&task_slot));
-
-    // Drain it (orchestrator run_wiring side).
-    int wired = orch.drain_wiring_queue(true /* force_drain */);
-    EXPECT_EQ(wired, 1);
-
-    // Task should be appended to initial-ready.
-    ASSERT_EQ(orch.initial_ready_count, 1);
-    EXPECT_EQ(orch.initial_ready[0], &task_slot);
-}
-
-TEST_F(WiringTest, DrainWiringQueueBackoffDefers) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
-
-    init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_count = 0;
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
-
-    orch.wiring.queue.push(&task_slot);
-
-    // Without force_drain, single item < BATCH_SIZE → backoff
-    orch.wiring.backoff_counter = 0;
-    int wired = orch.drain_wiring_queue(false);
-    EXPECT_EQ(wired, 0) << "Backoff should defer when queue < BATCH_SIZE";
-    EXPECT_EQ(orch.wiring.backoff_counter, 1);
-}
-
-TEST_F(WiringTest, DrainWiringQueueBackoffLimitForcesProcess) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
-
-    init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_count = 0;
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
-
-    orch.wiring.queue.push(&task_slot);
-
-    // Set backoff at limit → should process
-    orch.wiring.backoff_counter = PTO2OrchestratorState::WiringState::BACKOFF_LIMIT;
-    int wired = orch.drain_wiring_queue(false);
-    EXPECT_EQ(wired, 1) << "Backoff limit reached should force processing";
 }

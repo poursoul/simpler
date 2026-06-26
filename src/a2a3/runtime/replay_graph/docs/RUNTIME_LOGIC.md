@@ -30,7 +30,7 @@ It coordinates four layers of execution:
 ┌───────────────────────────▼───────────────────────────────────────────┐
 │                     AICPU (4 threads)                                   │
 │  Phase 1 — Thread 3: Orchestrator builds the whole task graph,          │
-│            then run_wiring() builds fanout lists + initial_ready[]       │
+│            submit_task wires fanout lists + initial_ready[] in-line      │
 │  Phase 2 — Threads 0-2: Schedulers seed initial_ready[] into their      │
 │            ready queues, then dispatch + handle completion              │
 │                                                                         │
@@ -69,7 +69,7 @@ back-pressure mechanism that `tensormap_and_ringbuffer` needs:
 | ------- | ------------------------ | ------------ |
 | Phasing | Orchestrator and schedulers run concurrently | Orchestrator fully precedes schedulers |
 | Rings | `PTO2_MAX_RING_DEPTH` per-scope rings | One ring, `ring_id` is always 0 |
-| Wiring | Scheduler thread 0 drains a wiring queue | Orchestrator builds fanout lists in `run_wiring()` |
+| Wiring | Scheduler thread 0 drains a wiring queue | Orchestrator builds fanout lists in-line in `submit_task` |
 | Allocation | Ring wrap + back-pressure spin | Pure bump; overflow is fatal |
 | Task states | `PENDING → COMPLETED → CONSUMED` | `PENDING → COMPLETED` (terminal) |
 | Reclaim | `advance_ring_pointers` frees slots/heap | None; the arena is never reclaimed |
@@ -192,24 +192,18 @@ alloc(output_size):
 - **State queries**: `active_count() == local_task_id` (everything allocated
   is still live); `task_tail()` and `heap_tail()` stay at 0.
 
-### 4.2 Fanin Spill Pool (`PTO2FaninPool`)
+### 4.2 Dependency List Pool (`PTO2DepListPool`)
 
-A bump allocator for fanin entries that overflow the inline capacity
-(`PTO2_FANIN_INLINE_CAP = 64` per task). Filled once during submit, never
-reclaimed; overflow is fatal.
-
-### 4.3 Dependency List Pool (`PTO2DepListPool`)
-
-A bump allocator for fanout linked-list nodes. `run_wiring()` builds the
-whole graph's fanout lists here during the orch phase; the schedulers only
-traverse them read-only during completion. Capacity must hold every fanout
-edge of the entire graph, and overflow is fatal.
+A bump allocator for fanout linked-list nodes. `submit_task` builds the
+fanout lists here in-line as each task is submitted during the orch phase;
+the schedulers only traverse them read-only during completion. Capacity must
+hold every fanout edge of the entire graph, and overflow is fatal.
 
 - **Entry 0**: NULL sentinel.
 - **Allocation**: `top++`, never wraps.
 - **Reclamation**: none — `tail` is fixed, `used() == top - tail`.
 
-### 4.4 No Back-Pressure, No Deadlock Path
+### 4.3 No Back-Pressure, No Deadlock Path
 
 Because the schedulers never run during the orch phase, there is nothing to
 wait for: an allocator that cannot satisfy a request can never make progress
@@ -290,13 +284,15 @@ removed the consumer-counting that drove the dropped `CONSUMED` lifecycle.
 
 | Field | Description |
 | ----- | ----------- |
-| `tensors[16]` | Tensor descriptors for parameters |
-| `scalar_value[16]` | Scalar parameter values |
-| `is_tensor[16]` | Whether each parameter is tensor or scalar |
-| `param_count` | Number of valid parameters |
-| `fanin_inline_slot_states[]` | Producer slot-state pointers (inline, up to 64) |
-| `fanin_spill_start` | Start index of spilled fanins in the fanin pool |
-| `fanin_count` | Actual fanin count |
+| `tensors[]` | Tensor descriptors for parameters |
+| `scalars[]` | Scalar parameter values |
+| `tensor_count` / `scalar_count` | Number of valid tensor / scalar parameters |
+| `dispatch_fanin` | Early-dispatch counter (consumer-side); seeded by `submit_task` |
+| `staged_core_mask[]` / `spec_*` | Speculative early-dispatch metadata |
+
+The payload no longer stores the producer (fanin) list: `submit_task` builds
+the fanout graph in-line via the slot's `fanout_head` / `fanin_count`, so the
+producer edges live in `dep_pool`, not the payload.
 
 ### 6.2 Task State Machine
 
@@ -332,58 +328,57 @@ rather than narrowed so the shared submit/dispatch types match
 The orchestrator runs on AICPU Thread 3 and builds the task graph by calling
 the user-provided orchestration function. Key members:
 
-- `task_allocator`, `fanin_pool`, `dep_pool`: the single-shot bump allocators
-  (task slots + heap, fanin spill, fanout dependency lists).
+- `task_allocator`, `dep_pool`: the single-shot bump allocators (task slots +
+  heap, fanout dependency lists).
 - `tensor_map`: producer lookup.
+- `fanin_seen_epoch[]`: per-slot dedup stamp so a producer counted twice for
+  one consumer (e.g. duplicate explicit dep) yields a single fanin edge.
 - `scope_stack_top`, `manual_begin_depth`: scope nesting depth + manual-scope
   bookkeeping (no per-scope task lists — slot reclaim was dropped).
-- `wiring`: orchestrator-owned wiring state — the SPSC queue, a local batch
-  buffer, and backoff counters.
-- `initial_ready[]`, `initial_ready_count`: the handoff array of tasks that
-  are ready at wiring time, consumed by the schedulers.
+- `initial_ready[]`, `initial_ready_count`: the handoff array of tasks whose
+  fanin is already satisfied when `submit_task` returns, consumed by the
+  schedulers.
 - `gm_heap_base`, `gm_heap_size`: GM heap for output buffers.
 
 ### 7.2 Task Submission Flow (`submit_task`)
 
 | Step | Operation |
 | ---- | --------- |
-| 1 | `PTO2TaskAllocator::alloc` — bump a task slot + heap buffer (fatal on overflow) |
-| 2 | Initialize the descriptor + slot state, copy parameters |
-| 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
-| 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 5 | **Push to wiring queue**: push the task into the orchestrator's own `wiring.queue` (SPSC). Fanout wiring is deferred to `run_wiring()`. |
+| 1 | `PTO2TaskAllocator::alloc` — bump a task slot + heap buffer (fatal on overflow); bind the slot's payload/task pointers |
+| 2 | **Wire fanin**: for each explicit dep and each INPUT/INOUT producer found in TensorMap, call `append_fanin_or_fail` to build the graph edge in-line (see §7.3) |
+| 3 | **Insert**: register OUTPUT/INOUT args in TensorMap |
+| 4 | **Materialize payload**: `payload.init` copies tensors/scalars and zeroes the early-dispatch counters |
+| 5 | **Seed initial-ready**: if `fanin_count == 0` (no pending-producer edges remain), append the task to `initial_ready[]` |
 
-`submit_task` never touches `fanout_head` or allocates from `dep_pool` —
-all of that happens in the wiring pass after orchestration finishes.
+`submit_task` builds the whole dependency graph as it runs — there is no
+separate wiring pass after orchestration. The fanin loop never touches the
+payload (already-complete producers are not counted), so `payload.init` simply
+runs after registration; the scheduler later seeds `dispatch_fanin` via
+`propagate_dispatch_fanin`.
 
-### 7.3 Wiring (`run_wiring`, orchestrator-owned)
+### 7.3 In-line Wiring (`append_fanin_or_fail`)
 
-After the orchestration function returns, the orchestrator drains its wiring
-queue and wires every task's fanout edges. Wiring is fully decoupled from
-the scheduler — schedulers only read the result.
+For each distinct producer of the task being submitted, `append_fanin_or_fail`
+wires one graph edge. Producers are deduped per-submit via `fanin_seen_epoch`
+(a duplicate producer returns early). For a fresh producer:
 
-`wire_task(dep_pool, ws, wfanin)`:
+1. If the producer is already `>= COMPLETED` (only inline-completed alloc
+   tasks during the orch phase), the dependency is already satisfied, so it is
+   **not counted at all** — `fanin_count` / `fanin_refcount` / `dispatch_fanin`
+   track only pending producers. No fanout edge is built either (such a
+   producer never fires `on_task_complete`).
+2. Otherwise the producer is still PENDING: `consumer->fanin_count++` (one
+   pending producer edge), then prepend this consumer to the producer's
+   `fanout_head` via `dep_pool.prepend`. No lock is taken — wiring is
+   single-threaded and runs entirely before the scheduler starts, so
+   `fanout_head` has no concurrent reader (the orch→sched barrier is §8.2).
+   `dep_pool` is never reclaimed during the orch phase, so its capacity must
+   hold every fanout edge; overflow is fatal.
 
-1. Set `fanin_count = wfanin + 1` (the +1 sentinel prevents premature
-   readiness).
-2. For each producer in the task's fanin slot states:
-   - If the producer is already `>= COMPLETED` (only inline-completed alloc
-     tasks during this phase), count it as `early_finished`.
-   - Otherwise prepend this consumer to the producer's `fanout_head` via
-     `dep_pool.prepend`. No lock is taken: wiring is single-threaded and runs
-     entirely before the scheduler starts, so `fanout_head` has no concurrent
-     reader (the orch→sched barrier is §8.2).
-3. Release `early_finished + 1` into `fanin_refcount` via `fetch_add`.
-4. If `fanin_refcount >= fanin_count`, append the task to `initial_ready[]`.
-
-A task with zero fanins releases the +1 sentinel and goes straight into
+After the fanin loop, `submit_task` checks `fanin_count == 0`: a task with no
+pending producers — either it had no producers at all, or every producer was
+an already-complete alloc (none counted) — is appended straight to
 `initial_ready[]`.
-
-`run_wiring()` calls `drain_wiring_queue(force_drain=true)` until the queue
-is empty. The dep pool cannot be reclaimed here (no task is COMPLETED yet),
-so its capacity must hold every fanout edge; overflow is fatal. The SPSC
-queue is retained (rather than collapsed into `submit_task`) so submit and
-wiring can be pipelined if the orchestrator ever runs multi-threaded.
 
 ### 7.4 Scope Mechanism (`PTO2_SCOPE`)
 
@@ -445,7 +440,8 @@ Each scheduler thread runs a tight loop with two phases:
   which:
   1. Stores `task_state = COMPLETED`.
   2. Reads `fanout_head` directly (lock-free): it was frozen by the orch
-     wiring pass before `orchestrator_done_` was released, so there is no
+     phase (built in-line by `submit_task`) before `orchestrator_done_` was
+     released, so there is no
      concurrent writer. The per-task spinlock that previously guarded it was
      dropped in the single-shot model — it MUST be restored before any
      orch/sched time-overlap (stage-3 ping-pong).
@@ -598,7 +594,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 4. `dlsym("aicpu_orchestration_config")` returns configuration.
 5. `dlsym("aicpu_orchestration_entry")` returns the orchestration function.
 6. Thread 3 creates a `PTO2Runtime` and calls the orchestration function
-   within a `PTO2_SCOPE`, then `run_wiring()`.
+   within a `PTO2_SCOPE`; each `submit_task` builds its graph edges in-line.
 7. After orchestration: `dlclose`, delete the temp file.
 
 ### 10.3 Thread Startup Synchronization
@@ -617,7 +613,8 @@ Startup sequence:
    `pto2_init_complete_`; others wait.
 3. Thread 3: wait for `pto2_init_complete_` → configure
    orchestrator/scheduler pointers.
-4. Thread 3: run orchestration → `run_wiring()` → set `orchestrator_done_`.
+4. Thread 3: run orchestration (graph wired in-line by `submit_task`) → set
+   `orchestrator_done_`.
 5. Scheduler threads: seed `initial_ready[]`, then enter the dispatch loop.
 
 ---

@@ -186,7 +186,6 @@ TEST(RuntimeArenaLayout, ConfigInitializesRuntimeComponents) {
     EXPECT_EQ(layout.dep_pool_capacity, dep_cap);
     EXPECT_EQ(rt->orchestrator.task_allocator.window_size(), static_cast<int32_t>(ws));
     EXPECT_EQ(rt->orchestrator.task_allocator.heap_capacity(), heap);
-    EXPECT_EQ(rt->orchestrator.fanin_pool.capacity, dep_cap);
     EXPECT_EQ(rt->orchestrator.dep_pool.capacity, dep_cap);
 }
 

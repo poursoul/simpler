@@ -565,12 +565,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
 
-            // replay_graph stage 1: wiring is an orchestrator step that runs after
-            // all submit_task calls. Single-threaded for now (submit fully precedes
-            // wiring); drains the wiring queue, builds the fanout graph in the
-            // orchestrator's dep_pool, and fills the initial_ready handoff — all
-            // before on_orchestration_done releases the scheduler threads.
-            rt->orchestrator.run_wiring();
+            // replay_graph: submit_task builds the dependency graph in-line, so by
+            // the time orch_func_ returns the fanout lists in dep_pool and the
+            // initial_ready handoff are fully populated — no separate wiring pass.
+            // mark_done (below, via rt_orchestration_done) then releases the
+            // scheduler threads.
 
             // Flush the (potentially partially-filled) DepGenBuffer so the host
             // collector can pick it up before this orchestrator thread joins.

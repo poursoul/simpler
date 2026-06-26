@@ -803,7 +803,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
     // replay_graph stage 1: run orch fully before sched. One-time init above
     // already published pto2_init_complete_, which unblocks the orchestrator's
-    // wait_pto2_init_complete() so it can run submit + wiring. Now wait until the
+    // wait_pto2_init_complete() so it can run submit (which builds the dependency
+    // graph in-line). Now wait until the
     // orchestrator publishes the dependency graph (orchestration_done_), then seed
     // the initial-ready handoff into the ready queues exactly once. Other
     // scheduler threads skip the seed and pick the tasks up by polling the ready
@@ -1054,10 +1055,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         int wired = 0;
 #if PTO2_PROFILING
         CYCLE_COUNT_LAP(l2_swimlane.sched_wiring_cycle);
-        // Wire outer phase: emit one bar covering this iter's drain_wiring_queue
-        // pass when it wired any tasks. tasks_processed = wired count. Resolve
-        // does NOT nest under Wire — wiring only enqueues, the consumer release
-        // happens later in Complete/Dummy.
+        // Wire outer phase: historically emitted one bar per scheduler-side
+        // wiring pass. Wiring now runs entirely in the orchestrator, so `wired`
+        // is always 0 and this bar is never emitted (kept for the profiling
+        // shape only). Resolve does NOT nest under Wire.
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && wired > 0) {
             int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
             capture_local_snapshot(phase_end_local);

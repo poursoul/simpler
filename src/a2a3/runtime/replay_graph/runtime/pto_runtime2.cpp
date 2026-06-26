@@ -99,7 +99,6 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, const c
     constexpr int kSegmentCap = 64;
     const PTO2TaskSlotState *seg[kSegmentCap];
     int seg_count = 0;
-    bool signaled = false;
     bool failed = false;
 
     auto wait_one_producer = [&](const PTO2TaskSlotState &slot) {
@@ -138,10 +137,6 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, const c
             if (failed) return;
         }
         seg[seg_count++] = &s;
-        if (!signaled) {
-            orch.wiring.orch_needs_drain.store(true, std::memory_order_release);
-            signaled = true;
-        }
     };
 
     auto do_wait = [&]() {
@@ -164,9 +159,6 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, const c
     };
 
     do_wait();
-    if (signaled) {
-        orch.wiring.orch_needs_drain.store(false, std::memory_order_release);
-    }
     return !failed;
 }
 MAYBE_UNINITIALIZED_END

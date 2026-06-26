@@ -197,11 +197,10 @@ PTO2Runtime *runtime_init_data_from_layout(
 
 /**
  * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
- * rt->aicore_mailbox, orchestrator.{scheduler, tensor_map.*,
- * ring.fanin_pool.base}, scheduler.{ready_queues, dep_pool,
- * wiring.queue}) so each holds arena.base() + offset. Idempotent — runs on
- * both host (writing host-mirror addresses) and AICPU (writing device
- * addresses) sides.
+ * rt->aicore_mailbox, orchestrator.{scheduler, tensor_map.*, dep_pool.base,
+ * initial_ready}, scheduler.ready_queues) so each holds arena.base() + offset.
+ * Idempotent — runs on both host (writing host-mirror addresses) and AICPU
+ * (writing device addresses) sides.
  */
 void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
 

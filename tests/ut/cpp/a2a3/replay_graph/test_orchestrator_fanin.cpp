@@ -70,7 +70,13 @@ TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     auto &producer_slot = sm_handle->header->get_slot_state_by_task_id(producer.task_id().local());
     auto &consumer_slot = sm_handle->header->get_slot_state_by_task_id(consumer.task_id().local());
 
-    ASSERT_NE(consumer_slot.payload, nullptr);
-    EXPECT_EQ(consumer_slot.payload->fanin_count, 1);
-    EXPECT_EQ(consumer_slot.payload->fanin_inline_slot_states[0], &producer_slot);
+    // The duplicate explicit dep is deduped: exactly one producer edge.
+    EXPECT_EQ(consumer_slot.fanin_count, 1);
+    // The producer is still PENDING (dummy task), so the consumer was wired as a
+    // fanout successor rather than counted as already-satisfied.
+    EXPECT_EQ(consumer_slot.fanin_refcount.load(), 0);
+    ASSERT_NE(producer_slot.fanout_head, nullptr);
+    EXPECT_EQ(producer_slot.fanout_head->slot_state, &consumer_slot);
+    // Deduped: only one fanout entry on the producer.
+    EXPECT_EQ(producer_slot.fanout_head->next, nullptr);
 }

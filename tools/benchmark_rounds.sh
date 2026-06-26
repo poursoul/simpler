@@ -49,6 +49,16 @@ TMR_EXAMPLE_ORDER=(
     spmd_paged_attention
 )
 
+# --- replay_graph (single-shot: one orch build, many sched runs) ---
+# Only paged_attention_unroll is ported so far. Case1 is auto-scope; Case2/Case3
+# are manual-scope (run_bench adds --manual include for every named case).
+declare -A REPLAY_GRAPH_EXAMPLE_CASES=(
+    [paged_attention_unroll]="Case1,Case2,Case3"
+)
+REPLAY_GRAPH_EXAMPLE_ORDER=(
+    paged_attention_unroll
+)
+
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
@@ -92,7 +102,7 @@ Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
-  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default)
+  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default) or replay_graph
   -v, --verbose  Save detailed test_*.py output to a timestamped log file
   -h, --help     Show this help
 
@@ -154,8 +164,12 @@ case "$RUNTIME" in
         declare -n EXAMPLE_CASES=TMR_EXAMPLE_CASES
         EXAMPLE_ORDER=("${TMR_EXAMPLE_ORDER[@]}")
         ;;
+    replay_graph)
+        declare -n EXAMPLE_CASES=REPLAY_GRAPH_EXAMPLE_CASES
+        EXAMPLE_ORDER=("${REPLAY_GRAPH_EXAMPLE_ORDER[@]}")
+        ;;
     *)
-        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer."
+        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer or replay_graph."
         exit 1
         ;;
 esac

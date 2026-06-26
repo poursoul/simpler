@@ -164,10 +164,12 @@ This project-defined flattened numbering is kept unchanged.
 
 1. Validate submit arguments.
 2. Allocate mixed-task ID and initialize descriptor/payload/slot_state once.
-3. Lookup producers via TensorMap; collect fanin metadata and increment producers' `fanout_count`.
-4. Push task to the orchestrator's own wiring queue; after orchestration
-   finishes, `run_wiring()` wires fanout edges and produces the initial-ready
-   handoff (the scheduler only reads it).
+3. Lookup producers via TensorMap and wire the dependency graph in-line: for
+   each pending producer bump `fanin_count` and prepend a fanout edge in
+   `dep_pool`; an already-complete (inline alloc) producer is not counted.
+4. If the task has no pending producers it is appended to the initial-ready
+   handoff array, which the scheduler seeds into its ready queues before
+   dispatch (the scheduler only reads it).
 5. Dispatch all active lanes atomically when resources allow.
 6. Aggregate completion and release downstream once.
 

@@ -147,18 +147,10 @@ PTO2OrchestratorLayout
 PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_window_size, int32_t dep_pool_capacity) {
     PTO2OrchestratorLayout layout{};
     layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
-    // Under run-orch-fully-then-sched, run_wiring drains the wiring queue only
-    // after every task has been submitted, so it must hold the whole-graph task
-    // upper bound without wrapping — the same bound used for initial_ready below.
-    layout.spsc_capacity = PTO2_SCOPE_TASKS_CAP;
     // Initial-ready upper bound: every task could be initially ready. Bound it by
     // the whole-graph task upper bound (PTO2_SCOPE_TASKS_CAP = window size).
     layout.initial_ready_cap = PTO2_SCOPE_TASKS_CAP;
     layout.dep_pool_capacity = dep_pool_capacity;
-
-    const size_t fanin_pool_bytes =
-        PTO2_ALIGN_UP(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-    layout.off_fanin_pool = arena.reserve(fanin_pool_bytes, PTO2_ALIGN_SIZE);
 
     // Fanout dep_pool entries, moved off the scheduler layout (replay_graph
     // stage 1). Cache-line aligned base so the single-writer orch wiring does
@@ -171,7 +163,6 @@ PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_window_si
         PTO2_ALIGN_UP(static_cast<size_t>(task_window_size) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
     layout.off_fanin_seen_epoch = arena.reserve(seen_epoch_bytes, PTO2_ALIGN_SIZE);
 
-    layout.off_wiring_spsc_buffer = PTO2SpscQueue::reserve_layout(arena, PTO2_SCOPE_TASKS_CAP);
     layout.off_initial_ready = arena.reserve(
         static_cast<size_t>(layout.initial_ready_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
     );
@@ -184,9 +175,8 @@ bool PTO2OrchestratorState::init_data_from_layout(
     uint64_t task_window_size
 ) {
     auto *orch = this;
-    // Default-construct in place: PTO2OrchestratorState is no longer copy-assignable
-    // (the orchestrator-owned wiring SPSC queue holds std::atomics). Placement new
-    // preserves member default initializers (e.g. fanin_seen_current_epoch{1}).
+    // Default-construct in place so member default initializers (e.g.
+    // fanin_seen_current_epoch{1}) are applied.
     new (orch) PTO2OrchestratorState{};
 
     orch->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
@@ -198,12 +188,6 @@ bool PTO2OrchestratorState::init_data_from_layout(
     auto *task_count_dev = pto2_sm_layout::task_count_addr(sm_dev_base);
 
     orch->task_allocator.init(static_cast<int32_t>(task_window_size), task_count_dev, gm_heap, heap_size, orch_err);
-
-    const size_t fanin_pool_bytes =
-        PTO2_ALIGN_UP(static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-    auto *fanin_entries = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool));
-    memset(fanin_entries, 0, fanin_pool_bytes);
-    orch->fanin_pool.init(fanin_entries, layout.dep_pool_capacity, orch_err);
 
     // Fanout dep_pool, moved off the scheduler (replay_graph stage 1).
     auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
@@ -224,13 +208,6 @@ bool PTO2OrchestratorState::init_data_from_layout(
     orch->scope_stack_capacity = layout.scope_stack_capacity;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
 
-    // Wiring SPSC queue + initial-ready handoff (moved off the scheduler).
-    if (!orch->wiring.queue.init_data_from_layout(arena, layout.off_wiring_spsc_buffer, layout.spsc_capacity)) {
-        return false;
-    }
-    orch->wiring.batch_count = 0;
-    orch->wiring.batch_index = 0;
-    orch->wiring.backoff_counter = 0;
     orch->initial_ready_count = 0;
     orch->initial_ready_capacity = layout.initial_ready_cap;
 
@@ -241,10 +218,8 @@ void PTO2OrchestratorState::wire_arena_pointers(
     const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler_arg
 ) {
     auto *orch = this;
-    orch->fanin_pool.base = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool));
     orch->dep_pool.base = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
     orch->fanin_seen_epoch = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch));
-    orch->wiring.queue.wire_arena_pointers(arena, layout.off_wiring_spsc_buffer);
     orch->initial_ready = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_initial_ready));
     orch->tensor_map.wire_arena_pointers(layout.tensor_map, arena);
     orch->scheduler = scheduler_arg;
@@ -253,10 +228,8 @@ void PTO2OrchestratorState::wire_arena_pointers(
 void PTO2OrchestratorState::destroy() {
     auto *orch = this;
     orch->tensor_map.destroy();
-    orch->fanin_pool.base = nullptr;
     orch->dep_pool.base = nullptr;
     orch->fanin_seen_epoch = nullptr;
-    orch->wiring.queue.destroy();
     orch->initial_ready = nullptr;
 }
 

@@ -10,8 +10,8 @@
 # ---------------------------------------------------------------------------
 # replay_graph runtime UTs — mirror of the a2a3 trb runtime UTs (tests/ut/cpp/
 # a2a3/*.cpp) but linked against the replay_graph runtime. replay_graph uses the
-# run-orch-fully-then-sched model: wiring (wire_task / drain_wiring_queue / the
-# SPSC queue) lives in the orchestrator, not the scheduler.
+# run-orch-fully-then-sched model: the orchestrator's submit_task builds the
+# fanout dependency graph in-line, and the scheduler only consumes it.
 #
 # Tests are auto-discovered: drop a `test_<name>.cpp` into this directory and it
 # is picked up on the next build as target `test_rg_<name>` — no CMake edit

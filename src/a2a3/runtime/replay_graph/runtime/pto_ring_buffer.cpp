@@ -11,7 +11,7 @@
 /**
  * PTO Runtime2 - Ring Buffer Implementation
  *
- * FaninPool / DepListPool / TaskAllocator are all single-shot pure-bump
+ * DepListPool and TaskAllocator are single-shot pure-bump
  * allocators in the replay_graph model: the arena fills exactly once, never
  * wraps, and nothing is reclaimed during the orch phase. All allocation and
  * traversal logic is therefore inline in pto_ring_buffer.h; this translation

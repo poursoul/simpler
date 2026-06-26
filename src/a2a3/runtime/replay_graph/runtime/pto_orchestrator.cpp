@@ -223,63 +223,48 @@ static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
     return next;
 }
 
-struct PTO2FaninBuilder {
-    PTO2FaninBuilder(PTO2OrchestratorState *orch, PTO2FaninPool &spill_pool, uint32_t seen_epoch) :
-        count(0),
-        spill_start(0),
-        orch(orch),
-        seen_epoch(seen_epoch),
-        spill_pool(spill_pool) {}
-    int32_t count{0};
-    int32_t spill_start{0};
-    PTO2OrchestratorState *orch{nullptr};
-    uint32_t seen_epoch{0};
-    PTO2FaninPool &spill_pool;
-    PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
-
-    template <typename Fn>
-    PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
-        return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
-    }
-
-    bool mark_seen(int32_t prod_slot) {
-        if (prod_slot < 0) {
-            return false;
-        }
-        uint32_t *seen = orch->fanin_seen_epoch;
-        uint32_t slot = static_cast<uint32_t>(prod_slot);
-        if (seen[slot] == seen_epoch) {
-            return true;
-        }
-        seen[slot] = seen_epoch;
-        return false;
-    }
-};
-
+// Build one producer edge into the graph as part of submit_task. For each
+// distinct producer of `consumer` (deduped per-submit via the seen_epoch
+// stamp), this either bumps the consumer's fanin satisfaction (producer already
+// inline-completed) or appends the consumer to the producer's fanout list
+// (producer still pending). Inlines the work that the deferred wire_task used to
+// do, so the dependency graph is fully built by the time submit_task returns.
+//
+// Producers are PENDING during the orch phase EXCEPT inline-completed alloc
+// (accumulator) tasks: those complete inline in alloc_tensors, never enter
+// dispatch, and never fire on_task_complete — so seeding the consumer's
+// fanin_refcount/dispatch_fanin here is the only way their consumers learn the
+// dependency is already satisfied.
 static bool append_fanin_or_fail(
-    PTO2OrchestratorState *orch, int32_t prod_slot, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder
+    PTO2OrchestratorState *orch, PTO2TaskSlotState *consumer, int32_t prod_slot, PTO2TaskSlotState *prod_state,
+    uint32_t seen_epoch
 ) {
-    if (fanin_builder->mark_seen(prod_slot)) {
+    if (prod_slot < 0) {
+        return true;
+    }
+    uint32_t *seen = orch->fanin_seen_epoch;
+    uint32_t slot = static_cast<uint32_t>(prod_slot);
+    if (seen[slot] == seen_epoch) {
+        return true;  // already counted this producer for this consumer
+    }
+    seen[slot] = seen_epoch;
+
+    int32_t pstate = prod_state->task_state.load(std::memory_order_acquire);
+    if (pstate >= PTO2_TASK_COMPLETED) {
+        // Inline-completed alloc producer: the dependency is already satisfied,
+        // so it contributes nothing to the consumer's readiness. fanin_count /
+        // fanin_refcount / dispatch_fanin all track only the still-pending
+        // producers — count nothing and build no fanout edge here (the producer
+        // never fires on_task_complete anyway).
         return true;
     }
 
-    if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
-        fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
-        return true;
-    }
-
-    PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
-    int32_t spill_idx = fanin_pool.top;
-    PTO2FaninSpillEntry *entry = fanin_pool.alloc();
-    if (entry == nullptr) {
-        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
-        return false;
-    }
-    if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) {
-        fanin_builder->spill_start = spill_idx;
-    }
-    entry->slot_state = prod_state;
-    fanin_builder->count++;
+    // Producer still pending: it gates the consumer's readiness. Count it toward
+    // fanin_count and record the consumer as a successor edge so the producer's
+    // completion releases it. Single-shot: the dep_pool is never reclaimed, so
+    // overflow is fatal rather than a back-pressure spin.
+    consumer->fanin_count++;
+    prod_state->fanout_head = orch->dep_pool.prepend(prod_state->fanout_head, consumer);
     return true;
 }
 
@@ -329,14 +314,15 @@ static bool prepare_task(
     // here lets SM init skip the O(window_size) bind loop.
     // Both writes hit the same 64B slot_state cache line we're about to
     // dirty below, so the extra cost is two stores on an already-hot line.
-    // Must precede the scheduler wiring.queue.push at the end of
-    // submit_task_common — that push is the first read of slot_state->task /
-    // slot_state->payload by another thread.
+    // Binds the slot's payload/task pointers; the scheduler reads slot_state->
+    // payload during dispatch, and PTO2TaskPayload::init populates that payload
+    // later in submit_task_common.
     out->slot_state->bind_buffers(out->payload, out->task);
 
     // prepare_task does NO payload writes: all payload content (tensors/scalars +
     // early-dispatch spec fields) is initialized in PTO2TaskPayload::init, the
-    // single payload-init point, which runs before the scheduler wiring push.
+    // single payload-init point, which runs in submit_task_common after the
+    // fanin loop + output registration.
 
     // The single-shot replay model fills each slot exactly once. Dynamic slot
     // fields (fanout_head, fanin_refcount, completed_subtasks,
@@ -349,7 +335,8 @@ static bool prepare_task(
         static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
-    // fanin_count is set by scheduler during wiring
+    // fanin_count / fanin_refcount accumulate from their SM-init zero state as
+    // submit_task_common's fanin loop wires each producer edge.
 
     return true;
 }
@@ -444,9 +431,10 @@ void PTO2OrchestratorState::end_scope() {
 
 // Shared body for submit_task / submit_dummy_task. Caller has already validated
 // args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
-// kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
-// computation (explicit_deps + auto), output registration, slot init, and pushes
-// to the scheduler wiring queue.
+// kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, builds
+// the dependency graph in-line (explicit_deps + auto: fanout edges + fanin
+// refcount seeding), output registration, slot init, and seeds the
+// initial-ready handoff for tasks whose fanin is already satisfied.
 static TaskOutputTensors submit_task_common(
     PTO2OrchestratorState *orch, const L0TaskArgs &args, ActiveMask active_mask, int32_t aic_kernel_id,
     int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
@@ -498,7 +486,7 @@ static TaskOutputTensors submit_task_common(
         );
     }
 
-    PTO2FaninBuilder fanin_builder(orch, orch->fanin_pool, next_fanin_seen_epoch(orch));
+    uint32_t seen_epoch = next_fanin_seen_epoch(orch);
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
@@ -521,7 +509,7 @@ static TaskOutputTensors submit_task_common(
         int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
         int32_t dep_slot = dep_hdr.get_slot_by_task_id(dep_local_task_id);
         PTO2TaskSlotState *producer_slot_state = &dep_hdr.get_slot_state_by_slot(dep_slot);
-        if (!append_fanin_or_fail(orch, dep_slot, producer_slot_state, &fanin_builder)) {
+        if (!append_fanin_or_fail(orch, &cur_slot_state, dep_slot, producer_slot_state, seen_epoch)) {
             return result;
         }
     }
@@ -536,7 +524,7 @@ static TaskOutputTensors submit_task_common(
         PTO2SharedMemoryHeader &producer_hdr = *orch->sm_header;
         int32_t prod_slot = producer_hdr.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
         PTO2TaskSlotState *prod_state = &producer_hdr.get_slot_state_by_slot(prod_slot);
-        return append_fanin_or_fail(orch, prod_slot, prod_state, &fanin_builder);
+        return append_fanin_or_fail(orch, &cur_slot_state, prod_slot, prod_state, seen_epoch);
     };
 
     if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
@@ -561,16 +549,6 @@ static TaskOutputTensors submit_task_common(
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    // Store fanin metadata in payload for scheduler to iterate
-    payload.fanin_count = fanin_builder.count;
-    payload.fanin_spill_start = fanin_builder.spill_start;
-    payload.fanin_spill_pool = &fanin_builder.spill_pool;
-    for (int i = 0; i < inline_count; i++) {
-        payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
-    }
-
-    payload.init(args, result, prepared.alloc_result, layout);
 #if PTO2_PROFILING
     if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
@@ -588,15 +566,24 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
+    // Materialize the dispatch-time tensor/scalar data (also zeroes dispatch_fanin,
+    // which the scheduler's propagate_dispatch_fanin later bumps). Runs after the
+    // fanin loop + output registration — the submit-time wiring above never touches
+    // the payload (already-complete producers are not counted; see
+    // append_fanin_or_fail).
+    payload.init(args, result, prepared.alloc_result, layout);
+
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
-    // === STEP 6: push to the orchestrator-owned wiring queue ===
-    // submit_task only stores dependency metadata; it pushes the task into the
-    // orchestrator's own wiring queue. The actual fanout_head wiring (dep_pool +
-    // early_finished) runs later in run_wiring(), after orchestration
-    // completes (replay_graph stage 1).
-    while (!orch->wiring.queue.push(&cur_slot_state)) {
-        SPIN_WAIT_HINT();
+    // === STEP 6: seed the initial-ready handoff ===
+    // The fanout graph is already built (append_fanin_or_fail wired every edge
+    // during the fanin loop above). fanin_count tracks only pending producers, so
+    // it reaching 0 means there are no unsatisfied dependencies — either the task
+    // had no producers at all, or every producer was an already-complete inline
+    // alloc (which counts toward neither fanin_count nor fanin_refcount).
+    // Equivalent to the old wire_task's ready push.
+    if (cur_slot_state.fanin_count == 0) {
+        orch->push_initial_ready(&cur_slot_state);
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
@@ -768,9 +755,6 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     TaskOutputTensors outputs;
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
-    payload.fanin_count = 0;
-    payload.fanin_spill_start = 0;
-    payload.fanin_spill_pool = &orch->fanin_pool;
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {
@@ -778,7 +762,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         // consumer can exist, so they have no fanout to notify and no worker
         // subtasks to retire. Running the full on_task_complete path would only
         // pay unnecessary fanout traversal overhead here. Consumers learn the
-        // dependency is already satisfied via wire_task's early_finished check;
+        // dependency is already satisfied via append_fanin_or_fail's
+        // already-completed-producer check (it seeds fanin_refcount/dispatch_fanin
+        // directly instead of building a fanout edge);
         // these slots stay COMPLETED (the single-shot model never retires them),
         // and worker dispatch fields are never observed for hidden alloc tasks.
         prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
@@ -809,11 +795,11 @@ void PTO2OrchestratorState::mark_done() {
     if (total_tasks > 0) {
         LOG_INFO_V0("=== [Orchestrator] total_tasks=%d ===", total_tasks);
     }
-    auto &fanin_pool = orch->fanin_pool;
-    if (fanin_pool.top > 1) {
+    auto &dep_pool = orch->dep_pool;
+    if (dep_pool.top > 1) {
         LOG_INFO_V0(
-            "=== [FaninPool] top=%d tail=%d used=%d high_water=%d capacity=%d ===", fanin_pool.top, fanin_pool.tail,
-            fanin_pool.top - fanin_pool.tail, fanin_pool.high_water, fanin_pool.capacity
+            "=== [DepPool] top=%d tail=%d used=%d high_water=%d capacity=%d ===", dep_pool.top, dep_pool.tail,
+            dep_pool.top - dep_pool.tail, dep_pool.high_water, dep_pool.capacity
         );
     }
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);

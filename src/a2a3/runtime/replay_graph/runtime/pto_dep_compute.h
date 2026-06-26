@@ -32,12 +32,13 @@
  *   bool emit(PTO2TaskId producer);
  *     - return true to continue (whether or not the producer was actually recorded —
  *       producer-not-alive / dedup-hit / etc. all return true silently)
- *     - return false to signal fatal (e.g. fanin spill overflow); caller bails
+ *     - return false to signal fatal (e.g. dep_pool overflow); caller bails
  *
  * Performance: Emit is a template parameter, not std::function. Both runtime
- * (lambda capturing fanin_builder + sm_header) and replay (lambda capturing edge
- * vector) instantiate at the call site and inline through. Do NOT replace with
- * std::function — it would break the inlining and add ~5 ns/call to the orch hot path.
+ * (lambda calling append_fanin_or_fail with the consumer slot + seen_epoch) and
+ * replay (lambda capturing edge vector) instantiate at the call site and inline
+ * through. Do NOT replace with std::function — it would break the inlining and
+ * add ~5 ns/call to the orch hot path.
  */
 
 #ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_DEP_COMPUTE_H_

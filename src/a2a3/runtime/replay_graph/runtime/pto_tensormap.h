@@ -18,8 +18,9 @@
  *
  * Key design features:
  * 1. Bump-allocated entry pool with a free list (no malloc/free)
- * 2. Single-shot lifetime: the orch phase never retires tasks, so every
- *    inserted entry stays valid for the life of the map (no lazy invalidation)
+ * 2. Single-shot lifetime: no lazy invalidation. An entry leaves the map only
+ *    when explicitly removed (dep_compute drops a COVERED-redundant entry);
+ *    there is no per-entry validity flag.
  * 3. OVERLAP DETECTION: Detects dependencies for overlapping sub-regions
  *
  * Hash table with chaining:
@@ -455,8 +456,7 @@ struct PTO2TensorMap {
      * Lookup producer for a tensor region
      *
      * Searches the hash table for matching regions and invokes the callback
-     * for each overlapping valid entry.
-     * Stale entries from different rings are skipped (not truncated).
+     * for each overlapping entry.
      *
      * The callback receives (PTO2TensorMapEntry &, OverlapStatus) and should
      * return true to continue iteration, false to stop early. It is safe for
@@ -482,17 +482,10 @@ struct PTO2TensorMap {
 #if PTO2_TENSORMAP_PROFILING
             chain_len++;
 #endif
-            // Skip stale entries (no chain truncation — entries from different
-            // rings can be interleaved, so a stale entry from one ring does NOT
-            // imply subsequent entries from other rings are also stale)
-            if (!entry_valid(*cur_entry)) {
-                cur_entry = next_entry;
-                continue;
-            }
 
-            // Entry is valid - check if regions OVERLAP (not just exact match)
-            // Since we hash only by base_ptr, all entries in this bucket have
-            // potential to overlap. We must check actual byte-range overlap.
+            // Check if regions OVERLAP (not just exact match). Since we hash
+            // only by base_ptr, all entries in this bucket have potential to
+            // overlap. We must check actual byte-range overlap.
             if (tensor.buffer.addr == cur_entry->buffer_addr) {
 #if PTO2_TENSORMAP_PROFILING
                 g_lookup_overlap_checks++;
@@ -524,7 +517,7 @@ struct PTO2TensorMap {
     /**
      * Insert a new entry (called when task produces output)
      *
-     * Allocates from ring buffer pool, may overwrite stale entries.
+     * Allocates from the entry pool (free list, then bump).
      * Inserts at head of hash bucket chain (maintains task_id ordering).
      *
      * @param tensor            Tensor produced
@@ -572,18 +565,6 @@ struct PTO2TensorMap {
         }
         buckets[bucket_index] = entry;
         entry->prev_in_bucket = nullptr;
-    }
-
-    /**
-     * Check if entry is valid (producer has not retired).
-     *
-     * In the single-shot replay model the orch phase never retires tasks, so
-     * no entry is ever invalidated — every inserted entry stays valid for the
-     * life of the map.
-     */
-    bool entry_valid(const PTO2TensorMapEntry &entry) const {
-        (void)entry;
-        return true;
     }
 
     void remove_entry(PTO2TensorMapEntry &entry) { free_entry(entry); }

@@ -356,8 +356,8 @@ static_assert(
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
  *
  * Consolidates all hot-path scheduling fields into a single cache-friendly
- * structure (32 bytes = half a cache line). Accessing any field of a task's
- * slot state brings all related fields into the same cache line.
+ * structure (one 64-byte cache line; alignas(64) below). Accessing any field
+ * of a task's slot state brings all related fields into the same cache line.
  *
  * Concurrency notes:
  * - fanout_head is built solely by the orchestrator's wire_task during the
@@ -370,12 +370,6 @@ static_assert(
  * - task_state, fanin_refcount updated atomically
  */
 struct alignas(64) PTO2TaskSlotState {
-    // Reclaim/reuse-lifecycle fields fanout_count and fanout_lock were removed
-    // (the latter dropped in the single-shot replay model, where fanout_head is
-    // frozen before sched starts); this 8-byte padding preserves the original
-    // field offsets (fanout_head stays at offset 8).
-    uint8_t _pad_reclaim0[8];
-
     PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
     // Task state (completion, ready check)
@@ -384,10 +378,6 @@ struct alignas(64) PTO2TaskSlotState {
     // Fanin (accessed together in release_fanin_and_check_ready)
     std::atomic<int32_t> fanin_refcount;  // Dynamic: counts completed producers
     int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
-
-    // Reclaim-lifecycle field fanout_refcount was removed in the single-shot
-    // replay model; this 4-byte padding preserves the 64-byte layout.
-    uint8_t _pad_reclaim1[4];
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
     // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
@@ -403,16 +393,10 @@ struct alignas(64) PTO2TaskSlotState {
     // Set by any subtask FIN that pushed deferred-completion CONDITIONs to
     // the runtime mailbox; read by the last subtask FIN to decide whether
     // the task needs MPSC-deferred completion or can complete inline on this
-    // thread. Carved out of the otherwise-padding byte after ring_id to keep
-    // PTO2TaskSlotState at 64 bytes. The write is sequenced before
-    // on_subtask_complete's acq_rel fetch_add and the read after, so all
-    // earlier subtasks' writes are visible to the last subtask.
+    // thread. The write is sequenced before on_subtask_complete's acq_rel
+    // fetch_add and the read after, so all earlier subtasks' writes are
+    // visible to the last subtask.
     std::atomic<bool> any_subtask_deferred{false};
-    uint8_t _async_pad{0};
-    // The reclaim/reuse-lifecycle field dep_pool_mark was removed in the
-    // single-shot replay model (the dep pool is never reclaimed); this 4-byte
-    // padding preserves the 64-byte layout.
-    uint8_t _pad_reclaim2[4];
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
@@ -449,6 +433,9 @@ struct alignas(64) PTO2TaskSlotState {
     // acquire barrier.
 };
 
+// alignas(64) keeps each slot on its own cache line (avoids false sharing
+// between sched threads touching distinct slots); it also rounds the struct
+// up to a full cache line even though the live fields sum to less.
 static_assert(sizeof(PTO2TaskSlotState) == 64);
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_RUNTIME2_TYPES_H_

@@ -182,42 +182,48 @@ struct PTO2OrchestratorState {
         initial_ready[initial_ready_count++] = ws;
     }
 
-    // Wire one task's fanout edges into the given dep_pool and seed its
-    // fanin refcount. Moved off the scheduler (was PTO2SchedulerState::wire_task):
-    // builds fanout linked lists the scheduler later traverses read-only. Producers
-    // are still PENDING during the orch phase except for inline-completed alloc
-    // tasks, so early_finished is normally 0 but the branch is kept for those.
+    // Wire one task's fanout edges into the given dep_pool and seed its fanin
+    // refcount. Moved off the scheduler (was PTO2SchedulerState::wire_task):
+    // builds fanout linked lists the scheduler later traverses read-only.
+    //
+    // Producers are PENDING during the orch phase EXCEPT inline-completed alloc
+    // (accumulator) tasks: those complete inline in alloc_tensors, never enter
+    // wiring/dispatch, and never fire on_task_complete — so early_finished is the
+    // only way their consumers learn the dependency is already satisfied. It stays
+    // even though ordinary producers are never complete here.
     void wire_task(PTO2DepListPool &dep_pool, PTO2TaskSlotState *ws, int32_t wfanin) {
+        ws->fanin_count = wfanin;
+
+        if (wfanin == 0) {
+            push_initial_ready(ws);  // no producers — initially ready
+            return;
+        }
+
         PTO2TaskPayload *wp = ws->payload;
-        ws->fanin_count = wfanin + 1;
-
-        if (wfanin != 0) {
-            int32_t early_finished = 0;
-            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-                // single-shot: fanout_head is frozen before sched starts, so no
-                // lock is needed. MUST restore this lock before any orch/sched
-                // time-overlap (stage-3 ping-pong). wire_task is the sole writer
-                // and runs single-threaded in the orch phase.
-                int32_t pstate = producer->task_state.load(std::memory_order_acquire);
-                if (pstate >= PTO2_TASK_COMPLETED) {
-                    early_finished++;
-                } else {
-                    producer->fanout_head = dep_pool.prepend(producer->fanout_head, ws);
-                }
-            });
-
-            if (early_finished != 0) {
-                wp->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
+        int32_t early_finished = 0;
+        for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+            // single-shot: fanout_head is frozen before sched starts, so no lock
+            // is needed. MUST restore before any orch/sched time-overlap (stage-3
+            // ping-pong). wire_task is the sole writer, single-threaded in orch.
+            int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+            if (pstate >= PTO2_TASK_COMPLETED) {
+                early_finished++;  // inline-completed alloc producer
+            } else {
+                producer->fanout_head = dep_pool.prepend(producer->fanout_head, ws);
             }
+        });
 
-            int32_t init_rc = early_finished + 1;
-            int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
-            if (new_rc >= ws->fanin_count) {
-                push_initial_ready(ws);
+        if (early_finished != 0) {
+            wp->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
+            // No wiring +1: under run-orch-fully-then-sched, wiring never races a
+            // live completion, so the +1 barrier that kept a half-wired task from
+            // reaching ready early is unnecessary. fanin_refcount counts only the
+            // already-completed alloc producers here; the scheduler bumps it once
+            // per live producer completion, reaching wfanin == fanin_count to ready.
+            int32_t new_rc = ws->fanin_refcount.fetch_add(early_finished, std::memory_order_acq_rel) + early_finished;
+            if (new_rc == ws->fanin_count) {
+                push_initial_ready(ws);  // every producer was an already-complete alloc
             }
-        } else {
-            ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            push_initial_ready(ws);
         }
     }
 
@@ -244,7 +250,7 @@ struct PTO2OrchestratorState {
         while (wiring.batch_index < wiring.batch_count) {
             PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
             PTO2DepListPool &dep_pool = this->dep_pool;
-            int32_t wfanin = ws->payload->fanin_actual_count;
+            int32_t wfanin = ws->payload->fanin_count;
             if (wfanin > 0 && dep_pool.available() < wfanin) {
                 report_fatal(
                     PTO2_ERROR_DEP_POOL_OVERFLOW, __FUNCTION__,

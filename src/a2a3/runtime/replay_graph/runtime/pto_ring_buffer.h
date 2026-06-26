@@ -353,8 +353,8 @@ inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(
 template <typename Fn>
 inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
     return for_each_fanin_storage(
-        payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start,
-        *payload.fanin_spill_pool, static_cast<Fn &&>(fn)
+        payload.fanin_inline_slot_states, payload.fanin_count, payload.fanin_spill_start, *payload.fanin_spill_pool,
+        static_cast<Fn &&>(fn)
     );
 }
 

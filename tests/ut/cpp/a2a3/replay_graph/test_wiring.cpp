@@ -111,16 +111,15 @@ TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
     PTO2TaskDescriptor desc{};
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_actual_count = 0;
+    payload.fanin_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
     orch.wire_task(orch.dep_pool, &task_slot, 0);
 
-    // fanin_count set to 0 + 1 = 1 (the wiring "+1" sentinel)
-    EXPECT_EQ(task_slot.fanin_count, 1);
-    // fanin_refcount should be 1 (the +1 from no-fanin path)
-    EXPECT_EQ(task_slot.fanin_refcount.load(), 1);
+    // wfanin == 0 -> fanin_count is 0 (no producers); refcount untouched.
+    EXPECT_EQ(task_slot.fanin_count, 0);
+    EXPECT_EQ(task_slot.fanin_refcount.load(), 0);
 
     // Task should be appended to the orchestrator's initial-ready handoff
     // (wire_task no longer pushes the scheduler's ready_queues directly).
@@ -146,7 +145,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
 
     // Consumer task with 2 fanins
     init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_actual_count = 2;
+    payload.fanin_count = 2;
     payload.fanin_inline_slot_states[0] = &producer_slots[0];
     payload.fanin_inline_slot_states[1] = &producer_slots[1];
 
@@ -155,10 +154,10 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
 
     orch.wire_task(orch.dep_pool, &task_slot, 2);
 
-    // fanin_count = 2 + 1 = 3
-    EXPECT_EQ(task_slot.fanin_count, 3);
-    // early_finished = 2, init_rc = 2 + 1 = 3, so refcount should hit fanin_count
-    EXPECT_GE(task_slot.fanin_refcount.load(), task_slot.fanin_count);
+    // fanin_count = wfanin = 2 (no +1 sentinel)
+    EXPECT_EQ(task_slot.fanin_count, 2);
+    // early_finished = 2, refcount == 2 == fanin_count -> ready
+    EXPECT_EQ(task_slot.fanin_refcount.load(), 2);
 
     // All producers early-finished -> task appended to initial-ready.
     ASSERT_EQ(orch.initial_ready_count, 1);
@@ -182,7 +181,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     }
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_actual_count = 2;
+    payload.fanin_count = 2;
     payload.fanin_inline_slot_states[0] = &producer_slots[0];
     payload.fanin_inline_slot_states[1] = &producer_slots[1];
     task_slot.payload = &payload;
@@ -190,10 +189,10 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 
     orch.wire_task(orch.dep_pool, &task_slot, 2);
 
-    // fanin_count = 3 (2 + 1)
-    EXPECT_EQ(task_slot.fanin_count, 3);
-    // early_finished = 0, init_rc = 1 -> not ready
-    EXPECT_EQ(task_slot.fanin_refcount.load(), 1);
+    // fanin_count = wfanin = 2 (no +1 sentinel)
+    EXPECT_EQ(task_slot.fanin_count, 2);
+    // early_finished = 0 -> wire_task leaves refcount untouched -> not ready
+    EXPECT_EQ(task_slot.fanin_refcount.load(), 0);
     EXPECT_LT(task_slot.fanin_refcount.load(), task_slot.fanin_count);
 
     // Not ready -> nothing appended to initial-ready.
@@ -222,7 +221,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     init_slot(producers[2], PTO2_TASK_COMPLETED, 1);  // early finished (>= COMPLETED)
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_actual_count = 3;
+    payload.fanin_count = 3;
     for (int i = 0; i < 3; i++) {
         payload.fanin_inline_slot_states[i] = &producers[i];
     }
@@ -231,11 +230,11 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 
     orch.wire_task(orch.dep_pool, &task_slot, 3);
 
-    // fanin_count = 4 (3 + 1)
-    EXPECT_EQ(task_slot.fanin_count, 4);
-    // early_finished = 2 (both COMPLETED producers), init_rc = 3
-    // Not yet 4 -> not ready (one producer still running)
-    EXPECT_EQ(task_slot.fanin_refcount.load(), 3);
+    // fanin_count = wfanin = 3 (no +1 sentinel)
+    EXPECT_EQ(task_slot.fanin_count, 3);
+    // early_finished = 2 (both COMPLETED producers) -> refcount = 2
+    // Not yet 3 -> not ready (one producer still running)
+    EXPECT_EQ(task_slot.fanin_refcount.load(), 2);
 
     // Only the running producer should have the consumer in its fanout chain
     EXPECT_EQ(producers[0].fanout_head, nullptr);  // early finished, no dep entry added
@@ -304,7 +303,7 @@ TEST_F(WiringTest, DrainWiringQueueProcessesTasks) {
     PTO2TaskDescriptor desc{};
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_actual_count = 0;
+    payload.fanin_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -327,7 +326,7 @@ TEST_F(WiringTest, DrainWiringQueueBackoffDefers) {
     PTO2TaskDescriptor desc{};
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_actual_count = 0;
+    payload.fanin_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -347,7 +346,7 @@ TEST_F(WiringTest, DrainWiringQueueBackoffLimitForcesProcess) {
     PTO2TaskDescriptor desc{};
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0);
-    payload.fanin_actual_count = 0;
+    payload.fanin_count = 0;
     task_slot.payload = &payload;
     task_slot.task = &desc;
 

@@ -215,8 +215,8 @@ struct PTO2TaskPayload {
     // === Cache lines 0-8 (576B) — metadata + inline fanin ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
-    int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
+    int32_t fanin_count{0};        // Producer-edge count (== slot fanin_count); early-dispatch target
+    int32_t fanin_spill_start{0};  // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
     // Speculative early-dispatch metadata (AICPU-side only). Ordered by descending
@@ -235,7 +235,7 @@ struct PTO2TaskPayload {
     // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
     // seeded at wiring with producers already complete, then a flagged producer's
     // DISPATCH bumps each consumer's dispatch_fanin. dispatch_fanin ==
-    // fanin_actual_count  <=>  every producer is flagged-and-dispatched or was
+    // fanin_count  <=>  every producer is flagged-and-dispatched or was
     // pre-completed  =>  this task is an early-dispatch candidate (push early_dispatch_queue).
     std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: flagged-dispatched + pre-completed producers
     bool allow_early_resolve{false};         // codegen hint copied from Arg in PTO2TaskPayload::init

@@ -563,7 +563,7 @@ static TaskOutputTensors submit_task_common(
 
     int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
     // Store fanin metadata in payload for scheduler to iterate
-    payload.fanin_actual_count = fanin_builder.count;
+    payload.fanin_count = fanin_builder.count;
     payload.fanin_spill_start = fanin_builder.spill_start;
     payload.fanin_spill_pool = &fanin_builder.spill_pool;
     for (int i = 0; i < inline_count; i++) {
@@ -768,7 +768,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     TaskOutputTensors outputs;
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
-    payload.fanin_actual_count = 0;
+    payload.fanin_count = 0;
     payload.fanin_spill_start = 0;
     payload.fanin_spill_pool = &orch->fanin_pool;
     CYCLE_COUNT_LAP(g_orch_args_cycle);
@@ -776,12 +776,11 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     if (prepared.slot_state != nullptr) {
         // Hidden alloc tasks complete inline in the orchestrator before any
         // consumer can exist, so they have no fanout to notify and no worker
-        // subtasks to retire. Running the full on_task_complete path
-        // would only pay unnecessary fanout traversal overhead here.
-        // The generic slot initialization done in prepare_task() is still
-        // required so scope_end can release the producer-side reference and
-        // drive the slot to CONSUMED, but worker dispatch fields are never
-        // observed for hidden alloc tasks.
+        // subtasks to retire. Running the full on_task_complete path would only
+        // pay unnecessary fanout traversal overhead here. Consumers learn the
+        // dependency is already satisfied via wire_task's early_finished check;
+        // these slots stay COMPLETED (the single-shot model never retires them),
+        // and worker dispatch fields are never observed for hidden alloc tasks.
         prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
     }
     orch->inline_completed_tasks++;

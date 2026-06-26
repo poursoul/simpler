@@ -296,7 +296,7 @@ removed the consumer-counting that drove the dropped `CONSUMED` lifecycle.
 | `param_count` | Number of valid parameters |
 | `fanin_inline_slot_states[]` | Producer slot-state pointers (inline, up to 64) |
 | `fanin_spill_start` | Start index of spilled fanins in the fanin pool |
-| `fanin_actual_count` | Actual fanin count |
+| `fanin_count` | Actual fanin count |
 
 ### 6.2 Task State Machine
 

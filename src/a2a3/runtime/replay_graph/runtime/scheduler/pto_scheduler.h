@@ -656,7 +656,7 @@ struct PTO2SchedulerState {
     // Event-driven candidate detection (the dual of fanin_refcount/ready). Call when a
     // FLAGGED producer `p` DISPATCHES (starts running): walk its fanout and bump each
     // consumer's dispatch_fanin. A consumer whose dispatch_fanin reaches
-    // fanin_actual_count (= every producer is either flagged-and-dispatched, or was
+    // fanin_count (= every producer is either flagged-and-dispatched, or was
     // already complete when the consumer was wired) is an early-dispatch candidate:
     // CAS NONE->STAGING (exactly-once) and push to early_dispatch_queue for the idle drain to
     // pre-stage. Once-guarded per producer so an SPMD producer's block-by-block
@@ -673,14 +673,14 @@ struct PTO2SchedulerState {
         PTO2DepListEntry *edge = p.fanout_head;
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
-            // Compare to fanin_actual_count (the real producer-edge count), NOT
-            // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
-            // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
-            // the wiring-time early_finished seed (producers already complete) and is
-            // bumped here by flagged producers; reaching fanin_actual_count means every
-            // producer is flagged-dispatched or was pre-completed.
+            // dispatch_fanin (CONSUMER-side early-dispatch counter) starts at the
+            // wiring-time early_finished seed (producers already complete) and is
+            // bumped here by flagged producers; reaching the producer-edge count
+            // means every producer is flagged-dispatched or pre-completed. Read it
+            // off the slot's hot fanin_count (== payload.fanin_count after the
+            // wiring +1 was dropped) instead of the cold payload cache line.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (nf != c->payload->fanin_actual_count) continue;
+            if (nf != c->fanin_count) continue;
             if (c->active_mask.requires_sync_start()) continue;  // sync_start can't be block-by-block pre-staged
             PTO2ResourceShape shape = c->active_mask.to_shape();
             if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX)

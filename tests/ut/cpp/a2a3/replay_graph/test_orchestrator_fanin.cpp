@@ -71,6 +71,6 @@ TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     auto &consumer_slot = sm_handle->header->get_slot_state_by_task_id(consumer.task_id().local());
 
     ASSERT_NE(consumer_slot.payload, nullptr);
-    EXPECT_EQ(consumer_slot.payload->fanin_actual_count, 1);
+    EXPECT_EQ(consumer_slot.payload->fanin_count, 1);
     EXPECT_EQ(consumer_slot.payload->fanin_inline_slot_states[0], &producer_slot);
 }

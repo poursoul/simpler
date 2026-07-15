@@ -362,10 +362,13 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
 
 PTO_DEVICE_FUNC void calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout) {
     layout.total_output_size = 0;
+    layout.output_count = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        layout.buffer_sizes[i] = TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info());
-        layout.total_output_size += PTO2_ALIGN_UP(layout.buffer_sizes[i], PTO2_PACKED_OUTPUT_ALIGN);
+        const int32_t output_ordinal = layout.output_count++;
+        layout.output_indices[output_ordinal] = i;
+        layout.buffer_sizes[output_ordinal] = TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info());
+        layout.total_output_size += PTO2_ALIGN_UP(layout.buffer_sizes[output_ordinal], PTO2_PACKED_OUTPUT_ALIGN);
     }
 }
 
@@ -401,11 +404,8 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     }
 
     uint64_t output_offset = 0;
-    for (int32_t i = 0; i < ctx.tensor_count; i++) {
-        const TensorArgType tag = args.tag(i);
-        if (tag != TensorArgType::OUTPUT) {
-            continue;
-        }
+    for (int32_t output_ordinal = 0; output_ordinal < layout.output_count; output_ordinal++) {
+        const int32_t i = layout.output_indices[output_ordinal];
         const auto &ci = args.tensor(i).create_info();
         if (g_dist.heap_base == nullptr) {
             set_fatal();
@@ -416,7 +416,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
             }
             return false;
         }
-        const uint64_t buffer_size = layout.buffer_sizes[i];
+        const uint64_t buffer_size = layout.buffer_sizes[output_ordinal];
         const uint64_t phys = (task_base + output_offset) % ring;
         __gm__ Tensor &slot_t = ctx.payload->tensors[i];
         init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, buffer_size);

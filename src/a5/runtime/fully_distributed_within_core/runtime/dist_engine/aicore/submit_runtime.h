@@ -645,7 +645,26 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     TRACE_SPAN_BEGIN(claim_trace);
     const bool is_winner = dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
     TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, static_cast<uint32_t>(is_winner), 1);
-    if (is_winner) set_fatal();
+    if (is_winner) {
+        atomic_fetch_add<int64_t>(g_dist.shared_winner_count.v, 1);
+        shared_wait_completed_before(ctx.self, ctx.task_id);
+        if (!dist_submit_shared_materialize_outputs(args, ctx)) {
+            set_fatal();
+        } else {
+            shared_map_advance_retire(g_dist.shared_map, ctx.task_id, g_dist.H);
+            dist_submit_shared_publish_producers(args, ctx);
+            shared_publish_done(ctx.task_id);
+            dist_submit_shared_release_heap_turn(ctx.task_id);
+            store_barrier();
+            publish_task_flag(ctx.task_id);
+            advance_frontier();
+            TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Alloc);
+        }
+    } else {
+        atomic_fetch_add<int64_t>(g_dist.shared_loser_count.v, 1);
+        TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::Replay);
+        drain_block_won(ctx.self);
+    }
     TRACE_SPAN_END(submit_trace, ctx.self, ctx.task_id, -1, TracePhase::Submit, static_cast<uint32_t>(is_winner), 1);
     return ctx.result;
 }

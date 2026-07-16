@@ -460,6 +460,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
         } else if (!dist_submit_shared_materialize_outputs(args, ctx)) {
             set_fatal();
         } else {
+            shared_map_advance_retire(g_dist.shared_map, ctx.task_id, g_dist.H);
             dist_submit_shared_publish_producers(args, ctx);
             shared_publish_done(ctx.task_id);
             if (!dist_submit_shared_resolve_inputs_and_fanin(args, ctx)) {

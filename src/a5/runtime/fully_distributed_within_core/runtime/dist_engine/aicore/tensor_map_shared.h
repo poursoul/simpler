@@ -52,6 +52,13 @@ PTO_DEVICE_FUNC int32_t shared_map_alloc_entry(__gm__ SharedDistTensorMap &map) 
     return static_cast<int32_t>(idx);
 }
 
+PTO_DEVICE_FUNC void shared_map_advance_retire(__gm__ SharedDistTensorMap &map, int32_t task_id, int32_t H) {
+    const int32_t new_floor = task_id - H;
+    if (new_floor <= 0) return;
+    atomic_fetch_max<int64_t>(map.cleaned_upto, static_cast<int64_t>(new_floor));
+    atomic_fetch_max<int64_t>(map.alive_floor, static_cast<int64_t>(new_floor));
+}
+
 template <typename TensorRef>
 PTO_DEVICE_FUNC void shared_map_insert_entry(
     __gm__ SharedDistTensorMap &map, int32_t task_id, int32_t output_slot, const TensorRef &tensor, bool publish_symbol,
@@ -101,6 +108,10 @@ shared_map_insert_range(__gm__ SharedDistTensorMap &map, int32_t task_id, const 
 PTO_DEVICE_FUNC bool shared_map_lookup_symbol(
     __gm__ const SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot, __gm__ const SharedMapEntry *&out
 ) {
+    if (task_id < atomic_load(map.alive_floor, __ATOMIC_ACQUIRE)) {
+        out = nullptr;
+        return false;
+    }
     const uint32_t bucket = shared_symbol_hash(task_id, output_slot);
     for (int32_t cur = map.symbol_buckets[bucket]; cur >= 0; cur = map.entries[cur].next_in_symbol_bucket) {
         __gm__ const SharedMapEntry &entry = map.entries[cur];
@@ -121,6 +132,7 @@ PTO_DEVICE_FUNC int32_t
 shared_map_lookup_range(__gm__ const SharedDistTensorMap &map, const TensorRef &tensor, int32_t consumer_task_id) {
     uint64_t addr, lo, hi;
     shared_map_byte_range(tensor, addr, lo, hi);
+    const int32_t alive_floor = static_cast<int32_t>(atomic_load(map.alive_floor, __ATOMIC_ACQUIRE));
     int32_t best = -1;
     for (int32_t cur = map.range_buckets[shared_range_hash(addr)]; cur >= 0;
          cur = map.entries[cur].next_in_range_bucket) {
@@ -128,6 +140,7 @@ shared_map_lookup_range(__gm__ const SharedDistTensorMap &map, const TensorRef &
 #if defined(__CCE_AICORE__)
         dist_aicore_invalidate_region(&entry, sizeof(entry));
 #endif
+        if (entry.owner_task_id < alive_floor) continue;
         if (entry.owner_task_id >= consumer_task_id) continue;
         if (entry.buf_addr == addr && lo < entry.hi && entry.lo < hi && entry.owner_task_id > best) {
             best = entry.owner_task_id;

@@ -111,7 +111,9 @@ struct SharedDistTensorMap {
     int32_t range_buckets[kSharedRangeBuckets];
     int32_t task_heads[kTaskWindow];
     volatile int64_t high_water;
-    uint8_t tail_pad[56];
+    volatile int64_t alive_floor;
+    volatile int64_t cleaned_upto;
+    uint8_t tail_pad[40];
 };
 static_assert(sizeof(SharedDistTensorMap) % 64 == 0, "SharedDistTensorMap must not share cachelines");
 

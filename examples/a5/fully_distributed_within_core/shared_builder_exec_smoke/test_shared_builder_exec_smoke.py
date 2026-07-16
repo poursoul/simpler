@@ -63,6 +63,13 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT],
             },
+            {
+                "func_id": 5,
+                "name": "MAKE_TEMP_AIV",
+                "source": "kernels/aiv/make_temp.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.OUT],
+            },
         ],
     }
 
@@ -124,6 +131,12 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 1, "mode": 7},
+        },
+        {
+            "name": "A5SimBd36AivProducerAicConsumerN64",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 64, "mode": 8},
         },
     ]
 

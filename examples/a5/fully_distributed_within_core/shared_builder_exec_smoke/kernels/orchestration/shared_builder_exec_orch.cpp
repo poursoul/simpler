@@ -18,6 +18,7 @@
 #define FUNC_FILL_OUTPUT_AIC 2
 #define FUNC_BUMP_OUTPUT_AIC 3
 #define FUNC_CONSUME_TEMP_AIV 4
+#define FUNC_MAKE_TEMP_AIV 5
 
 extern "C" {
 
@@ -158,6 +159,35 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) {
             builder.add_input([&]() -> const Tensor & {
                 return input;
+            });
+            builder.add_output([&]() -> const Tensor & {
+                return output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        return;
+    }
+
+    if (mode == 8) {
+        const uint32_t shape[1] = {static_cast<uint32_t>(n)};
+        TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
+        TaskOutputTensors temp = rt_submit_aiv_task<1>(FUNC_MAKE_TEMP_AIV, [&](SubmitBuilder &builder) {
+            builder.add_input([&]() -> const Tensor & {
+                return input;
+            });
+            builder.add_output([&]() -> TensorCreateInfo & {
+                return temp_ci;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        const SymbolicTensor temp_symbol = temp.get_symbol(0);
+        rt_submit_aic_task<0>(FUNC_CONSUME_TEMP_AIC, [&](SubmitBuilder &builder) {
+            builder.add_input([&]() -> SymbolicTensor {
+                return temp_symbol;
             });
             builder.add_output([&]() -> const Tensor & {
                 return output;

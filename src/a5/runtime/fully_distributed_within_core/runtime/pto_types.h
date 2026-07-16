@@ -226,6 +226,15 @@ public:
         kind_ = kSymbolic;
         return *this;
     }
+    PTO_DEVICE_FUNC void resolve_to_gm_tensor(__gm__ const Tensor *p) {
+#if defined(__CCE_AICORE__)
+        gm_ptr_ = p;
+        kind_ = kGmTensor;
+#else
+        ptr_ = p;
+        kind_ = kTensor;
+#endif
+    }
 #endif
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC TensorRef &set_gm_tensor(__gm__ const Tensor *p) {
@@ -464,6 +473,13 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     }
 
     PTO_DEVICE_FUNC const PTO2TaskId *explicit_deps_data() const { return explicit_deps_; }
+
+#if PTO_FDWIC_SHARED_TENSORMAP
+    PTO_DEVICE_FUNC void resolve_symbolic_tensor(int32_t index, __gm__ const Tensor *tensor) {
+        always_assert(index >= 0 && index < tensor_count_);
+        tensors_[index].resolve_to_gm_tensor(tensor);
+    }
+#endif
 
     /**
      * Add scalar values. Types are deduced per argument; each value is

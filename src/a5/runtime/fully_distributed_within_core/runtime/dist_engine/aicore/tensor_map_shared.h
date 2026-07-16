@@ -31,11 +31,14 @@ PTO_DEVICE_FUNC int32_t shared_map_alloc_entry(__gm__ SharedDistTensorMap &map) 
     return static_cast<int32_t>(idx);
 }
 
-PTO_DEVICE_FUNC void shared_map_insert_symbol(__gm__ SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot) {
+PTO_DEVICE_FUNC void shared_map_insert_symbol(
+    __gm__ SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot, __gm__ const Tensor &tensor
+) {
     const int32_t idx = shared_map_alloc_entry(map);
     if (idx < 0) return;
     const uint32_t bucket = shared_symbol_hash(task_id, output_slot);
     __gm__ SharedMapEntry &entry = map.entries[idx];
+    Tensor::copy(entry.tensor, tensor);
     entry.owner_task_id = task_id;
     entry.output_slot = static_cast<int32_t>(output_slot);
     entry.next_in_range_bucket = -1;
@@ -43,6 +46,9 @@ PTO_DEVICE_FUNC void shared_map_insert_symbol(__gm__ SharedDistTensorMap &map, i
     entry.next_in_symbol_bucket = map.symbol_buckets[bucket];
     map.task_heads[task_id & kTaskWindowMask] = idx;
     store_barrier();
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&entry, sizeof(entry));
+#endif
     map.symbol_buckets[bucket] = idx;
 }
 
@@ -52,6 +58,9 @@ PTO_DEVICE_FUNC bool shared_map_lookup_symbol(
     const uint32_t bucket = shared_symbol_hash(task_id, output_slot);
     for (int32_t cur = map.symbol_buckets[bucket]; cur >= 0; cur = map.entries[cur].next_in_symbol_bucket) {
         __gm__ const SharedMapEntry &entry = map.entries[cur];
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&entry, sizeof(entry));
+#endif
         if (entry.owner_task_id == task_id && entry.output_slot == static_cast<int32_t>(output_slot)) {
             out = &entry;
             return true;

@@ -273,12 +273,77 @@ PTO_DEVICE_FUNC uint32_t dist_submit_count_fresh_outputs(const L0TaskArgs &args)
     return count;
 }
 
-PTO_DEVICE_FUNC void dist_submit_shared_publish_outputs(int32_t task_id, uint32_t output_count) {
-    for (uint32_t slot = 0; slot < output_count; slot++)
-        shared_map_insert_symbol(g_dist.shared_map, task_id, slot);
+PTO_DEVICE_FUNC bool dist_submit_shared_materialize_outputs(L0TaskArgs &args, DistSubmitCtx &ctx) {
+    if (ctx.payload == nullptr) return false;
+    ctx.tensor_count = args.tensor_count();
+    ctx.scalar_count = args.scalar_count();
+
+    DistOutputLayout layout;
+    layout.total_output_size = 0;
+    layout.output_count = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        const int32_t output_ordinal = layout.output_count++;
+        layout.output_indices[output_ordinal] = i;
+        layout.buffer_sizes[output_ordinal] = TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info());
+        layout.total_output_size += PTO2_ALIGN_UP(layout.buffer_sizes[output_ordinal], PTO2_PACKED_OUTPUT_ALIGN);
+    }
+
+    if (layout.total_output_size == 0) {
+        ctx.output_bytes = 0;
+        return true;
+    }
+    if (g_dist.heap_base == nullptr) {
+        set_fatal();
+        DIST_ERRF("[dist_engine] shared GM output heap not allocated at task %d\n", ctx.task_id);
+        return false;
+    }
+    if (layout.total_output_size > g_dist.heap_size) {
+        set_fatal();
+        DIST_ERRF(
+            "[dist_engine] shared task %d outputs %llu B exceed heap %zu B\n", ctx.task_id,
+            (unsigned long long)layout.total_output_size, g_dist.heap_size
+        );
+        return false;
+    }
+
+    const uint64_t task_base = static_cast<uint64_t>(atomic_fetch_add<int64_t>(
+        g_dist.shared_heap_top.v, static_cast<int64_t>(layout.total_output_size), __ATOMIC_ACQ_REL
+    ));
+    if (task_base + layout.total_output_size > g_dist.heap_size) {
+        set_fatal();
+        DIST_ERRF(
+            "[dist_engine] shared heap exhausted at task %d (need=%llu B, used=%llu B, cap=%zu B)\n", ctx.task_id,
+            (unsigned long long)layout.total_output_size, (unsigned long long)task_base, g_dist.heap_size
+        );
+        return false;
+    }
+
+    uint64_t output_offset = 0;
+    for (int32_t output_ordinal = 0; output_ordinal < layout.output_count; output_ordinal++) {
+        const int32_t i = layout.output_indices[output_ordinal];
+        const auto &ci = args.tensor(i).create_info();
+        const uint64_t buffer_size = layout.buffer_sizes[output_ordinal];
+        __gm__ Tensor &slot_t = ctx.payload->tensors[i];
+        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + task_base + output_offset, buffer_size);
+        slot_t.owner_task_id.raw = ctx.result.task_id().raw;
+        output_offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
+    }
+    ctx.output_bytes = layout.total_output_size;
+    return true;
 }
 
-PTO_DEVICE_FUNC bool dist_submit_shared_resolve_symbolic_inputs(const L0TaskArgs &args, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC void dist_submit_shared_publish_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx) {
+    uint32_t output_slot = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) continue;
+        shared_map_insert_symbol(g_dist.shared_map, ctx.task_id, output_slot, ctx.payload->tensors[i]);
+        output_slot++;
+    }
+}
+
+PTO_DEVICE_FUNC bool dist_submit_shared_resolve_symbolic_inputs(L0TaskArgs &args, DistSubmitCtx &ctx) {
+    if (ctx.payload == nullptr) return false;
     bool waited = false;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         const TensorArgType tag = args.tag(i);
@@ -296,8 +361,9 @@ PTO_DEVICE_FUNC bool dist_submit_shared_resolve_symbolic_inputs(const L0TaskArgs
             set_fatal();
             return false;
         }
+        Tensor::copy(ctx.payload->tensors[i], entry->tensor);
+        args.resolve_symbolic_tensor(i, &ctx.payload->tensors[i]);
         (void)tag;
-        (void)entry;
     }
     return !fatal_set();
 }
@@ -329,13 +395,17 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
         const uint32_t actual_outputs = dist_submit_count_fresh_outputs(args);
         if (args.has_error || actual_outputs != output_count) {
             set_fatal();
-        } else if (!dist_submit_shared_resolve_symbolic_inputs(args, ctx)) {
+        } else if (!dist_submit_shared_materialize_outputs(args, ctx)) {
             set_fatal();
         } else {
-            dist_submit_shared_publish_outputs(ctx.task_id, output_count);
+            dist_submit_shared_publish_outputs(args, ctx);
             shared_publish_done(ctx.task_id);
-            complete_executed_task(ctx.self, ctx.task_id);
-            if (output_count == 0) atomic_fetch_add<int64_t>(g_dist.shared_zero_output_complete_count.v, 1);
+            if (!dist_submit_shared_resolve_symbolic_inputs(args, ctx)) {
+                set_fatal();
+            } else {
+                complete_executed_task(ctx.self, ctx.task_id);
+                if (output_count == 0) atomic_fetch_add<int64_t>(g_dist.shared_zero_output_complete_count.v, 1);
+            }
         }
     } else {
         atomic_fetch_add<int64_t>(g_dist.shared_loser_count.v, 1);

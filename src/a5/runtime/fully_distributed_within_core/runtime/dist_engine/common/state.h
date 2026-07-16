@@ -87,6 +87,7 @@ struct DistTensorMap {
 
 #if PTO_FDWIC_SHARED_TENSORMAP
 struct SharedMapEntry {
+    Tensor tensor;
     int32_t owner_task_id;
     int32_t output_slot;
     int32_t next_in_symbol_bucket;
@@ -94,7 +95,7 @@ struct SharedMapEntry {
     int32_t next_in_task;
     uint8_t pad[44];
 };
-static_assert(sizeof(SharedMapEntry) == 64, "SharedMapEntry must occupy one cacheline in the first skeleton");
+static_assert(sizeof(SharedMapEntry) == 3 * kCacheLine, "SharedMapEntry must occupy three cachelines");
 
 constexpr int32_t kSharedMapCap = kMapCap;
 constexpr int32_t kSharedSymbolBuckets = kMapBuckets;

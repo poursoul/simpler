@@ -35,17 +35,17 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     for (uint64_t i = 0; i < n; i++) {
         TensorCreateInfo ci0(shape, 1, DataType::FLOAT32);
         TensorCreateInfo ci1(shape, 1, DataType::FLOAT32);
-        TaskOutputTensors produced = rt_submit_aic_task<2>(FUNC_DUMMY_AIC, [&](SubmitBuilder &builder) {
-            builder.add_no_dep([&]() -> const Tensor & {
+        TaskOutputTensors produced = rt_submit_aic_task<2>(FUNC_DUMMY_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
+            builder.add_no_dep([&]() PTO_DEVICE_FUNC -> const Tensor & {
                 return sentinel;
             });
-            builder.add_output([&]() -> TensorCreateInfo & {
+            builder.add_output([&]() PTO_DEVICE_FUNC -> TensorCreateInfo & {
                 return ci0;
             });
-            builder.add_output([&]() -> TensorCreateInfo & {
+            builder.add_output([&]() PTO_DEVICE_FUNC -> TensorCreateInfo & {
                 return ci1;
             });
-            builder.add_scalar([&]() -> uint64_t {
+            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
                 return i;
             });
         });
@@ -53,14 +53,14 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         const SymbolicTensor produced_symbol1 = produced.get_symbol(1);
 
         if ((i & 1) == 0) {
-            rt_submit_aic_task<0>(FUNC_DUMMY_AIC, [&](SubmitBuilder &builder) {
-                builder.add_input([&]() -> SymbolicTensor {
+            rt_submit_aic_task<0>(FUNC_DUMMY_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
+                builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
                     return produced_symbol0;
                 });
-                builder.add_input([&]() -> SymbolicTensor {
+                builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
                     return produced_symbol1;
                 });
-                builder.add_scalar([&]() -> uint64_t {
+                builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
                     return i;
                 });
             });
@@ -68,14 +68,14 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             MixedKernels mixed;
             mixed.aic_kernel_id = FUNC_DUMMY_AIC;
             mixed.aiv0_kernel_id = FUNC_DUMMY_AIV;
-            rt_submit_task<0>(mixed, [&](SubmitBuilder &builder) {
-                builder.add_input([&]() -> SymbolicTensor {
+            rt_submit_task<0>(mixed, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
+                builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
                     return produced_symbol0;
                 });
-                builder.add_input([&]() -> SymbolicTensor {
+                builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
                     return produced_symbol1;
                 });
-                builder.add_scalar([&]() -> uint64_t {
+                builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
                     return i;
                 });
             });

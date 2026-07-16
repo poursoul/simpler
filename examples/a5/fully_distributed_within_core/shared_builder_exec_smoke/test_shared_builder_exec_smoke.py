@@ -138,6 +138,36 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 64, "mode": 8},
         },
+        {
+            "name": "A5OnboardBd1SymbolicN16",
+            "platforms": ["a5"],
+            "config": {"block_dim": 1},
+            "params": {"n": 16, "mode": 0},
+        },
+        {
+            "name": "A5OnboardBd36SymbolicN64",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 64, "mode": 0},
+        },
+        {
+            "name": "A5OnboardBd36InoutRangeN128",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 1},
+        },
+        {
+            "name": "A5OnboardBd36MixedAicAivN64",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 64, "mode": 4},
+        },
+        {
+            "name": "A5OnboardBd36AivProducerAicConsumerN64",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 64, "mode": 8},
+        },
     ]
 
     def generate_args(self, params):

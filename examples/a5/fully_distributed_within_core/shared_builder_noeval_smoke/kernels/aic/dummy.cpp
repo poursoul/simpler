@@ -13,8 +13,6 @@
 
 #if __has_include("inner_kernel.h")
 #include "inner_kernel.h"
-#elif __has_include(<pto/pto-inst.hpp>)
-#include <pto/pto-inst.hpp>
 #endif
 
 #ifndef __gm__

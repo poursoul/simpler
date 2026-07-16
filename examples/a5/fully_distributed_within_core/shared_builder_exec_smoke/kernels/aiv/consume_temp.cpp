@@ -13,10 +13,7 @@
 
 #if __has_include("inner_kernel.h")
 #include "inner_kernel.h"
-#elif __has_include(<pto/pto-inst.hpp>)
-#include <pto/pto-inst.hpp>
 #endif
-#include "pipe_sync.h"
 #include "tensor.h"
 
 #ifndef __gm__
@@ -24,7 +21,11 @@
 #endif
 
 #ifndef __aicore__
+#if defined(__CCE_AICORE__)
 #define __aicore__ [aicore]
+#else
+#define __aicore__
+#endif
 #endif
 
 #if !defined(__CCE_AICORE__) && !defined(dcci)
@@ -52,5 +53,4 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     for (uint64_t off = 0; off < n * sizeof(float); off += 64) {
         dcci(reinterpret_cast<__gm__ uint8_t *>(output) + off, SINGLE_CACHE_LINE, CACHELINE_OUT);
     }
-    pipe_sync();
 }

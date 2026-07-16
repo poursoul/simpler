@@ -49,13 +49,13 @@ enum class DataType : uint8_t {
 
 static_assert(sizeof(DataType) == 1, "DataType must stay 1 byte");
 
-// Kernel-callable qualifier: when compiling for AICore (ccec compiler defines
-// __DAV_VEC__ or __DAV_CUBE__), PTO_DEVICE_FUNC adds the __aicore__ attribute.
-// In orchestration / host builds, PTO_DEVICE_FUNC expands to nothing. Defined
-// up here (rather than further below near the uint64_t packing helpers) so
-// get_element_size / get_dtype_name can carry the qualifier for the AICore
+// Kernel-callable qualifier: when compiling for CCEC AICore, PTO_DEVICE_FUNC
+// adds the __aicore__ attribute. CPU sim also defines __DAV_VEC__/__DAV_CUBE__
+// to select AIV/AIC code, but host g++ must still see an empty qualifier.
+// Defined up here (rather than further below near the uint64_t packing helpers)
+// so get_element_size / get_dtype_name can carry the qualifier for the AICore
 // tree — shared runtime headers (tensor.h, tensor_create_info.h) call them.
-#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
+#if (defined(__DAV_VEC__) || defined(__DAV_CUBE__)) && !defined(__CPU_SIM)
 // Ensure __aicore__ is available (CCE attribute for bisheng compiler).
 // Platform headers (inner_kernel.h) normally define this, but data_type.h
 // may be included before them.

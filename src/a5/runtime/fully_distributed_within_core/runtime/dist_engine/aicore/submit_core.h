@@ -41,6 +41,9 @@ PTO_DEVICE_FUNC void publish_task_flag(int32_t task_id) {
 PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder) {
     if (task_id < 0 || task_id >= kFlagCap) return false;
     __gm__ DistTaskCell &cell = task_cell(task_id);
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&cell, sizeof(cell));
+#endif
     return atomic_load(cell.flag, memorder) != 0;
 }
 

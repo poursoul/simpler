@@ -24,6 +24,9 @@ PTO_DEVICE_FUNC bool claim(__gm__ volatile int64_t &cursor, int32_t N) {
 PTO_DEVICE_FUNC uint64_t load_task_vend(int32_t task_id) {
     if (task_id < 0) return 0;
     __gm__ DistTaskCell &cell = task_cell(task_id);
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&cell, sizeof(cell));
+#endif
     return atomic_load(cell.vend, __ATOMIC_RELAXED);
 }
 

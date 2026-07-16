@@ -279,10 +279,40 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
 }  // namespace
 
 #if PTO_FDWIC_SHARED_TENSORMAP
+PTO_DEVICE_FUNC inline int64_t dist_submit_shared_load_heap_cursor() {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&g_dist.shared_heap_alloc_cursor, sizeof(g_dist.shared_heap_alloc_cursor));
+#endif
+    return atomic_load(g_dist.shared_heap_alloc_cursor.v, __ATOMIC_ACQUIRE);
+}
+
+PTO_DEVICE_FUNC inline uint64_t dist_submit_shared_load_heap_top() {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&g_dist.shared_heap_top, sizeof(g_dist.shared_heap_top));
+#endif
+    return static_cast<uint64_t>(atomic_load(g_dist.shared_heap_top.v, __ATOMIC_ACQUIRE));
+}
+
+PTO_DEVICE_FUNC inline void dist_submit_shared_store_heap_top(uint64_t top, int32_t task_id) {
+    atomic_exchange(g_dist.shared_heap_top.v, static_cast<int64_t>(top), __ATOMIC_RELEASE);
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&g_dist.shared_heap_top, sizeof(g_dist.shared_heap_top));
+#endif
+    store_task_vend(task_id, top);
+    store_barrier();
+}
+
+PTO_DEVICE_FUNC inline void dist_submit_shared_release_heap_turn(int32_t task_id) {
+    atomic_exchange(g_dist.shared_heap_alloc_cursor.v, static_cast<int64_t>(task_id), __ATOMIC_RELEASE);
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&g_dist.shared_heap_alloc_cursor, sizeof(g_dist.shared_heap_alloc_cursor));
+#endif
+}
+
 PTO_DEVICE_FUNC inline bool dist_submit_shared_wait_heap_turn(DistSubmitCtx &ctx) {
     const int32_t target = ctx.task_id - 1;
     if (target < 0) return true;
-    while (atomic_load(g_dist.shared_heap_alloc_cursor.v, __ATOMIC_ACQUIRE) < target && !fatal_set()) {
+    while (dist_submit_shared_load_heap_cursor() < target && !fatal_set()) {
         drain_block_won(ctx.self);
         if (drain_phase_b(ctx.self) == 0) SPIN_WAIT_HINT();
     }
@@ -301,7 +331,7 @@ PTO_DEVICE_FUNC inline bool dist_submit_shared_reserve_heap(DistSubmitCtx &ctx, 
     if (!dist_submit_shared_wait_heap_turn(ctx)) return false;
 
     const size_t ring = g_dist.heap_size;
-    uint64_t top = static_cast<uint64_t>(atomic_load(g_dist.shared_heap_top.v, __ATOMIC_ACQUIRE));
+    uint64_t top = dist_submit_shared_load_heap_top();
     task_base = PTO2_ALIGN_UP(top, PTO2_PACKED_OUTPUT_ALIGN);
     if (total > 0) {
         if (g_dist.heap_base == nullptr || ring == 0) {
@@ -333,10 +363,7 @@ PTO_DEVICE_FUNC inline bool dist_submit_shared_reserve_heap(DistSubmitCtx &ctx, 
             if (waited) {
                 TRACE_SPAN_END(heap_bp_trace, ctx.self, ctx.task_id, -1, TracePhase::RingBp, 0, 1);
             }
-            atomic_exchange(g_dist.shared_heap_top.v, static_cast<int64_t>(vend), __ATOMIC_RELEASE);
-            store_task_vend(ctx.task_id, vend);
-            store_barrier();
-            atomic_exchange(g_dist.shared_heap_alloc_cursor.v, static_cast<int64_t>(ctx.task_id), __ATOMIC_RELEASE);
+            dist_submit_shared_store_heap_top(vend, ctx.task_id);
             return true;
         }
         if (f >= ctx.task_id - 1) {
@@ -407,18 +434,7 @@ PTO_DEVICE_FUNC inline void dist_submit_shared_publish_producers(const L0TaskArg
         if (tag == TensorArgType::OUTPUT) {
             shared_map_insert_symbol(g_dist.shared_map, ctx.task_id, output_slot, ctx.payload->tensors[i]);
             output_slot++;
-            continue;
         }
-        if (tag != TensorArgType::INOUT && tag != TensorArgType::OUTPUT_EXISTING) continue;
-#if defined(__CCE_AICORE__)
-        if (args.tensor(i).tensor_from_gm()) {
-            shared_map_insert_range(g_dist.shared_map, ctx.task_id, args.tensor(i).gm_ref());
-        } else {
-            shared_map_insert_range(g_dist.shared_map, ctx.task_id, args.tensor(i).ref());
-        }
-#else
-        shared_map_insert_range(g_dist.shared_map, ctx.task_id, args.tensor(i).ref());
-#endif
     }
 }
 
@@ -436,7 +452,6 @@ dist_submit_shared_collect_tensor_fanin(DistSubmitCtx &ctx, const TensorRef &ten
     if (owner_raw != UINT64_MAX) dist_submit_shared_add_fanin(ctx, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
     if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) return;
     if (tensor.manual_dep) return;
-    dist_submit_shared_add_fanin(ctx, shared_map_lookup_range(g_dist.shared_map, tensor, ctx.task_id));
 }
 
 PTO_DEVICE_FUNC inline bool dist_submit_shared_resolve_inputs_and_fanin(L0TaskArgs &args, DistSubmitCtx &ctx) {
@@ -447,7 +462,7 @@ PTO_DEVICE_FUNC inline bool dist_submit_shared_resolve_inputs_and_fanin(L0TaskAr
         if (tag == TensorArgType::OUTPUT) continue;
         if (args.tensor(i).tensor_is_symbolic()) {
             if (!waited) {
-                shared_wait_published_before(ctx.self, ctx.task_id);
+                shared_wait_completed_before(ctx.self, ctx.task_id);
                 waited = true;
             }
             const SymbolicTensor sym = args.tensor(i).symbol();
@@ -467,7 +482,7 @@ PTO_DEVICE_FUNC inline bool dist_submit_shared_resolve_inputs_and_fanin(L0TaskAr
             continue;
         }
         if (!waited && (tag == TensorArgType::INPUT || tag == TensorArgType::INOUT)) {
-            shared_wait_published_before(ctx.self, ctx.task_id);
+            shared_wait_completed_before(ctx.self, ctx.task_id);
             waited = true;
         }
 #if defined(__CCE_AICORE__)
@@ -495,7 +510,7 @@ dist_submit_shared_collect_eager_inputs_and_fanin(const L0TaskArgs &args, DistSu
             return false;
         }
         if (!waited && (tag == TensorArgType::INPUT || tag == TensorArgType::INOUT)) {
-            shared_wait_published_before(ctx.self, ctx.task_id);
+            shared_wait_completed_before(ctx.self, ctx.task_id);
             waited = true;
         }
 #if defined(__CCE_AICORE__)
@@ -544,11 +559,13 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
             shared_map_advance_retire(g_dist.shared_map, ctx.task_id, g_dist.H);
             dist_submit_shared_publish_producers(args, ctx);
             shared_publish_done(ctx.task_id);
+            dist_submit_shared_release_heap_turn(ctx.task_id);
             if (!dist_submit_shared_resolve_inputs_and_fanin(args, ctx)) {
                 set_fatal();
             } else {
                 TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
                 dist_submit_build_winner_task(ctx, mixed, args);
+                drain_phase_b(ctx.self);
             }
         }
     } else {
@@ -587,11 +604,13 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
             shared_map_advance_retire(g_dist.shared_map, ctx.task_id, g_dist.H);
             dist_submit_shared_publish_producers(args, ctx);
             shared_publish_done(ctx.task_id);
+            dist_submit_shared_release_heap_turn(ctx.task_id);
             if (!dist_submit_shared_collect_eager_inputs_and_fanin(args, ctx)) {
                 set_fatal();
             } else {
                 TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
                 dist_submit_build_winner_task(ctx, mixed, args);
+                drain_phase_b(ctx.self);
             }
         }
     } else {

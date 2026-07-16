@@ -43,8 +43,30 @@ PTO_DEVICE_FUNC void shared_map_byte_range(const TensorRef &t, uint64_t &addr, u
     hi = (t.start_offset + ext) * esz;
 }
 
+PTO_DEVICE_FUNC void shared_map_invalidate_control(__gm__ SharedDistTensorMap &map) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(const_cast<__gm__ const int64_t *>(&map.high_water), 64);
+#else
+    (void)map;
+#endif
+}
+
+PTO_DEVICE_FUNC void shared_map_flush_control(__gm__ SharedDistTensorMap &map) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(const_cast<__gm__ int64_t *>(&map.high_water), 64);
+#else
+    (void)map;
+#endif
+}
+
 PTO_DEVICE_FUNC bool shared_map_lock(__gm__ SharedDistTensorMap &map) {
+#if defined(__CCE_AICORE__)
+    shared_map_invalidate_control(map);
+#endif
     while (atomic_exchange(map.lock, int64_t{1}, __ATOMIC_ACQUIRE) != 0 && !fatal_set()) {
+#if defined(__CCE_AICORE__)
+        shared_map_invalidate_control(map);
+#endif
         SPIN_WAIT_HINT();
     }
     return !fatal_set();
@@ -53,6 +75,9 @@ PTO_DEVICE_FUNC bool shared_map_lock(__gm__ SharedDistTensorMap &map) {
 PTO_DEVICE_FUNC void shared_map_unlock(__gm__ SharedDistTensorMap &map) {
     store_barrier();
     atomic_exchange(map.lock, int64_t{0}, __ATOMIC_RELEASE);
+#if defined(__CCE_AICORE__)
+    shared_map_flush_control(map);
+#endif
 }
 
 PTO_DEVICE_FUNC int32_t shared_map_load_bucket(__gm__ const int32_t &bucket) {
@@ -82,22 +107,6 @@ PTO_DEVICE_FUNC int64_t shared_load_published(int32_t task_id) {
     dist_aicore_invalidate_region(&g_dist.published[task_id], sizeof(g_dist.published[task_id]));
 #endif
     return atomic_load(g_dist.published[task_id].v, __ATOMIC_ACQUIRE);
-}
-
-PTO_DEVICE_FUNC void shared_map_invalidate_control(__gm__ SharedDistTensorMap &map) {
-#if defined(__CCE_AICORE__)
-    dist_aicore_invalidate_region(const_cast<__gm__ const int64_t *>(&map.high_water), 64);
-#else
-    (void)map;
-#endif
-}
-
-PTO_DEVICE_FUNC void shared_map_flush_control(__gm__ SharedDistTensorMap &map) {
-#if defined(__CCE_AICORE__)
-    dist_aicore_flush_region(const_cast<__gm__ int64_t *>(&map.high_water), 64);
-#else
-    (void)map;
-#endif
 }
 
 PTO_DEVICE_FUNC int32_t shared_map_alloc_entry_locked(__gm__ SharedDistTensorMap &map) {
@@ -376,6 +385,15 @@ PTO_DEVICE_FUNC void shared_wait_published_before(__gm__ DistCore *self, int32_t
     const int32_t target = task_id - 1;
     if (target < 0) return;
     while (shared_load_publish_cursor() < target && !fatal_set()) {
+        drain_block_won(self);
+        if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
+    }
+}
+
+PTO_DEVICE_FUNC void shared_wait_completed_before(__gm__ DistCore *self, int32_t task_id) {
+    const int32_t target = task_id - 1;
+    if (target < 0) return;
+    while (!task_flag_ready(target, __ATOMIC_ACQUIRE) && !fatal_set()) {
         drain_block_won(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }

@@ -157,10 +157,28 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             "params": {"n": 128, "mode": 1},
         },
         {
+            "name": "A5OnboardBd36InoutSubViewN128",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 2},
+        },
+        {
+            "name": "A5OnboardBd36OutputExistingN128",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 3},
+        },
+        {
             "name": "A5OnboardBd36MixedAicAivN64",
             "platforms": ["a5"],
             "config": {"block_dim": 36},
             "params": {"n": 64, "mode": 4},
+        },
+        {
+            "name": "A5OnboardBd36Mixed2VN64",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 64, "mode": 5},
         },
         {
             "name": "A5OnboardBd36AivProducerAicConsumerN64",

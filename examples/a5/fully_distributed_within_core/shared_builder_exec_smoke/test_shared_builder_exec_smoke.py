@@ -42,21 +42,41 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
                 "core_type": "aic",
                 "signature": [D.IN, D.INOUT],
             },
+            {
+                "func_id": 2,
+                "name": "FILL_OUTPUT_AIC",
+                "source": "kernels/aic/fill_output.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.INOUT],
+            },
+            {
+                "func_id": 3,
+                "name": "BUMP_OUTPUT_AIC",
+                "source": "kernels/aic/bump_output.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
         ],
     }
 
     CASES = [
         {
-            "name": "A5SimBd1N16",
+            "name": "A5SimBd1SymbolicN16",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 1},
-            "params": {"n": 16},
+            "params": {"n": 16, "mode": 0},
         },
         {
-            "name": "A5SimBd36N64",
+            "name": "A5SimBd36SymbolicN64",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
-            "params": {"n": 64},
+            "params": {"n": 64, "mode": 0},
+        },
+        {
+            "name": "A5SimBd36InoutRangeN128",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 1},
         },
     ]
 
@@ -66,11 +86,15 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             Tensor("input", torch.arange(n, dtype=torch.float32)),
             Tensor("output", torch.full((n,), -1.0, dtype=torch.float32)),
             Scalar("n", n),
+            Scalar("mode", int(params.get("mode", 0))),
         )
 
     def compute_golden(self, args, params):
-        del params
-        args.output[:] = args.input + 3.0
+        mode = int(params.get("mode", 0))
+        if mode == 1:
+            args.output[:] = args.input + 4.0
+        else:
+            args.output[:] = args.input + 3.0
 
 
 if __name__ == "__main__":

@@ -22,6 +22,27 @@ PTO_DEVICE_FUNC uint32_t shared_symbol_hash(int32_t task_id, uint32_t output_slo
     return static_cast<uint32_t>(x >> (64 - kMapBucketShift));
 }
 
+PTO_DEVICE_FUNC uint32_t shared_range_hash(uint64_t addr) {
+    addr *= 0x9E3779B97F4A7C15ULL;
+    return static_cast<uint32_t>(addr >> (64 - kMapBucketShift));
+}
+
+template <typename TensorRef>
+PTO_DEVICE_FUNC void shared_map_byte_range(const TensorRef &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
+    const uint64_t esz = get_element_size(t.dtype);
+    addr = t.buffer.addr;
+    lo = t.start_offset * esz;
+    uint64_t ext;
+    if (t.is_contiguous) {
+        ext = 1;
+        for (uint32_t i = 0; i < t.ndims; i++)
+            ext *= t.shapes[i];
+    } else {
+        ext = t.extent_elem_cache;
+    }
+    hi = (t.start_offset + ext) * esz;
+}
+
 PTO_DEVICE_FUNC int32_t shared_map_alloc_entry(__gm__ SharedDistTensorMap &map) {
     const int64_t idx = atomic_fetch_add<int64_t>(map.high_water, 1);
     if (idx < 0 || idx >= kSharedMapCap) {
@@ -31,25 +52,50 @@ PTO_DEVICE_FUNC int32_t shared_map_alloc_entry(__gm__ SharedDistTensorMap &map) 
     return static_cast<int32_t>(idx);
 }
 
-PTO_DEVICE_FUNC void shared_map_insert_symbol(
-    __gm__ SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot, __gm__ const Tensor &tensor
+template <typename TensorRef>
+PTO_DEVICE_FUNC void shared_map_insert_entry(
+    __gm__ SharedDistTensorMap &map, int32_t task_id, int32_t output_slot, const TensorRef &tensor, bool publish_symbol,
+    bool publish_range
 ) {
     const int32_t idx = shared_map_alloc_entry(map);
     if (idx < 0) return;
-    const uint32_t bucket = shared_symbol_hash(task_id, output_slot);
     __gm__ SharedMapEntry &entry = map.entries[idx];
     Tensor::copy(entry.tensor, tensor);
+    shared_map_byte_range(tensor, entry.buf_addr, entry.lo, entry.hi);
     entry.owner_task_id = task_id;
-    entry.output_slot = static_cast<int32_t>(output_slot);
+    entry.output_slot = output_slot;
+    entry.range_bucket = -1;
+    entry.next_in_symbol_bucket = -1;
     entry.next_in_range_bucket = -1;
     entry.next_in_task = map.task_heads[task_id & kTaskWindowMask];
-    entry.next_in_symbol_bucket = map.symbol_buckets[bucket];
     map.task_heads[task_id & kTaskWindowMask] = idx;
+    if (publish_range) {
+        const uint32_t range_bucket = shared_range_hash(entry.buf_addr);
+        entry.range_bucket = static_cast<int32_t>(range_bucket);
+        entry.next_in_range_bucket = map.range_buckets[range_bucket];
+    }
+    if (publish_symbol) {
+        const uint32_t symbol_bucket = shared_symbol_hash(task_id, static_cast<uint32_t>(output_slot));
+        entry.next_in_symbol_bucket = map.symbol_buckets[symbol_bucket];
+    }
     store_barrier();
 #if defined(__CCE_AICORE__)
     dist_aicore_flush_region(&entry, sizeof(entry));
 #endif
-    map.symbol_buckets[bucket] = idx;
+    if (publish_range) map.range_buckets[entry.range_bucket] = idx;
+    if (publish_symbol) map.symbol_buckets[shared_symbol_hash(task_id, static_cast<uint32_t>(output_slot))] = idx;
+}
+
+PTO_DEVICE_FUNC void shared_map_insert_symbol(
+    __gm__ SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot, __gm__ const Tensor &tensor
+) {
+    shared_map_insert_entry(map, task_id, static_cast<int32_t>(output_slot), tensor, true, true);
+}
+
+template <typename TensorRef>
+PTO_DEVICE_FUNC void
+shared_map_insert_range(__gm__ SharedDistTensorMap &map, int32_t task_id, const TensorRef &tensor) {
+    shared_map_insert_entry(map, task_id, -1, tensor, false, true);
 }
 
 PTO_DEVICE_FUNC bool shared_map_lookup_symbol(
@@ -68,6 +114,26 @@ PTO_DEVICE_FUNC bool shared_map_lookup_symbol(
     }
     out = nullptr;
     return false;
+}
+
+template <typename TensorRef>
+PTO_DEVICE_FUNC int32_t
+shared_map_lookup_range(__gm__ const SharedDistTensorMap &map, const TensorRef &tensor, int32_t consumer_task_id) {
+    uint64_t addr, lo, hi;
+    shared_map_byte_range(tensor, addr, lo, hi);
+    int32_t best = -1;
+    for (int32_t cur = map.range_buckets[shared_range_hash(addr)]; cur >= 0;
+         cur = map.entries[cur].next_in_range_bucket) {
+        __gm__ const SharedMapEntry &entry = map.entries[cur];
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&entry, sizeof(entry));
+#endif
+        if (entry.owner_task_id >= consumer_task_id) continue;
+        if (entry.buf_addr == addr && lo < entry.hi && entry.lo < hi && entry.owner_task_id > best) {
+            best = entry.owner_task_id;
+        }
+    }
+    return best;
 }
 
 PTO_DEVICE_FUNC void shared_publish_done(int32_t task_id) {

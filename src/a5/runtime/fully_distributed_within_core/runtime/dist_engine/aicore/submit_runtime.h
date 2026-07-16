@@ -347,12 +347,25 @@ PTO_DEVICE_FUNC bool dist_submit_shared_materialize_outputs(L0TaskArgs &args, Di
     return true;
 }
 
-PTO_DEVICE_FUNC void dist_submit_shared_publish_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC void dist_submit_shared_publish_producers(const L0TaskArgs &args, DistSubmitCtx &ctx) {
     uint32_t output_slot = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        shared_map_insert_symbol(g_dist.shared_map, ctx.task_id, output_slot, ctx.payload->tensors[i]);
-        output_slot++;
+        const TensorArgType tag = args.tag(i);
+        if (tag == TensorArgType::OUTPUT) {
+            shared_map_insert_symbol(g_dist.shared_map, ctx.task_id, output_slot, ctx.payload->tensors[i]);
+            output_slot++;
+            continue;
+        }
+        if (tag != TensorArgType::INOUT && tag != TensorArgType::OUTPUT_EXISTING) continue;
+#if defined(__CCE_AICORE__)
+        if (args.tensor(i).tensor_from_gm()) {
+            shared_map_insert_range(g_dist.shared_map, ctx.task_id, args.tensor(i).gm_ref());
+        } else {
+            shared_map_insert_range(g_dist.shared_map, ctx.task_id, args.tensor(i).ref());
+        }
+#else
+        shared_map_insert_range(g_dist.shared_map, ctx.task_id, args.tensor(i).ref());
+#endif
     }
 }
 
@@ -363,30 +376,56 @@ PTO_DEVICE_FUNC void dist_submit_shared_add_fanin(DistSubmitCtx &ctx, int32_t pr
     if (ctx.fanin_count < kMaxFanin) ctx.fanin[ctx.fanin_count++] = producer;
 }
 
-PTO_DEVICE_FUNC bool dist_submit_shared_resolve_symbolic_inputs(L0TaskArgs &args, DistSubmitCtx &ctx) {
+template <typename TensorRef>
+PTO_DEVICE_FUNC void
+dist_submit_shared_collect_tensor_fanin(DistSubmitCtx &ctx, const TensorRef &tensor, TensorArgType tag) {
+    const uint64_t owner_raw = tensor.owner_task_id.raw;
+    if (owner_raw != UINT64_MAX) dist_submit_shared_add_fanin(ctx, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
+    if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) return;
+    if (tensor.manual_dep) return;
+    dist_submit_shared_add_fanin(ctx, shared_map_lookup_range(g_dist.shared_map, tensor, ctx.task_id));
+}
+
+PTO_DEVICE_FUNC bool dist_submit_shared_resolve_inputs_and_fanin(L0TaskArgs &args, DistSubmitCtx &ctx) {
     if (ctx.payload == nullptr) return false;
     bool waited = false;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         const TensorArgType tag = args.tag(i);
         if (tag == TensorArgType::OUTPUT) continue;
-        if (!args.tensor(i).tensor_is_symbolic()) continue;
-        if (!waited) {
+        if (args.tensor(i).tensor_is_symbolic()) {
+            if (!waited) {
+                shared_wait_published_before(ctx.self, ctx.task_id);
+                waited = true;
+            }
+            const SymbolicTensor sym = args.tensor(i).symbol();
+            __gm__ const SharedMapEntry *entry = nullptr;
+            if (!shared_map_lookup_symbol(
+                    g_dist.shared_map, static_cast<int32_t>(sym.producer_task_id.raw & 0xFFFFFFFFu), sym.output_slot,
+                    entry
+                )) {
+                set_fatal();
+                return false;
+            }
+            const int32_t producer = static_cast<int32_t>(sym.producer_task_id.raw & 0xFFFFFFFFu);
+            dist_submit_shared_add_fanin(ctx, producer);
+            Tensor::copy(ctx.payload->tensors[i], entry->tensor);
+            args.resolve_symbolic_tensor(i, &ctx.payload->tensors[i]);
+            dist_submit_shared_collect_tensor_fanin(ctx, ctx.payload->tensors[i], tag);
+            continue;
+        }
+        if (!waited && (tag == TensorArgType::INPUT || tag == TensorArgType::INOUT)) {
             shared_wait_published_before(ctx.self, ctx.task_id);
             waited = true;
         }
-        const SymbolicTensor sym = args.tensor(i).symbol();
-        __gm__ const SharedMapEntry *entry = nullptr;
-        if (!shared_map_lookup_symbol(
-                g_dist.shared_map, static_cast<int32_t>(sym.producer_task_id.raw & 0xFFFFFFFFu), sym.output_slot, entry
-            )) {
-            set_fatal();
-            return false;
+#if defined(__CCE_AICORE__)
+        if (args.tensor(i).tensor_from_gm()) {
+            dist_submit_shared_collect_tensor_fanin(ctx, args.tensor(i).gm_ref(), tag);
+        } else {
+            dist_submit_shared_collect_tensor_fanin(ctx, args.tensor(i).ref(), tag);
         }
-        const int32_t producer = static_cast<int32_t>(sym.producer_task_id.raw & 0xFFFFFFFFu);
-        dist_submit_shared_add_fanin(ctx, producer);
-        Tensor::copy(ctx.payload->tensors[i], entry->tensor);
-        args.resolve_symbolic_tensor(i, &ctx.payload->tensors[i]);
-        (void)tag;
+#else
+        dist_submit_shared_collect_tensor_fanin(ctx, args.tensor(i).ref(), tag);
+#endif
     }
     return !fatal_set();
 }
@@ -421,9 +460,9 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
         } else if (!dist_submit_shared_materialize_outputs(args, ctx)) {
             set_fatal();
         } else {
-            dist_submit_shared_publish_outputs(args, ctx);
+            dist_submit_shared_publish_producers(args, ctx);
             shared_publish_done(ctx.task_id);
-            if (!dist_submit_shared_resolve_symbolic_inputs(args, ctx)) {
+            if (!dist_submit_shared_resolve_inputs_and_fanin(args, ctx)) {
                 set_fatal();
             } else {
                 TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);

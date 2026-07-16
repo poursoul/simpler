@@ -15,6 +15,8 @@
 
 #define FUNC_MAKE_TEMP_AIC 0
 #define FUNC_CONSUME_TEMP_AIC 1
+#define FUNC_FILL_OUTPUT_AIC 2
+#define FUNC_BUMP_OUTPUT_AIC 3
 
 extern "C" {
 
@@ -22,7 +24,7 @@ __attribute__((visibility("default"), weak)) PTO2OrchestrationConfig
 aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 3,
+        .expected_arg_count = 4,
     };
 }
 
@@ -31,6 +33,31 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     const Tensor &input = orch_args.tensor(0).ref();
     const Tensor &output = orch_args.tensor(1).ref();
     const uint64_t n = orch_args.scalar(0);
+    const uint64_t mode = orch_args.scalar(1);
+
+    if (mode == 1) {
+        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) {
+            builder.add_input([&]() -> const Tensor & {
+                return input;
+            });
+            builder.add_inout([&]() -> const Tensor & {
+                return output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        rt_submit_aic_task<0>(FUNC_BUMP_OUTPUT_AIC, [&](SubmitBuilder &builder) {
+            builder.add_inout([&]() -> const Tensor & {
+                return output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        return;
+    }
+
     const uint32_t shape[1] = {static_cast<uint32_t>(n)};
     TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
 

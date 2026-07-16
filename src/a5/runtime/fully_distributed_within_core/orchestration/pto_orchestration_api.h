@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <type_traits>
 
 #include "dist_engine/dist_engine_api.h"  // NOLINT(build/include_subdir)
 #include "pto_runtime2_types.h"           // PTO2_ERROR_*
@@ -30,6 +31,72 @@
 #include "tensor.h"                       // Tensor, TensorCreateInfo
 
 struct PTO2Runtime;
+
+#if PTO_FDWIC_SHARED_TENSORMAP
+class SubmitBuilder {
+public:
+    explicit PTO_DEVICE_FUNC SubmitBuilder(L0TaskArgs &args) :
+        args_(args) {}
+
+    template <typename Fn>
+    PTO_DEVICE_FUNC void add_input(Fn &&fn) {
+        args_.add_input(fn());
+    }
+
+    template <typename Fn>
+    PTO_DEVICE_FUNC void add_output(Fn &&fn) {
+        args_.add_output(fn());
+    }
+
+    template <typename Fn>
+    PTO_DEVICE_FUNC void add_inout(Fn &&fn) {
+        args_.add_inout(fn());
+    }
+
+    template <typename Fn>
+    PTO_DEVICE_FUNC void add_no_dep(Fn &&fn) {
+        args_.add_no_dep(fn());
+    }
+
+    template <typename Fn>
+    PTO_DEVICE_FUNC void add_scalar(Fn &&fn) {
+        args_.add_scalar(fn());
+    }
+
+private:
+    L0TaskArgs &args_;
+};
+
+template <typename BuildFn>
+PTO_DEVICE_FUNC void dist_submit_builder_trampoline(L0TaskArgs *args, void *ctx) {
+    BuildFn &build_fn = *reinterpret_cast<BuildFn *>(ctx);
+    SubmitBuilder builder(*args);
+    build_fn(builder);
+}
+
+template <uint32_t OutputCount, typename BuildFn>
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, BuildFn &&build_fn) {
+    if (dist_is_fatal_query()) return TaskOutputTensors{};
+    using Fn = std::remove_reference_t<BuildFn>;
+    return dist_submit_builder_impl(
+        nullptr, mixed_kernels, OutputCount, &dist_submit_builder_trampoline<Fn>, static_cast<void *>(&build_fn)
+    );
+}
+
+template <uint32_t OutputCount, typename BuildFn>
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, BuildFn &&build_fn) {
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    return rt_submit_task<OutputCount>(mk, static_cast<BuildFn &&>(build_fn));
+}
+
+template <uint32_t OutputCount, typename BuildFn>
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, BuildFn &&build_fn) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return rt_submit_task<OutputCount>(mk, static_cast<BuildFn &&>(build_fn));
+}
+#endif
 
 PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};

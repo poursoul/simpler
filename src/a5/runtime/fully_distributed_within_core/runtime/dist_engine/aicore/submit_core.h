@@ -93,9 +93,14 @@ PTO_DEVICE_FUNC void advance_frontier() {
 }
 
 PTO_DEVICE_FUNC void complete_executed_task(__gm__ DistCore *self, int32_t task_id) {
+#if PTO_FDWIC_SHARED_TENSORMAP
+    (void)self;
+    store_task_vend(task_id, 0);
+#else
     if (self != nullptr) {
         store_task_vend(task_id, self->heap_next);
     }
+#endif
     store_barrier();
     publish_task_flag(task_id);
     advance_frontier();
@@ -346,6 +351,7 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
     ctx.joint_count = 0;
 }
 
+#if !PTO_FDWIC_SHARED_TENSORMAP
 PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.task_id < kFlagCap) return true;
     set_fatal();
@@ -428,6 +434,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     ctx.output_bytes = total;
     return true;
 }
+#endif
 
 PTO_DEVICE_FUNC inline void
 dist_submit_copy_arg_tensor(__gm__ Tensor &dst, const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t i) {
@@ -486,6 +493,7 @@ PTO_DEVICE_FUNC void build_ring_slot_from_submit(
     s.won_slot = won_slot;
 }
 
+#if !PTO_FDWIC_SHARED_TENSORMAP
 PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
     if (self == nullptr) return;
     dist_tensor_map_advance_retire(self->map, task_id, g_dist.H);
@@ -576,5 +584,6 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
     TRACE_SPAN_END(prepare_map_trace, self, ctx.task_id, -1, TracePhase::PrepareMap, 0, static_cast<uint32_t>(kind));
     return true;
 }
+#endif
 
 }  // namespace

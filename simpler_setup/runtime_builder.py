@@ -111,6 +111,13 @@ def _invalidate_cache_if_stale(target_cache_dir: Path, current_state: str) -> No
     commit_file.write_text(current_state + "\n")
 
 
+def _compile_definition_signature(compile_definitions: Optional[dict[str, str]]) -> str:
+    if not compile_definitions:
+        return ""
+    encoded = json.dumps(sorted(compile_definitions.items()), separators=(",", ":"))
+    return "defs-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+
+
 @dataclass
 class RuntimeBinaries:
     """Paths to the compiled runtime binaries.
@@ -267,7 +274,12 @@ class RuntimeBuilder:
             dispatcher_path=dispatcher_path,
         )
 
-    def get_binaries(self, name: str, build: bool = False) -> RuntimeBinaries:
+    def get_binaries(
+        self,
+        name: str,
+        build: bool = False,
+        compile_definitions: Optional[dict[str, str]] = None,
+    ) -> RuntimeBinaries:
         """Return paths to compiled runtime binaries.
 
         By default, looks up pre-built binaries from build/lib/. When
@@ -288,7 +300,10 @@ class RuntimeBuilder:
         self._validate_runtime(name)
 
         arch, variant = self._arch, self._variant
+        definition_signature = _compile_definition_signature(compile_definitions)
         output_dir = self._LIB_DIR / arch / variant / name
+        if definition_signature:
+            output_dir = output_dir / definition_signature
         # Per-arch shared destination for libsimpler_aicpu_dispatcher.so. The
         # dispatcher has no runtime-specific code, so all runtimes on a given
         # arch reuse the same SO instead of carrying a copy each (~50 KB × N).
@@ -310,6 +325,8 @@ class RuntimeBuilder:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name
+            if definition_signature:
+                cache_dir = cache_dir / definition_signature
             cache_dir.mkdir(parents=True, exist_ok=True)
 
             # File lock to prevent concurrent cmake runs in the same build dir.
@@ -326,6 +343,7 @@ class RuntimeBuilder:
                     build_dir=str(cache_dir),
                     output_dir=output_dir,
                     dispatcher_dest=dispatcher_staging_dir if target == "aicpu" else None,
+                    compile_definitions=compile_definitions,
                 )
 
         logger.info("Compiling AICore, AICPU, Host in parallel...")
@@ -369,6 +387,7 @@ class RuntimeBuilder:
         extra_sources: list[Path],
         cache_key: str,
         pto_isa_root: Optional[str] = None,
+        compile_definitions: Optional[dict[str, str]] = None,
     ) -> Path:
         """Build a per-callable AICore image with additional source files.
 
@@ -395,8 +414,14 @@ class RuntimeBuilder:
             include_dirs.extend([str(pto_root / "include"), str(pto_root / "include" / "pto")])
 
         arch, variant = self._arch, self._variant
-        cache_dir = self._CACHE_DIR / arch / variant / name / "aicore-extra" / cache_key
-        output_dir = self._LIB_DIR / arch / variant / name / "aicore-extra" / cache_key
+        definition_signature = _compile_definition_signature(compile_definitions)
+        cache_dir = self._CACHE_DIR / arch / variant / name
+        output_dir = self._LIB_DIR / arch / variant / name
+        if definition_signature:
+            cache_dir = cache_dir / definition_signature
+            output_dir = output_dir / definition_signature
+        cache_dir = cache_dir / "aicore-extra" / cache_key
+        output_dir = output_dir / "aicore-extra" / cache_key
         cache_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -414,6 +439,7 @@ class RuntimeBuilder:
                 build_dir=str(cache_dir),
                 output_dir=output_dir,
                 source_files=[str(p) for p in extra_sources],
+                compile_definitions=compile_definitions,
             )
 
     def _resolve_dispatcher_path(self) -> Optional[Path]:

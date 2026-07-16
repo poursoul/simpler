@@ -207,6 +207,36 @@ class TestRuntimeBuilderPtoIsaValidation:
 # --- Build integration tests (mocked compilation) ---
 
 
+class TestBuildTargetCMakeArgs:
+    """Test CMake argument generation for runtime build targets."""
+
+    def test_compile_definitions_are_emitted(self):
+        from simpler_setup.runtime_compiler import BuildTarget  # noqa: PLC0415
+        from simpler_setup.toolchain import Toolchain  # noqa: PLC0415
+
+        class FakeToolchain(Toolchain):
+            is_host = False
+            cxx_path = "c++"
+
+            def __init__(self):
+                pass
+
+            def get_compile_flags(self, **kwargs):
+                return []
+
+            def get_cmake_args(self):
+                return ["-DCMAKE_CXX_COMPILER=c++"]
+
+        target = BuildTarget(FakeToolchain(), "/tmp/src", "out.so")
+        args = target.gen_cmake_args(
+            ["/tmp/include"],
+            ["/tmp/source"],
+            compile_definitions={"PTO_FDWIC_SHARED_TENSORMAP": "1"},
+        )
+
+        assert "-DCUSTOM_COMPILE_DEFINITIONS=PTO_FDWIC_SHARED_TENSORMAP=1" in args
+
+
 class TestRuntimeBuilderGetBinaries:
     """Test get_binaries(build=True) logic with mocked RuntimeCompiler."""
 
@@ -276,6 +306,29 @@ class TestRuntimeBuilderGetBinaries:
         assert mock_instance.compile.call_count == 3
         targets = sorted(call.args[0] for call in mock_instance.compile.call_args_list)
         assert targets == ["aicore", "aicpu", "host"]
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_compile_definitions_are_forwarded_and_separate_output(
+        self, MockCompiler, tmp_path, default_test_platform, test_arch
+    ):
+        """Macro build variants are forwarded to CMake and staged under a distinct output directory."""
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, test_arch)
+
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+
+        builder = RuntimeBuilder(platform=default_test_platform)
+        result = builder.get_binaries(
+            "test_rt",
+            build=True,
+            compile_definitions={"PTO_FDWIC_SHARED_TENSORMAP": "1"},
+        )
+
+        assert result.aicore_path.parent.name.startswith("defs-")
+        for call in mock_instance.compile.call_args_list:
+            assert call.kwargs["compile_definitions"] == {"PTO_FDWIC_SHARED_TENSORMAP": "1"}
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_resolves_paths_relative_to_config(self, MockCompiler, tmp_path, default_test_platform, test_arch):

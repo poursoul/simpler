@@ -9,30 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#pragma once
+#include <cstdint>
 
-#if defined(__CPU_SIM)
-#define DIST_SIM_HOST_CLOCK 1
-#else
-#define DIST_SIM_HOST_CLOCK 0
+#if __has_include("inner_kernel.h")
+#include "inner_kernel.h"
+#elif __has_include(<pto/pto-inst.hpp>)
+#include <pto/pto-inst.hpp>
 #endif
 
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
+#ifndef __gm__
+#define __gm__
 #endif
 
-#ifndef PTO_FDWIC_SHARED_TENSORMAP
-#define PTO_FDWIC_SHARED_TENSORMAP 0
+#ifndef __aicore__
+#define __aicore__
 #endif
 
-#if defined(PTO2_PROFILING) && PTO2_PROFILING
-#define DIST_TRACE_ENABLED 1
-#else
-#define DIST_TRACE_ENABLED 0
-#endif
-
-#if defined(__CCE_AICORE__)
-#define DIST_API_ATTR __attribute__((weak))
-#else
-#define DIST_API_ATTR
-#endif
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { (void)args; }

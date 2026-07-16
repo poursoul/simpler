@@ -388,6 +388,7 @@ class KernelCompiler:
         source_path: str,
         extra_include_dirs: Optional[list[str]] = None,
         build_dir: Optional[str] = None,
+        compile_definitions: Optional[dict[str, str]] = None,
     ) -> bytes:
         """Compile an orchestration function for the given runtime.
 
@@ -443,6 +444,7 @@ class KernelCompiler:
             extra_include_dirs=include_dirs,
             extra_sources=orch_sources or None,
             build_dir=build_dir,
+            compile_definitions=compile_definitions,
         )
 
     def _compile_orchestration_shared_lib(
@@ -452,6 +454,7 @@ class KernelCompiler:
         extra_include_dirs: Optional[list[str]] = None,
         extra_sources: Optional[list[str]] = None,
         build_dir: Optional[str] = None,
+        compile_definitions: Optional[dict[str, str]] = None,
     ) -> bytes:
         """Compile an orchestration function to a shared library (.so).
 
@@ -477,6 +480,9 @@ class KernelCompiler:
 
         cmd = [toolchain.cxx_path] + toolchain.get_compile_flags()
         cmd += self._sanitizer_flags(toolchain)
+        if compile_definitions:
+            for key, value in sorted(compile_definitions.items()):
+                cmd.append(f"-D{key}={value}")
 
         # Force a deterministic ELF GNU Build-ID into every orchestration .so.
         # The host-side DeviceRunner reads `.note.gnu.build-id` to detect when

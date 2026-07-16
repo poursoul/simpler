@@ -104,6 +104,7 @@ PTO_DEVICE_FUNC void dist_submit_wait_slot_capacity(__gm__ DistCore *self, int32
     }
 }
 
+#if !PTO_FDWIC_SHARED_TENSORMAP
 PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.self == nullptr || ctx.output_bytes == 0 || g_dist.heap_base == nullptr) return true;
     const size_t ring = g_dist.heap_size;
@@ -210,6 +211,7 @@ PTO_DEVICE_FUNC void dist_submit_complete_alloc(DistSubmitCtx &ctx) {
         if (ctx.self != nullptr) complete_executed_task(ctx.self, ctx.task_id);
     }
 }
+#endif
 
 #include "dist_engine/aicore/run_state.h"
 
@@ -262,6 +264,137 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
 
 }  // namespace
 
+#if PTO_FDWIC_SHARED_TENSORMAP
+PTO_DEVICE_FUNC uint32_t dist_submit_count_fresh_outputs(const L0TaskArgs &args) {
+    uint32_t count = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        if (args.tag(i) == TensorArgType::OUTPUT) count++;
+    }
+    return count;
+}
+
+PTO_DEVICE_FUNC void dist_submit_shared_publish_outputs(int32_t task_id, uint32_t output_count) {
+    for (uint32_t slot = 0; slot < output_count; slot++)
+        shared_map_insert_symbol(g_dist.shared_map, task_id, slot);
+}
+
+PTO_DEVICE_FUNC bool dist_submit_shared_resolve_symbolic_inputs(const L0TaskArgs &args, DistSubmitCtx &ctx) {
+    bool waited = false;
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag == TensorArgType::OUTPUT) continue;
+        if (!args.tensor(i).tensor_is_symbolic()) continue;
+        if (!waited) {
+            shared_wait_published_before(ctx.self, ctx.task_id);
+            waited = true;
+        }
+        const SymbolicTensor sym = args.tensor(i).symbol();
+        __gm__ const SharedMapEntry *entry = nullptr;
+        if (!shared_map_lookup_symbol(
+                g_dist.shared_map, static_cast<int32_t>(sym.producer_task_id.raw & 0xFFFFFFFFu), sym.output_slot, entry
+            )) {
+            set_fatal();
+            return false;
+        }
+        (void)tag;
+        (void)entry;
+    }
+    return !fatal_set();
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
+    PTO2Runtime *, const MixedKernels &mixed, uint32_t output_count, DistSubmitBuildFn build_fn, void *build_ctx
+) {
+    L0TaskArgs empty_args;
+    DistSubmitCtx ctx;
+    dist_submit_begin(nullptr, empty_args, ctx);
+    ctx.result.set_symbolic_output_count(output_count);
+    TRACE_SPAN_BEGIN(submit_trace);
+    TRACE_LAP_RESET(ctx.self);
+    drain_block_won(ctx.self);
+    drain_phase_b(ctx.self);
+    TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
+
+    TRACE_SPAN_BEGIN(claim_trace);
+    const bool is_winner = dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
+    TRACE_SPAN_END(
+        claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, static_cast<uint32_t>(is_winner), 0
+    );
+
+    if (is_winner) {
+        atomic_fetch_add<int64_t>(g_dist.shared_winner_count.v, 1);
+        L0TaskArgs args;
+        atomic_fetch_add<int64_t>(g_dist.shared_builder_count.v, 1);
+        if (build_fn != nullptr) build_fn(&args, build_ctx);
+        const uint32_t actual_outputs = dist_submit_count_fresh_outputs(args);
+        if (args.has_error || actual_outputs != output_count) {
+            set_fatal();
+        } else if (!dist_submit_shared_resolve_symbolic_inputs(args, ctx)) {
+            set_fatal();
+        } else {
+            dist_submit_shared_publish_outputs(ctx.task_id, output_count);
+            shared_publish_done(ctx.task_id);
+            complete_executed_task(ctx.self, ctx.task_id);
+            if (output_count == 0) atomic_fetch_add<int64_t>(g_dist.shared_zero_output_complete_count.v, 1);
+        }
+    } else {
+        atomic_fetch_add<int64_t>(g_dist.shared_loser_count.v, 1);
+        TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Replay);
+        drain_block_won(ctx.self);
+    }
+    TRACE_SPAN_END(
+        submit_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit, static_cast<uint32_t>(is_winner), 0
+    );
+    return ctx.result;
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
+dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
+    DistSubmitCtx ctx;
+    dist_submit_begin(nullptr, args, ctx);
+    ctx.result.set_symbolic_output_count(dist_submit_count_fresh_outputs(args));
+    TRACE_SPAN_BEGIN(submit_trace);
+    TRACE_LAP_RESET(ctx.self);
+    drain_block_won(ctx.self);
+    drain_phase_b(ctx.self);
+    TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
+
+    TRACE_SPAN_BEGIN(claim_trace);
+    const bool is_winner = dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
+    TRACE_SPAN_END(
+        claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, static_cast<uint32_t>(is_winner), 0
+    );
+
+    if (is_winner) {
+        set_fatal();
+    } else {
+        TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Replay);
+        drain_block_won(ctx.self);
+    }
+    TRACE_SPAN_END(
+        submit_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit, static_cast<uint32_t>(is_winner), 0
+    );
+    return ctx.result;
+}
+
+DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
+    DistSubmitCtx ctx;
+    dist_submit_begin(nullptr, args, ctx);
+    ctx.result.set_symbolic_output_count(dist_submit_count_fresh_outputs(args));
+    TRACE_SPAN_BEGIN(submit_trace);
+    TRACE_LAP_RESET(ctx.self);
+    drain_block_won(ctx.self);
+    drain_phase_b(ctx.self);
+    TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
+
+    TRACE_SPAN_BEGIN(claim_trace);
+    const bool is_winner = dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
+    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, static_cast<uint32_t>(is_winner), 1);
+    if (is_winner) set_fatal();
+    TRACE_SPAN_END(submit_trace, ctx.self, ctx.task_id, -1, TracePhase::Submit, static_cast<uint32_t>(is_winner), 1);
+    return ctx.result;
+}
+#else
 DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors
 dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
@@ -325,3 +458,4 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
     TRACE_SPAN_END(submit_trace, ctx.self, ctx.task_id, -1, TracePhase::Submit, static_cast<uint32_t>(is_winner), 1);
     return ctx.result;
 }
+#endif

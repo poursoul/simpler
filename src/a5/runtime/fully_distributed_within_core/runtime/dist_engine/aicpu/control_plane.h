@@ -13,6 +13,26 @@
 // configuration reads and signal-handler installation; AICore images never
 // include this file.
 
+#if PTO_FDWIC_SHARED_TENSORMAP
+void dist_shared_state_reset() {
+    atomic_exchange(g_dist.shared_map.high_water, int64_t{0}, __ATOMIC_RELAXED);
+    for (int32_t i = 0; i < kSharedSymbolBuckets; i++)
+        g_dist.shared_map.symbol_buckets[i] = -1;
+    for (int32_t i = 0; i < kSharedRangeBuckets; i++)
+        g_dist.shared_map.range_buckets[i] = -1;
+    for (int32_t i = 0; i < kTaskWindow; i++)
+        g_dist.shared_map.task_heads[i] = -1;
+    atomic_exchange(g_dist.shared_heap_top.v, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.producer_publish_cursor.v, int64_t{-1}, __ATOMIC_RELAXED);
+    for (int32_t i = 0; i < kFlagCap; i++)
+        atomic_exchange(g_dist.published[i].v, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.shared_winner_count.v, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.shared_loser_count.v, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.shared_builder_count.v, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.shared_zero_output_complete_count.v, int64_t{0}, __ATOMIC_RELAXED);
+}
+#endif
+
 void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
     if (rt == nullptr || rt->dist_global == nullptr || rt->gm_heap == nullptr || rt->gm_heap_size == 0) {
         DIST_ERRF("[dist_engine] missing host-allocated runtime state\n");
@@ -46,6 +66,9 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     atomic_exchange(g_dist.frontier, int64_t{-1}, __ATOMIC_RELAXED);
     for (int32_t i = 0; i < kFlagCap; i++)
         reset_task_cell(i);
+#if PTO_FDWIC_SHARED_TENSORMAP
+    dist_shared_state_reset();
+#endif
     atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.replay_done, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.started_count, int64_t{0}, __ATOMIC_RELAXED);

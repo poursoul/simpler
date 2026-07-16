@@ -19,6 +19,10 @@ namespace {
 // AICore sim orchestration replay shares the submit runtime path, so scalar
 // reads/writes must drain the worker's own queue until the producer is complete.
 PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
+#if PTO_FDWIC_SHARED_TENSORMAP
+    (void)self;
+    (void)t;
+#else
     const int32_t p = dist_tensor_map_lookup(self->map, t);
     if (p < 0) return;
     uint64_t wd = 0;
@@ -30,6 +34,7 @@ PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
             watchdog(wd);
         }
     }
+#endif
 }
 #endif
 

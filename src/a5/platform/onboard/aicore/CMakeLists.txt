@@ -55,6 +55,13 @@ foreach(INC_DIR ${CMAKE_CUSTOM_INCLUDE_DIRS})
     list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${INC_DIR}")
 endforeach()
 
+set(CMAKE_CUSTOM_DEFINITION_FLAGS "")
+if(DEFINED CUSTOM_COMPILE_DEFINITIONS)
+    foreach(COMPILE_DEFINITION ${CUSTOM_COMPILE_DEFINITIONS})
+        list(APPEND CMAKE_CUSTOM_DEFINITION_FLAGS "-D${COMPILE_DEFINITION}")
+    endforeach()
+endif()
+
 # Compiler flags
 set(AICORE_FLAGS
     "-c -O3 -g -x cce -Wall -std=c++17 \
@@ -67,6 +74,7 @@ set(AICORE_FLAGS
     ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}"
 )
 separate_arguments(AICORE_FLAGS)
+list(APPEND AICORE_FLAGS ${CMAKE_CUSTOM_DEFINITION_FLAGS})
 
 # Step 1: Compile each source file to individual .o files for AIC and AIV
 set(ALL_AIC_OBJECTS "")

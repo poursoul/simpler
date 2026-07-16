@@ -120,6 +120,14 @@ def get_aicore_path_override(cache_key) -> Path | None:
     return _aicore_override_cache.get(cache_key)
 
 
+def _runtime_compile_definitions_for(cls) -> dict[str, str]:
+    return dict(getattr(cls, "RUNTIME_COMPILE_DEFINITIONS", {}) or {})
+
+
+def _runtime_definition_cache_token(cls) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(_runtime_compile_definitions_for(cls).items()))
+
+
 def maybe_build_aicore_override(
     cache_key,
     platform: str,
@@ -127,6 +135,7 @@ def maybe_build_aicore_override(
     orch_source: str,
     incores: list[dict],
     pto_isa_root: str | None = None,
+    compile_definitions: dict[str, str] | None = None,
 ) -> Path | None:
     if platform not in {"a5", "a5sim"} or runtime != "fully_distributed_within_core":
         return None
@@ -142,7 +151,13 @@ def maybe_build_aicore_override(
             source_paths.append(wrapper_path)
     key = _aicore_extra_cache_key(cache_key, source_paths)
     builder = RuntimeBuilder(platform)
-    return builder.build_aicore_with_extra_sources(runtime, source_paths, key, pto_isa_root=pto_isa_root)
+    return builder.build_aicore_with_extra_sources(
+        runtime,
+        source_paths,
+        key,
+        pto_isa_root=pto_isa_root,
+        compile_definitions=compile_definitions,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1080,7 +1095,7 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
         raise AssertionError("\n".join(mismatches))
 
 
-def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
+def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key, compile_definitions=None):
     """Compile a chip entry spec (orchestration + incores) -> ChipCallable. Session-cached."""
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
@@ -1098,7 +1113,11 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     kc = KernelCompiler(platform=platform)
     is_sim = platform.endswith("sim")
 
-    orch_binary = kc.compile_orchestration(runtime, orch["source"])
+    orch_binary = kc.compile_orchestration(
+        runtime,
+        orch["source"],
+        compile_definitions=compile_definitions,
+    )
     inc_dirs = kc.get_orchestration_include_dirs(runtime)
 
     kernel_binaries = []
@@ -1118,7 +1137,13 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
         config_name=orch.get("config_name", ""),
     )
     aicore_override = maybe_build_aicore_override(
-        cache_key, platform, runtime, orch["source"], incores, pto_isa_root=pto_isa_root
+        cache_key,
+        platform,
+        runtime,
+        orch["source"],
+        incores,
+        pto_isa_root=pto_isa_root,
+        compile_definitions=compile_definitions,
     )
     if aicore_override is not None:
         _aicore_override_cache[cache_key] = aicore_override
@@ -1164,6 +1189,7 @@ class SceneTestCase:
     RTOL: float = 1e-5
     ATOL: float = 1e-5
     RUNTIME_ENV: dict = {}
+    RUNTIME_COMPILE_DEFINITIONS: dict = {}
 
     def generate_args(self, params) -> TaskArgsBuilder:
         """Return TaskArgsBuilder with ordered Tensor/Scalar specs."""
@@ -1180,8 +1206,15 @@ class SceneTestCase:
     @classmethod
     def compile_chip_callable(cls, platform):
         """Compile CALLABLE -> ChipCallable (L2). Session-cached."""
-        cache_key = (cls.__qualname__, platform, cls._st_runtime)
-        return _compile_chip_callable_from_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
+        compile_definitions = _runtime_compile_definitions_for(cls)
+        cache_key = (cls.__qualname__, platform, cls._st_runtime, _runtime_definition_cache_token(cls))
+        return _compile_chip_callable_from_spec(
+            cls.CALLABLE,
+            platform,
+            cls._st_runtime,
+            cache_key,
+            compile_definitions=compile_definitions,
+        )
 
     @classmethod
     def _compile_l3_callables(cls, platform):
@@ -1190,8 +1223,21 @@ class SceneTestCase:
         for entry in cls.CALLABLE["callables"]:
             if "orchestration" in entry:
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, platform, cls._st_runtime)
-                chip = _compile_chip_callable_from_spec(entry, platform, cls._st_runtime, cache_key)
+                compile_definitions = _runtime_compile_definitions_for(cls)
+                cache_key = (
+                    cls.__qualname__,
+                    name,
+                    platform,
+                    cls._st_runtime,
+                    _runtime_definition_cache_token(cls),
+                )
+                chip = _compile_chip_callable_from_spec(
+                    entry,
+                    platform,
+                    cls._st_runtime,
+                    cache_key,
+                    compile_definitions=compile_definitions,
+                )
                 compiled[name] = chip
                 compiled[f"{name}_sig"] = entry["orchestration"].get("signature", [])
         return compiled
@@ -1211,10 +1257,13 @@ class SceneTestCase:
         """
         from simpler.worker import Worker  # noqa: PLC0415
 
-        cache_key = (cls.__qualname__, platform, cls._st_runtime)
+        cache_key = (cls.__qualname__, platform, cls._st_runtime, _runtime_definition_cache_token(cls))
         cls.compile_chip_callable(platform)
         aicore_override = get_aicore_path_override(cache_key)
         kwargs = {}
+        compile_definitions = _runtime_compile_definitions_for(cls)
+        if compile_definitions:
+            kwargs["runtime_compile_definitions"] = compile_definitions
         if aicore_override is not None:
             kwargs["aicore_path_override"] = aicore_override
         w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime, **kwargs)
@@ -2223,6 +2272,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         num_sub_workers=max_subs,
         platform=args.platform,
         runtime=first_cls._st_runtime,
+        runtime_compile_definitions=_runtime_compile_definitions_for(first_cls),
     )
     # Prepare sub callables per-class to avoid name collisions.
     per_class_sub_handles: dict[type, dict] = {}
@@ -2238,8 +2288,21 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
                 cls_sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
-                chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
+                compile_definitions = _runtime_compile_definitions_for(cls)
+                cache_key = (
+                    cls.__qualname__,
+                    name,
+                    args.platform,
+                    cls._st_runtime,
+                    _runtime_definition_cache_token(cls),
+                )
+                chip = _compile_chip_callable_from_spec(
+                    entry,
+                    args.platform,
+                    cls._st_runtime,
+                    cache_key,
+                    compile_definitions=compile_definitions,
+                )
                 handle = worker.register(chip)
                 cls_chip_handles[name] = handle
                 cls_chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])

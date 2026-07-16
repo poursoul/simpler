@@ -73,6 +73,7 @@ constexpr int32_t kMapBuckets = 1 << 13;
 constexpr int32_t kMapBucketShift = 13;
 constexpr int32_t kTaskWindow = 1 << 10;
 constexpr int32_t kTaskWindowMask = kTaskWindow - 1;
+constexpr size_t kCacheLine = 64;
 
 struct DistTensorMap {
     MapEntry entries[kMapCap];
@@ -83,6 +84,38 @@ struct DistTensorMap {
     int32_t alive_floor;
     int32_t cleaned_upto;
 };
+
+#if PTO_FDWIC_SHARED_TENSORMAP
+struct SharedMapEntry {
+    int32_t owner_task_id;
+    int32_t output_slot;
+    int32_t next_in_symbol_bucket;
+    int32_t next_in_range_bucket;
+    int32_t next_in_task;
+    uint8_t pad[44];
+};
+static_assert(sizeof(SharedMapEntry) == 64, "SharedMapEntry must occupy one cacheline in the first skeleton");
+
+constexpr int32_t kSharedMapCap = kMapCap;
+constexpr int32_t kSharedSymbolBuckets = kMapBuckets;
+constexpr int32_t kSharedRangeBuckets = kMapBuckets;
+
+struct SharedDistTensorMap {
+    SharedMapEntry entries[kSharedMapCap];
+    int32_t symbol_buckets[kSharedSymbolBuckets];
+    int32_t range_buckets[kSharedRangeBuckets];
+    int32_t task_heads[kTaskWindow];
+    volatile int64_t high_water;
+    uint8_t tail_pad[56];
+};
+static_assert(sizeof(SharedDistTensorMap) % 64 == 0, "SharedDistTensorMap must not share cachelines");
+
+struct PublishedCell {
+    volatile int64_t v;
+    uint8_t pad[kCacheLine - sizeof(int64_t)];
+};
+static_assert(sizeof(PublishedCell) == kCacheLine, "PublishedCell must occupy one cacheline");
+#endif
 
 enum class TracePhase : int32_t {
     Kernel = 0,
@@ -207,11 +240,17 @@ struct DistCore {
     int32_t lane;
     int32_t sub_block_id;
     int32_t local_index;
+#if !PTO_FDWIC_SHARED_TENSORMAP
     uint64_t heap_next;
 
     DistTensorMap map;
+#endif
 
+#if PTO_FDWIC_SHARED_TENSORMAP
+    uint8_t slots_pad[40];
+#else
     uint8_t slots_pad[16];
+#endif
     RingSlot slots[kPrivateSlots];
     int32_t occupied_count;
     int32_t owned_total;
@@ -224,7 +263,6 @@ static_assert(offsetof(DistCore, slots) % 64 == 0, "DistCore slots must be cache
 static_assert(offsetof(DistCore, task_payloads) % 64 == 0, "DistCore task_payloads must be cacheline-aligned");
 
 constexpr int32_t kCursorShards = 4;
-constexpr size_t kCacheLine = 64;
 static_assert(PTO2_PACKED_OUTPUT_ALIGN >= kCacheLine);
 static_assert((PTO2_PACKED_OUTPUT_ALIGN % kCacheLine) == 0);
 
@@ -254,6 +292,17 @@ struct DistGlobal {
 
     uint8_t *heap_base;
     size_t heap_size;
+
+#if PTO_FDWIC_SHARED_TENSORMAP
+    SharedDistTensorMap shared_map;
+    PaddedCursor shared_heap_top;
+    PaddedCursor producer_publish_cursor;
+    PublishedCell published[kFlagCap];
+    PaddedCursor shared_winner_count;
+    PaddedCursor shared_loser_count;
+    PaddedCursor shared_builder_count;
+    PaddedCursor shared_zero_output_complete_count;
+#endif
 
     const L2TaskArgs *orch_args;
     PTO2Runtime *rt;

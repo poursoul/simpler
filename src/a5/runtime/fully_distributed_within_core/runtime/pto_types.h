@@ -38,6 +38,7 @@
 
 #include "aicpu/dump_arg_selection.h"
 #include "data_type.h"
+#include "dist_engine/common/target.h"
 #include "intrinsic.h"  // for __gm__ (empty on sim/AICPU; __gm__ under CCEC)
 #include "profiling_config.h"
 #include "pto_submit_types.h"
@@ -65,6 +66,13 @@ enum class PTO2ScopeMode : uint8_t {
     AUTO = 0,
     MANUAL = 1,
 };
+
+#if PTO_FDWIC_SHARED_TENSORMAP
+struct SymbolicTensor {
+    PTO2TaskId producer_task_id;
+    uint32_t output_slot;
+};
+#endif
 
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
@@ -125,6 +133,21 @@ public:
 
     PTO_DEVICE_FUNC PTO2TaskId task_id() const { return task_id_; }
 
+#if PTO_FDWIC_SHARED_TENSORMAP
+    PTO_DEVICE_FUNC void set_symbolic_output_count(uint32_t output_count) {
+        always_assert(output_count <= MAX_TENSOR_ARGS);
+        output_count_ = output_count;
+    }
+
+    PTO_DEVICE_FUNC SymbolicTensor get_symbol(uint32_t index) const {
+        always_assert(index < output_count_);
+        SymbolicTensor sym;
+        sym.producer_task_id = task_id_;
+        sym.output_slot = index;
+        return sym;
+    }
+#endif
+
 private:
     PTO2TaskId task_id_;
     uint32_t output_count_;
@@ -164,12 +187,18 @@ class TensorRef {
 #endif
         const TensorCreateInfo *create_info_;
     };
+#if PTO_FDWIC_SHARED_TENSORMAP
+    SymbolicTensor symbol_;
+#endif
     uint8_t kind_;
 
     enum Kind : uint8_t {
         kTensor = 0,
         kGmTensor = 1,
         kCreateInfo = 2,
+#if PTO_FDWIC_SHARED_TENSORMAP
+        kSymbolic = 3,
+#endif
     };
 
 public:
@@ -191,6 +220,13 @@ public:
         kind_ = kCreateInfo;
         return *this;
     }
+#if PTO_FDWIC_SHARED_TENSORMAP
+    PTO_DEVICE_FUNC TensorRef &operator=(SymbolicTensor symbol) {
+        symbol_ = symbol;
+        kind_ = kSymbolic;
+        return *this;
+    }
+#endif
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC TensorRef &set_gm_tensor(__gm__ const Tensor *p) {
         gm_ptr_ = p;
@@ -203,6 +239,12 @@ public:
     PTO_DEVICE_FUNC __gm__ const Tensor &gm_ref() const { return *gm_ptr_; }
 #endif
     PTO_DEVICE_FUNC const TensorCreateInfo &create_info() const { return *create_info_; }
+#if PTO_FDWIC_SHARED_TENSORMAP
+    PTO_DEVICE_FUNC SymbolicTensor symbol() const { return symbol_; }
+    PTO_DEVICE_FUNC bool tensor_is_symbolic() const { return kind_ == kSymbolic; }
+#else
+    PTO_DEVICE_FUNC bool tensor_is_symbolic() const { return false; }
+#endif
     PTO_DEVICE_FUNC bool tensor_from_gm() const { return kind_ == kGmTensor; }
     PTO_DEVICE_FUNC bool refers_to(const Tensor *t) const { return ptr_ == t; }
     PTO_DEVICE_FUNC bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
@@ -623,7 +665,13 @@ private:
         // checks; the AICore orchestration path is trusted to pass lvalues and
         // matching element types (temporaries would fail differently on device).
         static_assert(
-            (std::is_lvalue_reference_v<Args> && ...),
+            ((
+                 std::is_lvalue_reference_v<Args>
+#if PTO_FDWIC_SHARED_TENSORMAP
+                 || std::is_same_v<std::decay_t<Args>, SymbolicTensor>
+#endif
+             ) &&
+             ...),
             "temporaries are not allowed — stored pointers would dangle after the call"
         );
         if constexpr (is_output) {
@@ -633,7 +681,16 @@ private:
                 "add_output: all arguments must be the same type (all Tensor or all TensorCreateInfo)"
             );
         } else {
-            static_assert((std::is_same_v<std::decay_t<Args>, Tensor> && ...), "all arguments must be Tensor");
+            static_assert(
+                ((
+                     std::is_same_v<std::decay_t<Args>, Tensor>
+#if PTO_FDWIC_SHARED_TENSORMAP
+                     || std::is_same_v<std::decay_t<Args>, SymbolicTensor>
+#endif
+                 ) &&
+                 ...),
+                "all arguments must be Tensor"
+            );
         }
 #endif
     }
@@ -681,6 +738,14 @@ private:
         tensor_count_++;
     }
 
+#if PTO_FDWIC_SHARED_TENSORMAP
+    PTO_DEVICE_FUNC void add_tensor_ref(SymbolicTensor symbol, TensorArgType tag) {
+        tensors_[tensor_count_] = symbol;
+        tags_[tensor_count_] = tag;
+        tensor_count_++;
+    }
+#endif
+
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC void add_tensor_ref(__gm__ const Tensor &tensor, TensorArgType tag) {
         tensors_[tensor_count_].set_gm_tensor(&tensor);
@@ -724,6 +789,14 @@ private:
         set_tag_slot(tensor_count_, tag);
         tensor_count_++;
     }
+
+#if PTO_FDWIC_SHARED_TENSORMAP
+    PTO_DEVICE_FUNC void add_tensor_arg(SymbolicTensor symbol, TensorArgType tag) {
+        tensors_[tensor_count_] = symbol;
+        set_tag_slot(tensor_count_, tag);
+        tensor_count_++;
+    }
+#endif
 
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC void add_tensor_arg(__gm__ const Tensor &tensor, TensorArgType tag) {

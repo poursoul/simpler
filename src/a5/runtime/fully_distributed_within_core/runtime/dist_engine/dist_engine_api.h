@@ -46,6 +46,13 @@
 
 struct PTO2Runtime;
 
+#if PTO_FDWIC_SHARED_TENSORMAP
+using DistSubmitBuildFn = void (*)(L0TaskArgs *args, void *ctx);
+PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
+    PTO2Runtime *rt, const MixedKernels &mixed, uint32_t output_count, DistSubmitBuildFn build_fn, void *build_ctx
+);
+#endif
+
 // Task submission and allocation. Host/sim definitions use the per-core g_self
 // stashed by dist_core_main / thread_local sim. CCEC definitions use the same
 // materialize/map/fanin/register stages, then dispatch through the current

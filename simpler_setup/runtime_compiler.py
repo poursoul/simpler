@@ -46,6 +46,7 @@ class BuildTarget:
         source_dirs: list[str],
         sanitizers: str = "",
         source_files: Optional[list[str]] = None,
+        compile_definitions: Optional[dict[str, str]] = None,
     ) -> list[str]:
         """Generate CMake arguments list from toolchain args + custom directories."""
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
@@ -57,6 +58,9 @@ class BuildTarget:
         if source_files:
             files = ";".join(os.path.abspath(f) for f in source_files)
             args.append(f"-DCUSTOM_SOURCE_FILES={files}")
+        if compile_definitions:
+            defs = ";".join(f"{k}={v}" for k, v in sorted(compile_definitions.items()))
+            args.append(f"-DCUSTOM_COMPILE_DEFINITIONS={defs}")
         # Sanitizers only apply to host-compiled targets — device toolchains
         # (ccec, aarch64 cross) run on the NPU and can't carry a host sanitizer
         # runtime. cmake/sanitizers.cmake reads both defines.
@@ -231,6 +235,7 @@ class RuntimeCompiler:
         output_dir: Optional[Union[str, Path]] = None,
         dispatcher_dest: Optional[Union[str, Path]] = None,
         source_files: Optional[list[str]] = None,
+        compile_definitions: Optional[dict[str, str]] = None,
     ) -> Union[bytes, Path]:
         """
         Compile binary for the specified target platform.
@@ -272,6 +277,7 @@ class RuntimeCompiler:
             source_dirs,
             sanitizers=self._sanitizers,
             source_files=source_files,
+            compile_definitions=compile_definitions,
         )
         cmake_source_dir = target.get_root_dir()
         binary_name = target.get_binary_name()

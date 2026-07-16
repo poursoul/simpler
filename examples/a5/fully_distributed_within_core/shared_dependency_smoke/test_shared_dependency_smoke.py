@@ -23,7 +23,7 @@ class TestSharedDependencySmoke(SceneTestCase):
 
     CALLABLE = {
         "orchestration": {
-            "source": "../submit_dependency_smoke/kernels/orchestration/submit_dependency_orch.cpp",
+            "source": "kernels/orchestration/shared_dependency_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.INOUT, D.INOUT],
         },
@@ -88,10 +88,24 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 4096, "mode": 1},
         },
         {
+            "name": "A5OnboardBd36OverlapSubView",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 1},
+        },
+        {
             "name": "A5SimBd36ExistingInoutChain",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 4096, "mode": 2},
+        },
+        {
+            "name": "A5OnboardBd36ExistingInoutChain",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 2},
         },
         {
             "name": "A5SimBd36SubViewOnly",
@@ -100,10 +114,24 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 4096, "mode": 3},
         },
         {
+            "name": "A5OnboardBd36SubViewOnly",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 3},
+        },
+        {
             "name": "A5SimBd36ScalarOffsetOnly",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 4096, "mode": 4},
+        },
+        {
+            "name": "A5OnboardBd36ScalarOffsetOnly",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 4},
         },
         {
             "name": "A5SimBd36InspectSubView",
@@ -112,10 +140,43 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 4096, "mode": 5},
         },
         {
+            "name": "A5OnboardBd36InspectSubView",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 5},
+        },
+        {
             "name": "A5SimBd36L0TaskArgsTagPersistence",
             "platforms": ["a5sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 4096, "mode": 14},
+        },
+        {
+            "name": "A5SimBd36EagerFullInout",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 30},
+        },
+        {
+            "name": "A5SimBd36BuilderFullInout",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 31},
+        },
+        {
+            "name": "A5OnboardBd36EagerFullInout",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 30},
+        },
+        {
+            "name": "A5OnboardBd36BuilderFullInout",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 31},
         },
         {
             "name": "A5OnboardBd36L0TaskArgsTagPersistence",
@@ -164,6 +225,9 @@ class TestSharedDependencySmoke(SceneTestCase):
         if mode == 14:
             args.output[:] = -1.0
             args.output[:12] = 1.0
+            return
+        if mode in {30, 31}:
+            args.output += 1.0
             return
         raise AssertionError(f"unsupported mode {mode}")
 

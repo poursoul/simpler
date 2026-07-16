@@ -91,6 +91,13 @@ class TestSharedDependencySmoke(SceneTestCase):
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.IN, D.INOUT],
             },
+            {
+                "func_id": 9,
+                "name": "MAKE_PAIR_AIC",
+                "source": "kernels/aic/make_pair.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.OUT, D.OUT],
+            },
         ],
     }
 
@@ -197,6 +204,12 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 128, "mode": 34},
         },
         {
+            "name": "A5SimBd36MultiOutputFanin",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 35},
+        },
+        {
             "name": "A5OnboardBd36EagerFullInout",
             "manual": True,
             "platforms": ["a5"],
@@ -230,6 +243,13 @@ class TestSharedDependencySmoke(SceneTestCase):
             "platforms": ["a5"],
             "config": {"block_dim": 36},
             "params": {"n": 128, "mode": 34},
+        },
+        {
+            "name": "A5OnboardBd36MultiOutputFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 35},
         },
         {
             "name": "A5OnboardBd36L0TaskArgsTagPersistence",
@@ -294,6 +314,9 @@ class TestSharedDependencySmoke(SceneTestCase):
             end = start + n // 2
             args.output[:] = -1.0
             args.output[: n // 2] = (args.input[start:end] * 2.0 + 3.0) * 3.0 + 8.0
+            return
+        if mode == 35:
+            args.output[:] = args.input * 8.0 + 19.0
             return
         raise AssertionError(f"unsupported mode {mode}")
 

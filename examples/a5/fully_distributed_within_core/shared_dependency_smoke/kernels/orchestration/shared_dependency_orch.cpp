@@ -19,6 +19,7 @@
 #define FUNC_INSPECT_VIEW_AIV 6
 #define FUNC_MAKE_LEFT_AIC 7
 #define FUNC_FANIN_AIV 8
+#define FUNC_MAKE_PAIR_AIC 9
 
 #if !defined(__CCE_AICORE__) && !defined(dcci)
 #define dcci(...) \
@@ -49,6 +50,29 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     const Tensor &dump = orch_args.tensor(2).ref();
     const uint64_t n = orch_args.scalar(0);
     const uint64_t mode = orch_args.scalar(1);
+
+    if (mode == 35) {
+        const uint32_t shape[1] = {static_cast<uint32_t>(n)};
+        TensorCreateInfo left_ci(shape, 1, DataType::FLOAT32);
+        TensorCreateInfo right_ci(shape, 1, DataType::FLOAT32);
+        L0TaskArgs pair_args;
+        pair_args.add_input(input);
+        pair_args.add_output(left_ci);
+        pair_args.add_output(right_ci);
+        pair_args.add_scalar(n);
+        TaskOutputTensors pair_out = rt_submit_aic_task(FUNC_MAKE_PAIR_AIC, pair_args);
+        __gm__ const Tensor &left = pair_out.get_ref(0);
+        __gm__ const Tensor &right = pair_out.get_ref(1);
+
+        L0TaskArgs fanin_args;
+        fanin_args.add_input(left);
+        fanin_args.add_input(right);
+        fanin_args.add_input(left);
+        fanin_args.add_inout(output);
+        fanin_args.add_scalar(n);
+        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        return;
+    }
 
     if (mode == 34) {
         const uint32_t shape[1] = {static_cast<uint32_t>(n)};

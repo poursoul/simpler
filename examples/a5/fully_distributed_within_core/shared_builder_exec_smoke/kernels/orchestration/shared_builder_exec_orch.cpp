@@ -17,6 +17,7 @@
 #define FUNC_CONSUME_TEMP_AIC 1
 #define FUNC_FILL_OUTPUT_AIC 2
 #define FUNC_BUMP_OUTPUT_AIC 3
+#define FUNC_CONSUME_TEMP_AIV 4
 
 extern "C" {
 
@@ -108,6 +109,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
+    const bool use_mixed = mode == 4 || mode == 5;
     const uint32_t shape[1] = {static_cast<uint32_t>(n)};
     TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
 
@@ -123,6 +125,29 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         });
     });
     const SymbolicTensor temp_symbol = temp.get_symbol(0);
+
+    if (use_mixed) {
+        MixedKernels mixed;
+        if (mode == 4) {
+            mixed.aic_kernel_id = FUNC_CONSUME_TEMP_AIC;
+            mixed.aiv0_kernel_id = FUNC_CONSUME_TEMP_AIV;
+        } else {
+            mixed.aiv0_kernel_id = FUNC_CONSUME_TEMP_AIV;
+            mixed.aiv1_kernel_id = FUNC_CONSUME_TEMP_AIV;
+        }
+        rt_submit_task<0>(mixed, [&](SubmitBuilder &builder) {
+            builder.add_input([&]() -> SymbolicTensor {
+                return temp_symbol;
+            });
+            builder.add_output([&]() -> const Tensor & {
+                return output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        return;
+    }
 
     rt_submit_aic_task<0>(FUNC_CONSUME_TEMP_AIC, [&](SubmitBuilder &builder) {
         builder.add_input([&]() -> SymbolicTensor {

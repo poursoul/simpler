@@ -85,6 +85,29 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
+    if (mode == 3) {
+        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) {
+            builder.add_input([&]() -> const Tensor & {
+                return input;
+            });
+            builder.add_output([&]() -> const Tensor & {
+                return output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        rt_submit_aic_task<0>(FUNC_BUMP_OUTPUT_AIC, [&](SubmitBuilder &builder) {
+            builder.add_inout([&]() -> const Tensor & {
+                return output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        return;
+    }
+
     const uint32_t shape[1] = {static_cast<uint32_t>(n)};
     TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
 

@@ -84,6 +84,12 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 128, "mode": 2},
         },
+        {
+            "name": "A5SimBd36OutputExistingN128",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 3},
+        },
     ]
 
     def generate_args(self, params):
@@ -97,7 +103,7 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
 
     def compute_golden(self, args, params):
         mode = int(params.get("mode", 0))
-        if mode == 1:
+        if mode in {1, 3}:
             args.output[:] = args.input + 4.0
         elif mode == 2:
             n = int(params["n"])

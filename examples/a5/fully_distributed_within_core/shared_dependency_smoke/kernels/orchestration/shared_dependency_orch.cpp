@@ -50,6 +50,31 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     const uint64_t n = orch_args.scalar(0);
     const uint64_t mode = orch_args.scalar(1);
 
+    if (mode == 34) {
+        const uint32_t shape[1] = {static_cast<uint32_t>(n)};
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+        L0TaskArgs left_args;
+        left_args.add_input(input);
+        left_args.add_output(scratch_ci);
+        left_args.add_scalar(n);
+        TaskOutputTensors left_out = rt_submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
+        __gm__ const Tensor &left = left_out.get_ref(0);
+
+        const uint32_t sub_n = static_cast<uint32_t>(n / 2);
+        const uint32_t sub_shape[1] = {sub_n};
+        const uint32_t sub_offset[1] = {static_cast<uint32_t>(n / 4)};
+        Tensor left_view = Tensor::view(left, sub_shape, sub_offset);
+
+        L0TaskArgs fanin_args;
+        fanin_args.add_input(left_view);
+        fanin_args.add_input(left_view);
+        fanin_args.add_input(left_view);
+        fanin_args.add_inout(output);
+        fanin_args.add_scalar(sub_n);
+        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        return;
+    }
+
     if (mode == 33) {
         const uint32_t shape[1] = {static_cast<uint32_t>(n)};
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);

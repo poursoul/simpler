@@ -191,6 +191,12 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 128, "mode": 33},
         },
         {
+            "name": "A5SimBd36TaskOutputViewFanin",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 34},
+        },
+        {
             "name": "A5OnboardBd36EagerFullInout",
             "manual": True,
             "platforms": ["a5"],
@@ -217,6 +223,13 @@ class TestSharedDependencySmoke(SceneTestCase):
             "platforms": ["a5"],
             "config": {"block_dim": 36},
             "params": {"n": 128, "mode": 33},
+        },
+        {
+            "name": "A5OnboardBd36TaskOutputViewFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 34},
         },
         {
             "name": "A5OnboardBd36L0TaskArgsTagPersistence",
@@ -274,6 +287,13 @@ class TestSharedDependencySmoke(SceneTestCase):
             return
         if mode == 33:
             args.output[:] = args.input * 3.0 + 29.0
+            return
+        if mode == 34:
+            n = int(params["n"])
+            start = n // 4
+            end = start + n // 2
+            args.output[:] = -1.0
+            args.output[: n // 2] = (args.input[start:end] * 2.0 + 3.0) * 3.0 + 8.0
             return
         raise AssertionError(f"unsupported mode {mode}")
 

@@ -279,7 +279,7 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
 }  // namespace
 
 #if PTO_FDWIC_SHARED_TENSORMAP
-PTO_DEVICE_FUNC bool dist_submit_shared_wait_heap_turn(DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC inline bool dist_submit_shared_wait_heap_turn(DistSubmitCtx &ctx) {
     const int32_t target = ctx.task_id - 1;
     if (target < 0) return true;
     while (atomic_load(g_dist.shared_heap_alloc_cursor.v, __ATOMIC_ACQUIRE) < target && !fatal_set()) {
@@ -289,7 +289,7 @@ PTO_DEVICE_FUNC bool dist_submit_shared_wait_heap_turn(DistSubmitCtx &ctx) {
     return !fatal_set();
 }
 
-PTO_DEVICE_FUNC bool dist_submit_shared_reserve_heap(DistSubmitCtx &ctx, uint64_t total, uint64_t &task_base) {
+PTO_DEVICE_FUNC inline bool dist_submit_shared_reserve_heap(DistSubmitCtx &ctx, uint64_t total, uint64_t &task_base) {
     if (ctx.task_id < 0 || ctx.task_id >= kFlagCap) {
         set_fatal();
         DIST_ERRF(
@@ -358,7 +358,7 @@ PTO_DEVICE_FUNC bool dist_submit_shared_reserve_heap(DistSubmitCtx &ctx, uint64_
     return false;
 }
 
-PTO_DEVICE_FUNC uint32_t dist_submit_count_fresh_outputs(const L0TaskArgs &args) {
+PTO_DEVICE_FUNC inline uint32_t dist_submit_count_fresh_outputs(const L0TaskArgs &args) {
     uint32_t count = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) == TensorArgType::OUTPUT) count++;
@@ -366,7 +366,7 @@ PTO_DEVICE_FUNC uint32_t dist_submit_count_fresh_outputs(const L0TaskArgs &args)
     return count;
 }
 
-PTO_DEVICE_FUNC bool dist_submit_shared_materialize_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC inline bool dist_submit_shared_materialize_outputs(const L0TaskArgs &args, DistSubmitCtx &ctx) {
     if (ctx.payload == nullptr) return false;
     ctx.tensor_count = args.tensor_count();
     ctx.scalar_count = args.scalar_count();
@@ -400,7 +400,7 @@ PTO_DEVICE_FUNC bool dist_submit_shared_materialize_outputs(const L0TaskArgs &ar
     return true;
 }
 
-PTO_DEVICE_FUNC void dist_submit_shared_publish_producers(const L0TaskArgs &args, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC inline void dist_submit_shared_publish_producers(const L0TaskArgs &args, DistSubmitCtx &ctx) {
     uint32_t output_slot = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         const TensorArgType tag = args.tag(i);
@@ -422,7 +422,7 @@ PTO_DEVICE_FUNC void dist_submit_shared_publish_producers(const L0TaskArgs &args
     }
 }
 
-PTO_DEVICE_FUNC void dist_submit_shared_add_fanin(DistSubmitCtx &ctx, int32_t producer) {
+PTO_DEVICE_FUNC inline void dist_submit_shared_add_fanin(DistSubmitCtx &ctx, int32_t producer) {
     if (producer < 0 || producer >= ctx.task_id) return;
     for (int32_t k = 0; k < ctx.fanin_count; k++)
         if (ctx.fanin[k] == producer) return;
@@ -439,7 +439,7 @@ dist_submit_shared_collect_tensor_fanin(DistSubmitCtx &ctx, const TensorRef &ten
     dist_submit_shared_add_fanin(ctx, shared_map_lookup_range(g_dist.shared_map, tensor, ctx.task_id));
 }
 
-PTO_DEVICE_FUNC bool dist_submit_shared_resolve_inputs_and_fanin(L0TaskArgs &args, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC inline bool dist_submit_shared_resolve_inputs_and_fanin(L0TaskArgs &args, DistSubmitCtx &ctx) {
     if (ctx.payload == nullptr) return false;
     bool waited = false;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
@@ -483,7 +483,8 @@ PTO_DEVICE_FUNC bool dist_submit_shared_resolve_inputs_and_fanin(L0TaskArgs &arg
     return !fatal_set();
 }
 
-PTO_DEVICE_FUNC bool dist_submit_shared_collect_eager_inputs_and_fanin(const L0TaskArgs &args, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC inline bool
+dist_submit_shared_collect_eager_inputs_and_fanin(const L0TaskArgs &args, DistSubmitCtx &ctx) {
     if (ctx.payload == nullptr) return false;
     bool waited = false;
     for (int32_t i = 0; i < args.tensor_count(); i++) {

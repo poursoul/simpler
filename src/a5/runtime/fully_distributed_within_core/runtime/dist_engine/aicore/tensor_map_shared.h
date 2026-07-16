@@ -52,6 +52,35 @@ PTO_DEVICE_FUNC int32_t shared_map_alloc_entry(__gm__ SharedDistTensorMap &map) 
     return static_cast<int32_t>(idx);
 }
 
+PTO_DEVICE_FUNC int32_t shared_map_load_bucket(__gm__ const int32_t &bucket) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&bucket, sizeof(bucket));
+#endif
+    return bucket;
+}
+
+PTO_DEVICE_FUNC void shared_map_flush_bucket(__gm__ int32_t &bucket) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&bucket, sizeof(bucket));
+#else
+    (void)bucket;
+#endif
+}
+
+PTO_DEVICE_FUNC int64_t shared_load_publish_cursor() {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&g_dist.producer_publish_cursor, sizeof(g_dist.producer_publish_cursor));
+#endif
+    return atomic_load(g_dist.producer_publish_cursor.v, __ATOMIC_ACQUIRE);
+}
+
+PTO_DEVICE_FUNC int64_t shared_load_published(int32_t task_id) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&g_dist.published[task_id], sizeof(g_dist.published[task_id]));
+#endif
+    return atomic_load(g_dist.published[task_id].v, __ATOMIC_ACQUIRE);
+}
+
 PTO_DEVICE_FUNC void shared_map_advance_retire(__gm__ SharedDistTensorMap &map, int32_t task_id, int32_t H) {
     const int32_t new_floor = task_id - H;
     if (new_floor <= 0) return;
@@ -68,7 +97,13 @@ PTO_DEVICE_FUNC void shared_map_insert_entry(
     if (idx < 0) return;
     __gm__ SharedMapEntry &entry = map.entries[idx];
     Tensor::copy(entry.tensor, tensor);
-    shared_map_byte_range(tensor, entry.buf_addr, entry.lo, entry.hi);
+    uint64_t addr = 0;
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    shared_map_byte_range(tensor, addr, lo, hi);
+    entry.buf_addr = addr;
+    entry.lo = lo;
+    entry.hi = hi;
     entry.owner_task_id = task_id;
     entry.output_slot = output_slot;
     entry.range_bucket = -1;
@@ -85,12 +120,17 @@ PTO_DEVICE_FUNC void shared_map_insert_entry(
     if (publish_symbol) {
         symbol_bucket = shared_symbol_hash(task_id, static_cast<uint32_t>(output_slot));
     }
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&entry, sizeof(entry));
+#endif
     if (publish_range) entry.next_in_range_bucket = atomic_exchange(map.range_buckets[range_bucket], idx);
     if (publish_symbol) entry.next_in_symbol_bucket = atomic_exchange(map.symbol_buckets[symbol_bucket], idx);
     store_barrier();
 #if defined(__CCE_AICORE__)
     dist_aicore_flush_region(&entry, sizeof(entry));
 #endif
+    if (publish_range) shared_map_flush_bucket(map.range_buckets[range_bucket]);
+    if (publish_symbol) shared_map_flush_bucket(map.symbol_buckets[symbol_bucket]);
 }
 
 PTO_DEVICE_FUNC void shared_map_insert_symbol(
@@ -106,14 +146,15 @@ shared_map_insert_range(__gm__ SharedDistTensorMap &map, int32_t task_id, const 
 }
 
 PTO_DEVICE_FUNC bool shared_map_lookup_symbol(
-    __gm__ const SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot, __gm__ const SharedMapEntry *&out
+    __gm__ SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot, __gm__ const SharedMapEntry *&out
 ) {
     if (task_id < atomic_load(map.alive_floor, __ATOMIC_ACQUIRE)) {
         out = nullptr;
         return false;
     }
     const uint32_t bucket = shared_symbol_hash(task_id, output_slot);
-    for (int32_t cur = map.symbol_buckets[bucket]; cur >= 0; cur = map.entries[cur].next_in_symbol_bucket) {
+    for (int32_t cur = shared_map_load_bucket(map.symbol_buckets[bucket]); cur >= 0;
+         cur = map.entries[cur].next_in_symbol_bucket) {
         __gm__ const SharedMapEntry &entry = map.entries[cur];
 #if defined(__CCE_AICORE__)
         dist_aicore_invalidate_region(&entry, sizeof(entry));
@@ -129,12 +170,12 @@ PTO_DEVICE_FUNC bool shared_map_lookup_symbol(
 
 template <typename TensorRef>
 PTO_DEVICE_FUNC int32_t
-shared_map_lookup_range(__gm__ const SharedDistTensorMap &map, const TensorRef &tensor, int32_t consumer_task_id) {
+shared_map_lookup_range(__gm__ SharedDistTensorMap &map, const TensorRef &tensor, int32_t consumer_task_id) {
     uint64_t addr, lo, hi;
     shared_map_byte_range(tensor, addr, lo, hi);
     const int32_t alive_floor = static_cast<int32_t>(atomic_load(map.alive_floor, __ATOMIC_ACQUIRE));
     int32_t best = -1;
-    for (int32_t cur = map.range_buckets[shared_range_hash(addr)]; cur >= 0;
+    for (int32_t cur = shared_map_load_bucket(map.range_buckets[shared_range_hash(addr)]); cur >= 0;
          cur = map.entries[cur].next_in_range_bucket) {
         __gm__ const SharedMapEntry &entry = map.entries[cur];
 #if defined(__CCE_AICORE__)
@@ -152,12 +193,20 @@ shared_map_lookup_range(__gm__ const SharedDistTensorMap &map, const TensorRef &
 PTO_DEVICE_FUNC void shared_publish_done(int32_t task_id) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     atomic_exchange(g_dist.published[task_id].v, int64_t{1}, __ATOMIC_RELEASE);
-    int64_t p = atomic_load(g_dist.producer_publish_cursor.v, __ATOMIC_ACQUIRE);
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&g_dist.published[task_id], sizeof(g_dist.published[task_id]));
+#endif
+    int64_t p = shared_load_publish_cursor();
     while (true) {
         const int64_t next = p + 1;
         if (next < 0 || next >= kFlagCap) break;
-        if (atomic_load(g_dist.published[next].v, __ATOMIC_ACQUIRE) == 0) break;
+        if (shared_load_published(static_cast<int32_t>(next)) == 0) break;
         const int64_t old = atomic_fetch_max<int64_t>(g_dist.producer_publish_cursor.v, next);
+#if defined(__CCE_AICORE__)
+        if (next > old) {
+            dist_aicore_flush_region(&g_dist.producer_publish_cursor, sizeof(g_dist.producer_publish_cursor));
+        }
+#endif
         p = old > next ? old : next;
     }
 }
@@ -165,7 +214,7 @@ PTO_DEVICE_FUNC void shared_publish_done(int32_t task_id) {
 PTO_DEVICE_FUNC void shared_wait_published_before(__gm__ DistCore *self, int32_t task_id) {
     const int32_t target = task_id - 1;
     if (target < 0) return;
-    while (atomic_load(g_dist.producer_publish_cursor.v, __ATOMIC_ACQUIRE) < target && !fatal_set()) {
+    while (shared_load_publish_cursor() < target && !fatal_set()) {
         drain_block_won(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }

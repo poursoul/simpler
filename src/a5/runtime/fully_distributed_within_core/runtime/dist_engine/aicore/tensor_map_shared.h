@@ -413,6 +413,24 @@ PTO_DEVICE_FUNC void shared_wait_completed_before(__gm__ DistCore *self, int32_t
     }
 }
 
+PTO_DEVICE_FUNC __gm__ const Tensor *dist_shared_lookup_output_tensor(PTO2TaskId task_id, uint32_t output_slot) {
+    const int32_t producer = static_cast<int32_t>(task_id.raw & 0xFFFFFFFFu);
+    __gm__ const SharedMapEntry *entry = nullptr;
+    while (!fatal_set()) {
+        if (shared_map_lookup_symbol(g_dist.shared_map, producer, output_slot, entry)) {
+            return &entry->tensor;
+        }
+        drain_block_won(g_self);
+        if (drain_phase_b(g_self) == 0) SPIN_WAIT_HINT();
+    }
+    return nullptr;
+}
+
 }  // namespace
+
+__attribute__((weak)) PTO_DEVICE_FUNC __gm__ const Tensor *
+dist_shared_get_output_tensor(PTO2TaskId task_id, uint32_t output_slot) {
+    return dist_shared_lookup_output_tensor(task_id, output_slot);
+}
 
 #endif

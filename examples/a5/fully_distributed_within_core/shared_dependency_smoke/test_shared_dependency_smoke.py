@@ -77,6 +77,20 @@ class TestSharedDependencySmoke(SceneTestCase):
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT, D.INOUT],
             },
+            {
+                "func_id": 7,
+                "name": "MAKE_LEFT_AIC",
+                "source": "kernels/aic/make_left.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.OUT],
+            },
+            {
+                "func_id": 8,
+                "name": "FANIN_AIV",
+                "source": "kernels/aiv/fanin.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.IN, D.IN, D.INOUT],
+            },
         ],
     }
 
@@ -165,6 +179,12 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 128, "mode": 31},
         },
         {
+            "name": "A5SimBd36AicOutputToAivFanin",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 32},
+        },
+        {
             "name": "A5OnboardBd36EagerFullInout",
             "manual": True,
             "platforms": ["a5"],
@@ -177,6 +197,13 @@ class TestSharedDependencySmoke(SceneTestCase):
             "platforms": ["a5"],
             "config": {"block_dim": 36},
             "params": {"n": 128, "mode": 31},
+        },
+        {
+            "name": "A5OnboardBd36AicOutputToAivFanin",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 128, "mode": 32},
         },
         {
             "name": "A5OnboardBd36L0TaskArgsTagPersistence",
@@ -228,6 +255,9 @@ class TestSharedDependencySmoke(SceneTestCase):
             return
         if mode in {30, 31}:
             args.output += 1.0
+            return
+        if mode == 32:
+            args.output[:] = args.input * 6.0 + 17.0
             return
         raise AssertionError(f"unsupported mode {mode}")
 

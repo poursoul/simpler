@@ -72,6 +72,8 @@ struct SymbolicTensor {
     PTO2TaskId producer_task_id;
     uint32_t output_slot;
 };
+
+PTO_DEVICE_FUNC __gm__ const Tensor *dist_shared_get_output_tensor(PTO2TaskId task_id, uint32_t output_slot);
 #endif
 
 /**
@@ -118,6 +120,13 @@ public:
     /// collapses the qualifier away.
     PTO_DEVICE_FUNC __gm__ const Tensor &get_ref(uint32_t index) const & {
         always_assert(index < output_count_);
+#if PTO_FDWIC_SHARED_TENSORMAP
+        if (tensors_[index] == nullptr) {
+            __gm__ const Tensor *tensor = dist_shared_get_output_tensor(task_id_, index);
+            always_assert(tensor != nullptr);
+            tensors_[index] = tensor;
+        }
+#endif
         return *tensors_[index];
     }
     __gm__ const Tensor &get_ref(uint32_t index) const && = delete;
@@ -137,6 +146,9 @@ public:
     PTO_DEVICE_FUNC void set_symbolic_output_count(uint32_t output_count) {
         always_assert(output_count <= MAX_TENSOR_ARGS);
         output_count_ = output_count;
+        for (uint32_t i = 0; i < output_count; i++) {
+            tensors_[i] = nullptr;
+        }
     }
 
     PTO_DEVICE_FUNC SymbolicTensor get_symbol(uint32_t index) const {
@@ -156,7 +168,7 @@ private:
     // __gm__ so the aicore build can point at Tensors that live in the shared
     // engine state; empty macro on sim keeps the field
     // a plain pointer.
-    __gm__ const Tensor *tensors_[MAX_TENSOR_ARGS];
+    mutable __gm__ const Tensor *tensors_[MAX_TENSOR_ARGS];
 };
 
 // =============================================================================

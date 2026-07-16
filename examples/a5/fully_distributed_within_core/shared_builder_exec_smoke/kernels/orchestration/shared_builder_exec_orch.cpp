@@ -109,6 +109,36 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
+    if (mode == 6) {
+        const uint32_t shape[1] = {static_cast<uint32_t>(n)};
+        TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
+        for (int32_t i = 0; i < 96; i++) {
+            rt_submit_aic_task<1>(FUNC_MAKE_TEMP_AIC, [&](SubmitBuilder &builder) {
+                builder.add_input([&]() -> const Tensor & {
+                    return input;
+                });
+                builder.add_output([&]() -> TensorCreateInfo & {
+                    return temp_ci;
+                });
+                builder.add_scalar([&]() -> uint64_t {
+                    return n;
+                });
+            });
+        }
+        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) {
+            builder.add_input([&]() -> const Tensor & {
+                return input;
+            });
+            builder.add_output([&]() -> const Tensor & {
+                return output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        return;
+    }
+
     const bool use_mixed = mode == 4 || mode == 5;
     const uint32_t shape[1] = {static_cast<uint32_t>(n)};
     TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);

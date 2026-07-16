@@ -25,6 +25,7 @@ void dist_shared_state_reset() {
     for (int32_t i = 0; i < kTaskWindow; i++)
         g_dist.shared_map.task_heads[i] = -1;
     atomic_exchange(g_dist.shared_heap_top.v, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.shared_heap_alloc_cursor.v, int64_t{-1}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.producer_publish_cursor.v, int64_t{-1}, __ATOMIC_RELAXED);
     for (int32_t i = 0; i < kFlagCap; i++)
         atomic_exchange(g_dist.published[i].v, int64_t{0}, __ATOMIC_RELAXED);

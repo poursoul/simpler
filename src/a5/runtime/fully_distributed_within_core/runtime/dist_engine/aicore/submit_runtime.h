@@ -279,6 +279,85 @@ PTO_DEVICE_FUNC void dist_submit_replay_orch(__gm__ Runtime *runtime) {
 }  // namespace
 
 #if PTO_FDWIC_SHARED_TENSORMAP
+PTO_DEVICE_FUNC bool dist_submit_shared_wait_heap_turn(DistSubmitCtx &ctx) {
+    const int32_t target = ctx.task_id - 1;
+    if (target < 0) return true;
+    while (atomic_load(g_dist.shared_heap_alloc_cursor.v, __ATOMIC_ACQUIRE) < target && !fatal_set()) {
+        drain_block_won(ctx.self);
+        if (drain_phase_b(ctx.self) == 0) SPIN_WAIT_HINT();
+    }
+    return !fatal_set();
+}
+
+PTO_DEVICE_FUNC bool dist_submit_shared_reserve_heap(DistSubmitCtx &ctx, uint64_t total, uint64_t &task_base) {
+    if (ctx.task_id < 0 || ctx.task_id >= kFlagCap) {
+        set_fatal();
+        DIST_ERRF(
+            "[dist_engine] shared task id %d exceeds kFlagCap %d (enlarge or window the flag/vend rings)\n",
+            ctx.task_id, kFlagCap
+        );
+        return false;
+    }
+    if (!dist_submit_shared_wait_heap_turn(ctx)) return false;
+
+    const size_t ring = g_dist.heap_size;
+    uint64_t top = static_cast<uint64_t>(atomic_load(g_dist.shared_heap_top.v, __ATOMIC_ACQUIRE));
+    task_base = PTO2_ALIGN_UP(top, PTO2_PACKED_OUTPUT_ALIGN);
+    if (total > 0) {
+        if (g_dist.heap_base == nullptr || ring == 0) {
+            set_fatal();
+            DIST_ERRF("[dist_engine] shared GM output heap not allocated at task %d\n", ctx.task_id);
+            return false;
+        }
+        if (total > ring) {
+            set_fatal();
+            DIST_ERRF(
+                "[dist_engine] shared task %d outputs %llu B exceed heap ring %zu B\n", ctx.task_id,
+                (unsigned long long)total, ring
+            );
+            return false;
+        }
+        if ((task_base % ring) + total > ring) {
+            task_base = ((task_base / ring) + 1) * ring;
+        }
+    }
+
+    const uint64_t vend = task_base + total;
+    bool waited = false;
+    TRACE_SPAN_BEGIN(heap_bp_trace);
+    while (!fatal_set()) {
+        const int32_t f = static_cast<int32_t>(atomic_load(g_dist.frontier));
+        const int32_t R = f - g_dist.H;
+        const uint64_t vstart_live = load_task_vend(R);
+        if (total == 0 || vend - vstart_live <= ring) {
+            if (waited) {
+                TRACE_SPAN_END(heap_bp_trace, ctx.self, ctx.task_id, -1, TracePhase::RingBp, 0, 1);
+            }
+            atomic_exchange(g_dist.shared_heap_top.v, static_cast<int64_t>(vend), __ATOMIC_RELEASE);
+            store_task_vend(ctx.task_id, vend);
+            store_barrier();
+            atomic_exchange(g_dist.shared_heap_alloc_cursor.v, static_cast<int64_t>(ctx.task_id), __ATOMIC_RELEASE);
+            return true;
+        }
+        if (f >= ctx.task_id - 1) {
+            set_fatal();
+            DIST_ERRF(
+                "[dist_engine] shared heap ring %zu B too small for H=%d window at task %d (live=%llu B); "
+                "enlarge PTO_DIST_HEAP_MB or reduce PTO_DIST_H\n",
+                ring, g_dist.H, ctx.task_id, (unsigned long long)(vend - vstart_live)
+            );
+            return false;
+        }
+        waited = true;
+        drain_block_won(ctx.self);
+        if (drain_phase_b(ctx.self) == 0) SPIN_WAIT_HINT();
+    }
+    if (waited) {
+        TRACE_SPAN_END(heap_bp_trace, ctx.self, ctx.task_id, -1, TracePhase::RingBp, 0, 1);
+    }
+    return false;
+}
+
 PTO_DEVICE_FUNC uint32_t dist_submit_count_fresh_outputs(const L0TaskArgs &args) {
     uint32_t count = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
@@ -303,43 +382,17 @@ PTO_DEVICE_FUNC bool dist_submit_shared_materialize_outputs(const L0TaskArgs &ar
         layout.total_output_size += PTO2_ALIGN_UP(layout.buffer_sizes[output_ordinal], PTO2_PACKED_OUTPUT_ALIGN);
     }
 
-    if (layout.total_output_size == 0) {
-        ctx.output_bytes = 0;
-        return true;
-    }
-    if (g_dist.heap_base == nullptr) {
-        set_fatal();
-        DIST_ERRF("[dist_engine] shared GM output heap not allocated at task %d\n", ctx.task_id);
-        return false;
-    }
-    if (layout.total_output_size > g_dist.heap_size) {
-        set_fatal();
-        DIST_ERRF(
-            "[dist_engine] shared task %d outputs %llu B exceed heap %zu B\n", ctx.task_id,
-            (unsigned long long)layout.total_output_size, g_dist.heap_size
-        );
-        return false;
-    }
-
-    const uint64_t task_base = static_cast<uint64_t>(atomic_fetch_add<int64_t>(
-        g_dist.shared_heap_top.v, static_cast<int64_t>(layout.total_output_size), __ATOMIC_ACQ_REL
-    ));
-    if (task_base + layout.total_output_size > g_dist.heap_size) {
-        set_fatal();
-        DIST_ERRF(
-            "[dist_engine] shared heap exhausted at task %d (need=%llu B, used=%llu B, cap=%zu B)\n", ctx.task_id,
-            (unsigned long long)layout.total_output_size, (unsigned long long)task_base, g_dist.heap_size
-        );
-        return false;
-    }
+    uint64_t task_base = 0;
+    if (!dist_submit_shared_reserve_heap(ctx, layout.total_output_size, task_base)) return false;
 
     uint64_t output_offset = 0;
     for (int32_t output_ordinal = 0; output_ordinal < layout.output_count; output_ordinal++) {
         const int32_t i = layout.output_indices[output_ordinal];
         const auto &ci = args.tensor(i).create_info();
         const uint64_t buffer_size = layout.buffer_sizes[output_ordinal];
+        const uint64_t phys = (task_base + output_offset) % g_dist.heap_size;
         __gm__ Tensor &slot_t = ctx.payload->tensors[i];
-        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + task_base + output_offset, buffer_size);
+        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, buffer_size);
         slot_t.owner_task_id.raw = ctx.result.task_id().raw;
         output_offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
     }

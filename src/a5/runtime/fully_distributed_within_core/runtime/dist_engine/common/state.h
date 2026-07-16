@@ -303,6 +303,7 @@ struct DistGlobal {
 #if PTO_FDWIC_SHARED_TENSORMAP
     SharedDistTensorMap shared_map;
     PaddedCursor shared_heap_top;
+    PaddedCursor shared_heap_alloc_cursor;
     PaddedCursor producer_publish_cursor;
     PublishedCell published[kFlagCap];
     PaddedCursor shared_winner_count;

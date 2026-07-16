@@ -95,7 +95,6 @@ PTO_DEVICE_FUNC void advance_frontier() {
 PTO_DEVICE_FUNC void complete_executed_task(__gm__ DistCore *self, int32_t task_id) {
 #if PTO_FDWIC_SHARED_TENSORMAP
     (void)self;
-    store_task_vend(task_id, 0);
 #else
     if (self != nullptr) {
         store_task_vend(task_id, self->heap_next);

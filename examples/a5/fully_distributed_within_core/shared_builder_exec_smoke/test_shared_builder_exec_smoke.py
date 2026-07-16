@@ -109,6 +109,16 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 64, "mode": 5},
         },
+        {
+            "name": "A5SimBd36HeapWrapN256",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 36,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 256, "mode": 6},
+        },
     ]
 
     def generate_args(self, params):
@@ -128,6 +138,8 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             n = int(params["n"])
             args.output[:] = args.input + 1.0
             args.output[n // 4 : n // 4 + n // 2] += 3.0
+        elif mode == 6:
+            args.output[:] = args.input + 1.0
         else:
             args.output[:] = args.input + 3.0
 

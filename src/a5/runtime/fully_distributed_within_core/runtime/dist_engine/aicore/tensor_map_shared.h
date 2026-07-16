@@ -69,21 +69,21 @@ PTO_DEVICE_FUNC void shared_map_insert_entry(
     entry.next_in_range_bucket = -1;
     entry.next_in_task = map.task_heads[task_id & kTaskWindowMask];
     map.task_heads[task_id & kTaskWindowMask] = idx;
+    uint32_t range_bucket = 0;
+    uint32_t symbol_bucket = 0;
     if (publish_range) {
-        const uint32_t range_bucket = shared_range_hash(entry.buf_addr);
+        range_bucket = shared_range_hash(entry.buf_addr);
         entry.range_bucket = static_cast<int32_t>(range_bucket);
-        entry.next_in_range_bucket = map.range_buckets[range_bucket];
     }
     if (publish_symbol) {
-        const uint32_t symbol_bucket = shared_symbol_hash(task_id, static_cast<uint32_t>(output_slot));
-        entry.next_in_symbol_bucket = map.symbol_buckets[symbol_bucket];
+        symbol_bucket = shared_symbol_hash(task_id, static_cast<uint32_t>(output_slot));
     }
+    if (publish_range) entry.next_in_range_bucket = atomic_exchange(map.range_buckets[range_bucket], idx);
+    if (publish_symbol) entry.next_in_symbol_bucket = atomic_exchange(map.symbol_buckets[symbol_bucket], idx);
     store_barrier();
 #if defined(__CCE_AICORE__)
     dist_aicore_flush_region(&entry, sizeof(entry));
 #endif
-    if (publish_range) map.range_buckets[entry.range_bucket] = idx;
-    if (publish_symbol) map.symbol_buckets[shared_symbol_hash(task_id, static_cast<uint32_t>(output_slot))] = idx;
 }
 
 PTO_DEVICE_FUNC void shared_map_insert_symbol(

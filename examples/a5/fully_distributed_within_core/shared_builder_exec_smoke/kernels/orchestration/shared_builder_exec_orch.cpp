@@ -58,6 +58,33 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         return;
     }
 
+    if (mode == 2) {
+        const uint32_t sub_n = static_cast<uint32_t>(n / 2);
+        const uint32_t sub_shape[1] = {sub_n};
+        const uint32_t sub_offset[1] = {static_cast<uint32_t>(n / 4)};
+        Tensor sub_output = Tensor::view(output, sub_shape, sub_offset);
+        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) {
+            builder.add_input([&]() -> const Tensor & {
+                return input;
+            });
+            builder.add_inout([&]() -> const Tensor & {
+                return output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return n;
+            });
+        });
+        rt_submit_aic_task<0>(FUNC_BUMP_OUTPUT_AIC, [&](SubmitBuilder &builder) {
+            builder.add_inout([&]() -> const Tensor & {
+                return sub_output;
+            });
+            builder.add_scalar([&]() -> uint64_t {
+                return sub_n;
+            });
+        });
+        return;
+    }
+
     const uint32_t shape[1] = {static_cast<uint32_t>(n)};
     TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
 

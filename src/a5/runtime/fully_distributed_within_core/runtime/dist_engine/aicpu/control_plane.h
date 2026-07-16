@@ -18,6 +18,8 @@ void dist_shared_state_reset() {
     atomic_exchange(g_dist.shared_map.high_water, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.shared_map.alive_floor, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.shared_map.cleaned_upto, int64_t{0}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.shared_map.free_head, int64_t{-1}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.shared_map.lock, int64_t{0}, __ATOMIC_RELAXED);
     for (int32_t i = 0; i < kSharedSymbolBuckets; i++)
         g_dist.shared_map.symbol_buckets[i] = -1;
     for (int32_t i = 0; i < kSharedRangeBuckets; i++)

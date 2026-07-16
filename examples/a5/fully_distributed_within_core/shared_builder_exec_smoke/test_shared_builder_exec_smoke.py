@@ -119,6 +119,12 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             },
             "params": {"n": 256, "mode": 6},
         },
+        {
+            "name": "A5SimBd36MapReuseN1",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 1, "mode": 7},
+        },
     ]
 
     def generate_args(self, params):
@@ -139,6 +145,8 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             args.output[:] = args.input + 1.0
             args.output[n // 4 : n // 4 + n // 2] += 3.0
         elif mode == 6:
+            args.output[:] = args.input + 1.0
+        elif mode == 7:
             args.output[:] = args.input + 1.0
         else:
             args.output[:] = args.input + 3.0

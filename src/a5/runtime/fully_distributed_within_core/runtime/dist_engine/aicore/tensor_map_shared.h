@@ -43,13 +43,16 @@ PTO_DEVICE_FUNC void shared_map_byte_range(const TensorRef &t, uint64_t &addr, u
     hi = (t.start_offset + ext) * esz;
 }
 
-PTO_DEVICE_FUNC int32_t shared_map_alloc_entry(__gm__ SharedDistTensorMap &map) {
-    const int64_t idx = atomic_fetch_add<int64_t>(map.high_water, 1);
-    if (idx < 0 || idx >= kSharedMapCap) {
-        set_fatal();
-        return -1;
+PTO_DEVICE_FUNC bool shared_map_lock(__gm__ SharedDistTensorMap &map) {
+    while (atomic_exchange(map.lock, int64_t{1}, __ATOMIC_ACQUIRE) != 0 && !fatal_set()) {
+        SPIN_WAIT_HINT();
     }
-    return static_cast<int32_t>(idx);
+    return !fatal_set();
+}
+
+PTO_DEVICE_FUNC void shared_map_unlock(__gm__ SharedDistTensorMap &map) {
+    store_barrier();
+    atomic_exchange(map.lock, int64_t{0}, __ATOMIC_RELEASE);
 }
 
 PTO_DEVICE_FUNC int32_t shared_map_load_bucket(__gm__ const int32_t &bucket) {
@@ -81,11 +84,164 @@ PTO_DEVICE_FUNC int64_t shared_load_published(int32_t task_id) {
     return atomic_load(g_dist.published[task_id].v, __ATOMIC_ACQUIRE);
 }
 
+PTO_DEVICE_FUNC void shared_map_invalidate_control(__gm__ SharedDistTensorMap &map) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(const_cast<__gm__ const int64_t *>(&map.high_water), 64);
+#else
+    (void)map;
+#endif
+}
+
+PTO_DEVICE_FUNC void shared_map_flush_control(__gm__ SharedDistTensorMap &map) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(const_cast<__gm__ int64_t *>(&map.high_water), 64);
+#else
+    (void)map;
+#endif
+}
+
+PTO_DEVICE_FUNC int32_t shared_map_alloc_entry_locked(__gm__ SharedDistTensorMap &map) {
+    shared_map_invalidate_control(map);
+    if (map.free_head >= 0) {
+        const int32_t idx = static_cast<int32_t>(map.free_head);
+        __gm__ SharedMapEntry &entry = map.entries[idx];
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&entry, sizeof(entry));
+#endif
+        map.free_head = entry.next_in_task;
+        return idx;
+    }
+    const int64_t idx = map.high_water++;
+    if (idx < 0 || idx >= kSharedMapCap) {
+        set_fatal();
+        return -1;
+    }
+    return static_cast<int32_t>(idx);
+}
+
+PTO_DEVICE_FUNC void shared_map_unlink_symbol_locked(__gm__ SharedDistTensorMap &map, int32_t idx) {
+    __gm__ SharedMapEntry &target = map.entries[idx];
+    if (target.output_slot < 0) return;
+    const uint32_t bucket = shared_symbol_hash(target.owner_task_id, static_cast<uint32_t>(target.output_slot));
+    int32_t prev = -1;
+    int32_t cur = shared_map_load_bucket(map.symbol_buckets[bucket]);
+    while (cur >= 0) {
+        __gm__ SharedMapEntry &entry = map.entries[cur];
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&entry, sizeof(entry));
+#endif
+        const int32_t next = entry.next_in_symbol_bucket;
+        if (cur == idx) {
+            if (prev < 0) {
+                map.symbol_buckets[bucket] = next;
+                shared_map_flush_bucket(map.symbol_buckets[bucket]);
+            } else {
+                map.entries[prev].next_in_symbol_bucket = next;
+#if defined(__CCE_AICORE__)
+                dist_aicore_flush_region(&map.entries[prev], sizeof(map.entries[prev]));
+#endif
+            }
+            target.next_in_symbol_bucket = -1;
+            return;
+        }
+        prev = cur;
+        cur = next;
+    }
+}
+
+PTO_DEVICE_FUNC void shared_map_unlink_range_locked(__gm__ SharedDistTensorMap &map, int32_t idx) {
+    __gm__ SharedMapEntry &target = map.entries[idx];
+    if (target.range_bucket < 0) return;
+    const uint32_t bucket = static_cast<uint32_t>(target.range_bucket);
+    int32_t prev = -1;
+    int32_t cur = shared_map_load_bucket(map.range_buckets[bucket]);
+    while (cur >= 0) {
+        __gm__ SharedMapEntry &entry = map.entries[cur];
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&entry, sizeof(entry));
+#endif
+        const int32_t next = entry.next_in_range_bucket;
+        if (cur == idx) {
+            if (prev < 0) {
+                map.range_buckets[bucket] = next;
+                shared_map_flush_bucket(map.range_buckets[bucket]);
+            } else {
+                map.entries[prev].next_in_range_bucket = next;
+#if defined(__CCE_AICORE__)
+                dist_aicore_flush_region(&map.entries[prev], sizeof(map.entries[prev]));
+#endif
+            }
+            target.next_in_range_bucket = -1;
+            return;
+        }
+        prev = cur;
+        cur = next;
+    }
+}
+
+PTO_DEVICE_FUNC void shared_map_free_entry_locked(__gm__ SharedDistTensorMap &map, int32_t idx) {
+    shared_map_unlink_symbol_locked(map, idx);
+    shared_map_unlink_range_locked(map, idx);
+    __gm__ SharedMapEntry &entry = map.entries[idx];
+    entry.owner_task_id = -1;
+    entry.output_slot = -1;
+    entry.range_bucket = -1;
+    entry.next_in_task = static_cast<int32_t>(map.free_head);
+    map.free_head = idx;
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&entry, sizeof(entry));
+#endif
+    shared_map_flush_control(map);
+}
+
 PTO_DEVICE_FUNC void shared_map_advance_retire(__gm__ SharedDistTensorMap &map, int32_t task_id, int32_t H) {
-    const int32_t new_floor = task_id - H;
+    (void)task_id;
+    const int32_t frontier = static_cast<int32_t>(atomic_load(g_dist.frontier, __ATOMIC_ACQUIRE));
+    const int32_t new_floor = frontier - H + 1;
     if (new_floor <= 0) return;
-    atomic_fetch_max<int64_t>(map.cleaned_upto, static_cast<int64_t>(new_floor));
-    atomic_fetch_max<int64_t>(map.alive_floor, static_cast<int64_t>(new_floor));
+    if (!shared_map_lock(map)) return;
+    int32_t cleaned = static_cast<int32_t>(map.cleaned_upto);
+    if (new_floor <= cleaned) {
+        if (new_floor > map.alive_floor) map.alive_floor = new_floor;
+        shared_map_unlock(map);
+        return;
+    }
+    for (int32_t id = cleaned; id < new_floor; id++) {
+        const int32_t slot = id & kTaskWindowMask;
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&map.task_heads[slot], sizeof(map.task_heads[slot]));
+#endif
+        int32_t prev = -1;
+        int32_t cur = map.task_heads[slot];
+        while (cur >= 0) {
+            __gm__ SharedMapEntry &entry = map.entries[cur];
+#if defined(__CCE_AICORE__)
+            dist_aicore_invalidate_region(&entry, sizeof(entry));
+#endif
+            const int32_t next = entry.next_in_task;
+            if (entry.owner_task_id == id) {
+                if (prev < 0) {
+                    map.task_heads[slot] = next;
+#if defined(__CCE_AICORE__)
+                    dist_aicore_flush_region(&map.task_heads[slot], sizeof(map.task_heads[slot]));
+#endif
+                } else {
+                    map.entries[prev].next_in_task = next;
+#if defined(__CCE_AICORE__)
+                    dist_aicore_flush_region(&map.entries[prev], sizeof(map.entries[prev]));
+#endif
+                }
+                shared_map_free_entry_locked(map, cur);
+            } else {
+                prev = cur;
+            }
+            cur = next;
+        }
+    }
+    map.cleaned_upto = new_floor;
+    map.alive_floor = new_floor;
+    shared_map_flush_control(map);
+    shared_map_unlock(map);
 }
 
 template <typename TensorRef>
@@ -93,8 +249,12 @@ PTO_DEVICE_FUNC void shared_map_insert_entry(
     __gm__ SharedDistTensorMap &map, int32_t task_id, int32_t output_slot, const TensorRef &tensor, bool publish_symbol,
     bool publish_range
 ) {
-    const int32_t idx = shared_map_alloc_entry(map);
-    if (idx < 0) return;
+    if (!shared_map_lock(map)) return;
+    const int32_t idx = shared_map_alloc_entry_locked(map);
+    if (idx < 0) {
+        shared_map_unlock(map);
+        return;
+    }
     __gm__ SharedMapEntry &entry = map.entries[idx];
     Tensor::copy(entry.tensor, tensor);
     uint64_t addr = 0;
@@ -131,6 +291,7 @@ PTO_DEVICE_FUNC void shared_map_insert_entry(
 #endif
     if (publish_range) shared_map_flush_bucket(map.range_buckets[range_bucket]);
     if (publish_symbol) shared_map_flush_bucket(map.symbol_buckets[symbol_bucket]);
+    shared_map_unlock(map);
 }
 
 PTO_DEVICE_FUNC void shared_map_insert_symbol(

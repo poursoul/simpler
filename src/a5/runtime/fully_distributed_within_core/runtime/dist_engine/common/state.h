@@ -113,7 +113,9 @@ struct SharedDistTensorMap {
     volatile int64_t high_water;
     volatile int64_t alive_floor;
     volatile int64_t cleaned_upto;
-    uint8_t tail_pad[40];
+    volatile int64_t free_head;
+    volatile int64_t lock;
+    uint8_t tail_pad[24];
 };
 static_assert(sizeof(SharedDistTensorMap) % 64 == 0, "SharedDistTensorMap must not share cachelines");
 

@@ -145,6 +145,7 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
     }
     return false;
 }
+#endif
 
 PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
     if (!ctx.joint) return;
@@ -182,6 +183,16 @@ PTO_DEVICE_FUNC bool dist_submit_build_winner_slot(DistSubmitCtx &ctx, const L0T
     if (slot == nullptr || ctx.payload == nullptr) return false;
     const int32_t sub_block_id = ctx.self != nullptr && ctx.self->lane == LANE_AIV1 ? 1 : 0;
     const uint64_t fn_addr = dist_aicore_slot_function_addr(g_dist.runtime, ctx.kernel_id);
+#if PTO_FDWIC_SHARED_TENSORMAP && !defined(__CCE_AICORE__)
+    const bool has_sim_exec_time = g_dist.runtime != nullptr && g_dist.runtime->use_example_exec_time_ &&
+                                   ctx.kernel_id >= 0 && ctx.kernel_id < RUNTIME_MAX_FUNC_ID &&
+                                   g_dist.runtime->example_exec_time_ns_[ctx.kernel_id] > 0;
+    if (fn_addr == 0 && !g_skip_exec && !has_sim_exec_time) {
+        set_fatal();
+        DIST_ERRF("[dist_engine] shared task %d kernel %d has no function address\n", ctx.task_id, ctx.kernel_id);
+        return false;
+    }
+#endif
     build_ring_slot_from_submit(
         *slot, ctx.task_id, ctx.kernel_id, fn_addr, args, ctx, ctx.fanin, ctx.fanin_count, sub_block_id, ctx.joint,
         ctx.joint_block, ctx.joint_slot
@@ -193,7 +204,9 @@ PTO_DEVICE_FUNC void
 dist_submit_build_winner_task(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
     if (ctx.self == nullptr) return;
     dist_submit_wait_slot_capacity(ctx.self, ctx.task_id);
+#if !PTO_FDWIC_SHARED_TENSORMAP
     if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Kernel)) return;
+#endif
     if (ctx.joint && ctx.joint_slot < 0) {
         ctx.joint_slot = wait_alloc_won_slot(ctx.self, ctx.joint_block);
         if (ctx.joint_slot < 0) return;
@@ -205,6 +218,7 @@ dist_submit_build_winner_task(DistSubmitCtx &ctx, const MixedKernels &mixed, con
     if (!dist_submit_build_winner_slot(ctx, args, slot)) return;
 }
 
+#if !PTO_FDWIC_SHARED_TENSORMAP
 PTO_DEVICE_FUNC void dist_submit_complete_alloc(DistSubmitCtx &ctx) {
     if (ctx.won) {
         if (!dist_submit_wait_heap_capacity(ctx, DistSubmitKind::Alloc)) return;
@@ -342,6 +356,13 @@ PTO_DEVICE_FUNC void dist_submit_shared_publish_outputs(const L0TaskArgs &args, 
     }
 }
 
+PTO_DEVICE_FUNC void dist_submit_shared_add_fanin(DistSubmitCtx &ctx, int32_t producer) {
+    if (producer < 0 || producer >= ctx.task_id) return;
+    for (int32_t k = 0; k < ctx.fanin_count; k++)
+        if (ctx.fanin[k] == producer) return;
+    if (ctx.fanin_count < kMaxFanin) ctx.fanin[ctx.fanin_count++] = producer;
+}
+
 PTO_DEVICE_FUNC bool dist_submit_shared_resolve_symbolic_inputs(L0TaskArgs &args, DistSubmitCtx &ctx) {
     if (ctx.payload == nullptr) return false;
     bool waited = false;
@@ -361,6 +382,8 @@ PTO_DEVICE_FUNC bool dist_submit_shared_resolve_symbolic_inputs(L0TaskArgs &args
             set_fatal();
             return false;
         }
+        const int32_t producer = static_cast<int32_t>(sym.producer_task_id.raw & 0xFFFFFFFFu);
+        dist_submit_shared_add_fanin(ctx, producer);
         Tensor::copy(ctx.payload->tensors[i], entry->tensor);
         args.resolve_symbolic_tensor(i, &ctx.payload->tensors[i]);
         (void)tag;
@@ -403,8 +426,8 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
             if (!dist_submit_shared_resolve_symbolic_inputs(args, ctx)) {
                 set_fatal();
             } else {
-                complete_executed_task(ctx.self, ctx.task_id);
-                if (output_count == 0) atomic_fetch_add<int64_t>(g_dist.shared_zero_output_complete_count.v, 1);
+                TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
+                dist_submit_build_winner_task(ctx, mixed, args);
             }
         }
     } else {

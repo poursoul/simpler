@@ -1,0 +1,63 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <cstdint>
+
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+
+#define FUNC_MAKE_TEMP_AIC 0
+#define FUNC_CONSUME_TEMP_AIC 1
+
+extern "C" {
+
+__attribute__((visibility("default"), weak)) PTO2OrchestrationConfig
+aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+    (void)orch_args;
+    return PTO2OrchestrationConfig{
+        .expected_arg_count = 3,
+    };
+}
+
+__attribute__((visibility("default"), weak)) PTO_DEVICE_FUNC void
+aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &input = orch_args.tensor(0).ref();
+    const Tensor &output = orch_args.tensor(1).ref();
+    const uint64_t n = orch_args.scalar(0);
+    const uint32_t shape[1] = {static_cast<uint32_t>(n)};
+    TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
+
+    TaskOutputTensors temp = rt_submit_aic_task<1>(FUNC_MAKE_TEMP_AIC, [&](SubmitBuilder &builder) {
+        builder.add_input([&]() -> const Tensor & {
+            return input;
+        });
+        builder.add_output([&]() -> TensorCreateInfo & {
+            return temp_ci;
+        });
+        builder.add_scalar([&]() -> uint64_t {
+            return n;
+        });
+    });
+    const SymbolicTensor temp_symbol = temp.get_symbol(0);
+
+    rt_submit_aic_task<0>(FUNC_CONSUME_TEMP_AIC, [&](SubmitBuilder &builder) {
+        builder.add_input([&]() -> SymbolicTensor {
+            return temp_symbol;
+        });
+        builder.add_output([&]() -> const Tensor & {
+            return output;
+        });
+        builder.add_scalar([&]() -> uint64_t {
+            return n;
+        });
+    });
+}
+
+}  // extern "C"

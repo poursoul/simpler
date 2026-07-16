@@ -25,22 +25,29 @@ class TestSharedBuilderNoevalSmoke(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/shared_builder_noeval_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN],
+            "signature": [D.IN, D.INOUT],
         },
         "incores": [
             {
                 "func_id": 0,
-                "name": "DUMMY_AIC",
-                "source": "kernels/aic/dummy.cpp",
+                "name": "PRODUCER_AIC",
+                "source": "kernels/aic/producer.cpp",
                 "core_type": "aic",
-                "signature": [],
+                "signature": [D.IN, D.OUT, D.OUT],
             },
             {
                 "func_id": 1,
-                "name": "DUMMY_AIV",
-                "source": "kernels/aiv/dummy.cpp",
+                "name": "CONSUMER_AIC",
+                "source": "kernels/aic/consumer.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.IN, D.INOUT],
+            },
+            {
+                "func_id": 2,
+                "name": "CONSUMER_AIV",
+                "source": "kernels/aiv/consumer.cpp",
                 "core_type": "aiv",
-                "signature": [],
+                "signature": [D.IN, D.IN, D.INOUT],
             },
         ],
     }
@@ -58,17 +65,49 @@ class TestSharedBuilderNoevalSmoke(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 16},
         },
+        {
+            "name": "A5OnboardBd1N1",
+            "platforms": ["a5"],
+            "config": {"block_dim": 1},
+            "params": {"n": 1},
+        },
+        {
+            "name": "A5OnboardBd1N2",
+            "platforms": ["a5"],
+            "config": {"block_dim": 1},
+            "params": {"n": 2},
+        },
+        {
+            "name": "A5OnboardBd36N1",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 1},
+        },
+        {
+            "name": "A5OnboardBd36N2",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 2},
+        },
+        {
+            "name": "A5OnboardBd36N16",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 16},
+        },
     ]
 
     def generate_args(self, params):
         n = int(params["n"])
         return TaskArgsBuilder(
             Tensor("sentinel", torch.arange(n, dtype=torch.float32)),
+            Tensor("output", torch.full((n,), -1.0, dtype=torch.float32)),
             Scalar("n", n),
         )
 
     def compute_golden(self, args, params):
-        del args, params
+        n = int(params["n"])
+        args.output[:] = torch.arange(n, dtype=torch.float32) * 2.0 + 1.0
 
 
 if __name__ == "__main__":

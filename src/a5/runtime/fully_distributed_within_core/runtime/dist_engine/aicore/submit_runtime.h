@@ -429,13 +429,17 @@ PTO_DEVICE_FUNC inline bool dist_submit_shared_materialize_outputs(const L0TaskA
 
 PTO_DEVICE_FUNC inline void dist_submit_shared_publish_producers(const L0TaskArgs &args, DistSubmitCtx &ctx) {
     uint32_t output_slot = 0;
+    // Shared winners wait for the previous task before publishing, so fresh
+    // OUTPUT symbol insertion is single-writer here and avoids the map lock's
+    // onboard control-line traffic.
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         const TensorArgType tag = args.tag(i);
         if (tag == TensorArgType::OUTPUT) {
-            shared_map_insert_symbol(g_dist.shared_map, ctx.task_id, output_slot, ctx.payload->tensors[i]);
+            shared_map_insert_symbol_unlocked(g_dist.shared_map, ctx.task_id, output_slot, ctx.payload->tensors[i]);
             output_slot++;
         }
     }
+    shared_map_flush_control(g_dist.shared_map);
 }
 
 PTO_DEVICE_FUNC inline void dist_submit_shared_add_fanin(DistSubmitCtx &ctx, int32_t producer) {
@@ -553,19 +557,22 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
         const uint32_t actual_outputs = dist_submit_count_fresh_outputs(args);
         if (args.has_error || actual_outputs != output_count) {
             set_fatal();
-        } else if (!dist_submit_shared_materialize_outputs(args, ctx)) {
-            set_fatal();
         } else {
-            shared_map_advance_retire(g_dist.shared_map, ctx.task_id, g_dist.H);
-            dist_submit_shared_publish_producers(args, ctx);
-            shared_publish_done(ctx.task_id);
-            dist_submit_shared_release_heap_turn(ctx.task_id);
-            if (!dist_submit_shared_resolve_inputs_and_fanin(args, ctx)) {
+            shared_wait_completed_before(ctx.self, ctx.task_id);
+            if (!dist_submit_shared_materialize_outputs(args, ctx)) {
                 set_fatal();
             } else {
-                TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
-                dist_submit_build_winner_task(ctx, mixed, args);
-                drain_phase_b(ctx.self);
+                shared_map_advance_retire(g_dist.shared_map, ctx.task_id, g_dist.H);
+                dist_submit_shared_publish_producers(args, ctx);
+                shared_publish_done(ctx.task_id);
+                dist_submit_shared_release_heap_turn(ctx.task_id);
+                if (!dist_submit_shared_resolve_inputs_and_fanin(args, ctx)) {
+                    set_fatal();
+                } else {
+                    TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
+                    dist_submit_build_winner_task(ctx, mixed, args);
+                    drain_phase_b(ctx.self);
+                }
             }
         }
     } else {
@@ -598,6 +605,7 @@ dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, const L0TaskArgs &arg
 
     if (is_winner) {
         atomic_fetch_add<int64_t>(g_dist.shared_winner_count.v, 1);
+        shared_wait_completed_before(ctx.self, ctx.task_id);
         if (!dist_submit_shared_materialize_outputs(args, ctx)) {
             set_fatal();
         } else {

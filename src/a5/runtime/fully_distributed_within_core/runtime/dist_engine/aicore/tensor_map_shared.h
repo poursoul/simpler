@@ -254,16 +254,12 @@ PTO_DEVICE_FUNC void shared_map_advance_retire(__gm__ SharedDistTensorMap &map, 
 }
 
 template <typename TensorRef>
-PTO_DEVICE_FUNC void shared_map_insert_entry(
+PTO_DEVICE_FUNC void shared_map_insert_entry_unlocked(
     __gm__ SharedDistTensorMap &map, int32_t task_id, int32_t output_slot, const TensorRef &tensor, bool publish_symbol,
     bool publish_range
 ) {
-    if (!shared_map_lock(map)) return;
     const int32_t idx = shared_map_alloc_entry_locked(map);
-    if (idx < 0) {
-        shared_map_unlock(map);
-        return;
-    }
+    if (idx < 0) return;
     __gm__ SharedMapEntry &entry = map.entries[idx];
     Tensor::copy(entry.tensor, tensor);
     uint64_t addr = 0;
@@ -280,6 +276,9 @@ PTO_DEVICE_FUNC void shared_map_insert_entry(
     entry.next_in_range_bucket = -1;
     entry.next_in_task = map.task_heads[task_id & kTaskWindowMask];
     map.task_heads[task_id & kTaskWindowMask] = idx;
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&map.task_heads[task_id & kTaskWindowMask], sizeof(map.task_heads[0]));
+#endif
     uint32_t range_bucket = 0;
     uint32_t symbol_bucket = 0;
     if (publish_range) {
@@ -300,13 +299,28 @@ PTO_DEVICE_FUNC void shared_map_insert_entry(
 #endif
     if (publish_range) shared_map_flush_bucket(map.range_buckets[range_bucket]);
     if (publish_symbol) shared_map_flush_bucket(map.symbol_buckets[symbol_bucket]);
+}
+
+template <typename TensorRef>
+PTO_DEVICE_FUNC void shared_map_insert_entry(
+    __gm__ SharedDistTensorMap &map, int32_t task_id, int32_t output_slot, const TensorRef &tensor, bool publish_symbol,
+    bool publish_range
+) {
+    if (!shared_map_lock(map)) return;
+    shared_map_insert_entry_unlocked(map, task_id, output_slot, tensor, publish_symbol, publish_range);
     shared_map_unlock(map);
 }
 
 PTO_DEVICE_FUNC void shared_map_insert_symbol(
     __gm__ SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot, __gm__ const Tensor &tensor
 ) {
-    shared_map_insert_entry(map, task_id, static_cast<int32_t>(output_slot), tensor, true, true);
+    shared_map_insert_entry(map, task_id, static_cast<int32_t>(output_slot), tensor, true, false);
+}
+
+PTO_DEVICE_FUNC void shared_map_insert_symbol_unlocked(
+    __gm__ SharedDistTensorMap &map, int32_t task_id, uint32_t output_slot, __gm__ const Tensor &tensor
+) {
+    shared_map_insert_entry_unlocked(map, task_id, static_cast<int32_t>(output_slot), tensor, true, false);
 }
 
 template <typename TensorRef>

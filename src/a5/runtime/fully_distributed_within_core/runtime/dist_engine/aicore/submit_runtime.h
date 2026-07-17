@@ -429,14 +429,24 @@ PTO_DEVICE_FUNC inline bool dist_submit_shared_materialize_outputs(const L0TaskA
 
 PTO_DEVICE_FUNC inline void dist_submit_shared_publish_producers(const L0TaskArgs &args, DistSubmitCtx &ctx) {
     uint32_t output_slot = 0;
-    // Shared winners wait for the previous task before publishing, so fresh
-    // OUTPUT symbol insertion is single-writer here and avoids the map lock's
-    // onboard control-line traffic.
+    // Shared winners wait for the previous task before publishing, so map
+    // insertion is single-writer here and avoids the map lock's onboard
+    // control-line traffic.
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         const TensorArgType tag = args.tag(i);
         if (tag == TensorArgType::OUTPUT) {
             shared_map_insert_symbol_unlocked(g_dist.shared_map, ctx.task_id, output_slot, ctx.payload->tensors[i]);
             output_slot++;
+        } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
+#if defined(__CCE_AICORE__)
+            if (args.tensor(i).tensor_from_gm()) {
+                shared_map_insert_range_unlocked(g_dist.shared_map, ctx.task_id, args.tensor(i).gm_ref());
+            } else {
+                shared_map_insert_range_unlocked(g_dist.shared_map, ctx.task_id, args.tensor(i).ref());
+            }
+#else
+            shared_map_insert_range_unlocked(g_dist.shared_map, ctx.task_id, args.tensor(i).ref());
+#endif
         }
     }
     shared_map_flush_control(g_dist.shared_map);
@@ -456,6 +466,7 @@ dist_submit_shared_collect_tensor_fanin(DistSubmitCtx &ctx, const TensorRef &ten
     if (owner_raw != UINT64_MAX) dist_submit_shared_add_fanin(ctx, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
     if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) return;
     if (tensor.manual_dep) return;
+    dist_submit_shared_add_fanin(ctx, shared_map_lookup_range(g_dist.shared_map, tensor, ctx.task_id));
 }
 
 PTO_DEVICE_FUNC inline bool dist_submit_shared_resolve_inputs_and_fanin(const L0TaskArgs &args, DistSubmitCtx &ctx) {

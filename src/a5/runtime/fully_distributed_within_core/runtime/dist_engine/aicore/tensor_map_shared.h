@@ -331,6 +331,12 @@ PTO_DEVICE_FUNC void shared_map_insert_symbol_unlocked(
 
 template <typename TensorRef>
 PTO_DEVICE_FUNC void
+shared_map_insert_range_unlocked(__gm__ SharedDistTensorMap &map, int32_t task_id, const TensorRef &tensor) {
+    shared_map_insert_entry_unlocked(map, task_id, -1, tensor, false, true);
+}
+
+template <typename TensorRef>
+PTO_DEVICE_FUNC void
 shared_map_insert_range(__gm__ SharedDistTensorMap &map, int32_t task_id, const TensorRef &tensor) {
     shared_map_insert_entry(map, task_id, -1, tensor, false, true);
 }

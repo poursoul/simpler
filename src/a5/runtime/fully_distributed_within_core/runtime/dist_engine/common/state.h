@@ -303,6 +303,7 @@ struct DistGlobal {
     size_t heap_size;
 
 #if PTO_FDWIC_SHARED_TENSORMAP
+    uint8_t shared_map_pad[kCacheLine - 2 * sizeof(uint64_t)];
     SharedDistTensorMap shared_map;
     PaddedCursor shared_heap_top;
     PaddedCursor shared_heap_alloc_cursor;
@@ -318,7 +319,11 @@ struct DistGlobal {
     PTO2Runtime *rt;
     Runtime *runtime;
 
+#if PTO_FDWIC_SHARED_TENSORMAP
+    uint8_t fatal_pad[40];
+#else
     uint8_t fatal_pad[24];
+#endif
     volatile int32_t fatal;
     uint8_t fatal_tail_pad[kCacheLine - sizeof(int32_t)];
 
@@ -338,6 +343,9 @@ struct DistGlobal {
 };
 static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be cacheline-aligned");
+#if PTO_FDWIC_SHARED_TENSORMAP
+static_assert(offsetof(DistGlobal, shared_map) % 64 == 0, "DistGlobal shared_map must be cacheline-aligned");
+#endif
 static_assert(offsetof(DistGlobal, fatal) % 64 == 0, "DistGlobal fatal must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, blocks) % 64 == 0, "DistGlobal blocks must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, replay_done) % 64 == 0, "DistGlobal replay_done must be cacheline-aligned");

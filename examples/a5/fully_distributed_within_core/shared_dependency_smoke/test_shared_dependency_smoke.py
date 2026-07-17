@@ -112,6 +112,27 @@ class TestSharedDependencySmoke(SceneTestCase):
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.IN, D.INOUT],
             },
+            {
+                "func_id": 12,
+                "name": "INSPECT_ALLOC_AIC",
+                "source": "kernels/aic/inspect_alloc.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.INOUT, D.INOUT],
+            },
+            {
+                "func_id": 13,
+                "name": "DCCI_ATOMIC_CLOBBER_AIC",
+                "source": "kernels/aic/dcci_atomic_clobber.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 14,
+                "name": "DCCI_ATOMIC_CLOBBER_AIV",
+                "source": "kernels/aiv/dcci_atomic_clobber.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
         ],
     }
 
@@ -254,6 +275,66 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 512, "mode": 40},
         },
         {
+            "name": "A5SimBd1AllocFillRunAhead67",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 67, "mode": 41},
+        },
+        {
+            "name": "A5SimBd1AllocOnly1",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 1, "mode": 42},
+        },
+        {
+            "name": "A5SimBd1TailAicOutput",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 43},
+        },
+        {
+            "name": "A5SimBd1DeadAicOutput",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 44},
+        },
+        {
+            "name": "A5SimBd1AllocDescriptorInSlot",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 45},
+        },
+        {
+            "name": "A5SimBd1AllocDescriptorInAicSlot",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 128, "mode": 46},
+        },
+        {
+            "name": "A5SimBd1AllocHeapBackPressure",
+            "platforms": ["a5sim"],
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 1,
+                "runtime_env": {"ring_heap": 68 * 1024},
+            },
+            "params": {"n": 67, "mode": 47},
+        },
+        {
+            "name": "A5SimBd1DcciAtomicClobber",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": {"n": 64, "mode": 48},
+        },
+        {
             "name": "A5OnboardBd36EagerFullInout",
             "manual": True,
             "platforms": ["a5"],
@@ -331,6 +412,104 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 512, "mode": 40},
         },
         {
+            "name": "A5OnboardBd1AllocFillRunAhead67",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 67, "mode": 41},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillExisting1",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 1, "mode": 41},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillExisting2",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 2, "mode": 41},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillExisting4",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 4, "mode": 41},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillExisting8",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 8, "mode": 41},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillExisting16",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 16, "mode": 41},
+        },
+        {
+            "name": "A5OnboardBd1AllocFillExisting64",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 64, "mode": 41},
+        },
+        {
+            "name": "A5OnboardBd1AllocOnly1",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 1, "mode": 42},
+        },
+        {
+            "name": "A5OnboardBd1TailAicOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1},
+            "params": {"n": 128, "mode": 43},
+        },
+        {
+            "name": "A5OnboardBd1DeadAicOutput",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1},
+            "params": {"n": 128, "mode": 44},
+        },
+        {
+            "name": "A5OnboardBd1AllocDescriptorInSlot",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1},
+            "params": {"n": 128, "mode": 45},
+        },
+        {
+            "name": "A5OnboardBd1AllocDescriptorInAicSlot",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1},
+            "params": {"n": 128, "mode": 46},
+        },
+        {
+            "name": "A5OnboardBd1AllocHeapBackPressure",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 67, "mode": 47},
+        },
+        {
+            "name": "A5OnboardBd1DcciAtomicClobber",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 1},
+            "params": {"n": 64, "mode": 48},
+        },
+        {
             "name": "A5OnboardBd36L0TaskArgsTagPersistence",
             "manual": True,
             "platforms": ["a5"],
@@ -349,7 +528,7 @@ class TestSharedDependencySmoke(SceneTestCase):
             Scalar("mode", int(params.get("mode", 0))),
         )
 
-    def compute_golden(self, args, params):
+    def compute_golden(self, args, params):  # noqa: PLR0912 -- mode table mirrors orchestration coverage
         mode = int(params.get("mode", 0))
         if mode == 1:
             n = int(params["n"])
@@ -415,6 +594,33 @@ class TestSharedDependencySmoke(SceneTestCase):
             args.output[:] = -1.0
             expected = args.input[:sub_n] * 5.0 + 21.0
             args.output[: 12 * sub_n] = expected.repeat(12)
+            return
+        if mode in {41, 42, 44}:
+            args.output[:] = -1.0
+            return
+        if mode == 43:
+            args.output[:] = args.input + 7.0
+            return
+        if mode == 45:
+            args.output[:] = -1.0
+            args.output[0] = 0.0
+            args.output[1:4] = 1.0
+            args.dump[:3] = 1.0
+            return
+        if mode == 46:
+            args.output[:] = -1.0
+            args.output[:10] = 1.0
+            args.dump[:3] = 1.0
+            return
+        if mode == 47:
+            args.output[:] = (args.input * 2.0 + 3.0) * 3.0 + 8.0
+            return
+        if mode == 48:
+            args.output[:] = -1.0
+            args.output[0] = 1.0
+            args.output[1] = 11.0
+            args.output[16] = 1.0
+            args.output[17] = 1.0
             return
         raise AssertionError(f"unsupported mode {mode}")
 

@@ -40,25 +40,46 @@
 #define CACHELINE_OUT 0
 #endif
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *input_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *left_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    const uint64_t n = static_cast<uint64_t>(args[2]);
+namespace {
 
-    __gm__ float *input = reinterpret_cast<__gm__ float *>(input_tensor->buffer.addr) + input_tensor->start_offset;
-    __gm__ float *left = reinterpret_cast<__gm__ float *>(left_tensor->buffer.addr) + left_tensor->start_offset;
-    if (n == 67) {
-        const uint64_t spin = static_cast<uint64_t>(args[3]);
-        volatile uint64_t sink = 0;
-        for (uint64_t i = 0; i < spin; i++) {
-            sink += i;
-        }
-        if (sink == UINT64_MAX) left[0] = input[0];
-    }
-    for (uint64_t i = 0; i < n; i++) {
-        left[i] = input[i] * 2.0f + 3.0f;
-    }
-    for (uint64_t off = 0; off < n * sizeof(float); off += 64) {
-        dcci(reinterpret_cast<__gm__ uint8_t *>(left) + off, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    }
+constexpr float kOne = 1.0f;
+constexpr float kThree = 3.0f;
+constexpr float kEleven = 11.0f;
+
+PTO_DEVICE_FUNC inline float atomic_load_f32(__gm__ volatile float *addr) {
+#if defined(__CCE_AICORE__)
+    return atomicAdd(const_cast<__gm__ float *>(addr), 0.0f);
+#else
+    return *addr;
+#endif
+}
+
+PTO_DEVICE_FUNC inline void atomic_store_f32(__gm__ volatile float *addr, float value) {
+#if defined(__CCE_AICORE__)
+    atomicExch(const_cast<__gm__ float *>(addr), value);
+#else
+    *addr = value;
+#endif
+}
+
+}  // namespace
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *output_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
+    __gm__ volatile float *words = output;
+    __gm__ volatile float *phase = output + 16;
+
+    words[0] = kOne;
+    words[1] = kEleven;
+    atomic_store_f32(&phase[0], kOne);
+    while (atomic_load_f32(&phase[1]) != kOne) {}
+    dcci(reinterpret_cast<__gm__ uint8_t *>(output), SINGLE_CACHE_LINE, CACHELINE_OUT);
+
+    float observed = words[0];
+#if defined(__CCE_AICORE__)
+    words[0] = (observed == kOne) ? kOne : 0.0f;
+#else
+    words[0] = (observed == kThree) ? kOne : 0.0f;
+#endif
 }

@@ -187,6 +187,12 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             "params": {"n": 1, "mode": 6},
         },
         {
+            "name": "A5OnboardBd36HeapWrapN256",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36, "runtime_env": {"ring_heap": 68 * 1024}},
+            "params": {"n": 256, "mode": 6},
+        },
+        {
             "name": "A5OnboardBd36AivProducerAicConsumerN64",
             "platforms": ["a5"],
             "config": {"block_dim": 36},

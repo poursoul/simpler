@@ -291,14 +291,20 @@ PTO_DEVICE_FUNC void shared_map_insert_entry_unlocked(
 #if defined(__CCE_AICORE__)
     dist_aicore_flush_region(&entry, sizeof(entry));
 #endif
-    if (publish_range) entry.next_in_range_bucket = atomic_exchange(map.range_buckets[range_bucket], idx);
-    if (publish_symbol) entry.next_in_symbol_bucket = atomic_exchange(map.symbol_buckets[symbol_bucket], idx);
+    if (publish_range) entry.next_in_range_bucket = shared_map_load_bucket(map.range_buckets[range_bucket]);
+    if (publish_symbol) entry.next_in_symbol_bucket = shared_map_load_bucket(map.symbol_buckets[symbol_bucket]);
     store_barrier();
 #if defined(__CCE_AICORE__)
     dist_aicore_flush_region(&entry, sizeof(entry));
 #endif
-    if (publish_range) shared_map_flush_bucket(map.range_buckets[range_bucket]);
-    if (publish_symbol) shared_map_flush_bucket(map.symbol_buckets[symbol_bucket]);
+    if (publish_range) {
+        map.range_buckets[range_bucket] = idx;
+        shared_map_flush_bucket(map.range_buckets[range_bucket]);
+    }
+    if (publish_symbol) {
+        map.symbol_buckets[symbol_bucket] = idx;
+        shared_map_flush_bucket(map.symbol_buckets[symbol_bucket]);
+    }
 }
 
 template <typename TensorRef>

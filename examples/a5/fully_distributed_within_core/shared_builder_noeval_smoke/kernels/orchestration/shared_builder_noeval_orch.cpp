@@ -37,57 +37,42 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     for (uint64_t i = 0; i < n; i++) {
         TensorCreateInfo ci0(shape, 1, DataType::FLOAT32);
         TensorCreateInfo ci1(shape, 1, DataType::FLOAT32);
-        TaskOutputTensors produced =
-            rt_submit_aic_task<2>(FUNC_PRODUCER_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-                builder.add_no_dep([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                    return sentinel;
-                });
-                builder.add_output([&]() PTO_DEVICE_FUNC -> TensorCreateInfo & {
-                    return ci0;
-                });
-                builder.add_output([&]() PTO_DEVICE_FUNC -> TensorCreateInfo & {
-                    return ci1;
-                });
-                builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                    return i;
-                });
-            });
+        PreparedSubmit producer = rt_prepare_aic_task<2>(FUNC_PRODUCER_AIC);
+        if (producer.is_winner()) {
+            L0TaskArgs producer_args;
+            producer_args.add_no_dep(sentinel);
+            producer_args.add_output(ci0);
+            producer_args.add_output(ci1);
+            producer_args.add_scalar(i);
+            producer.commit(producer_args);
+        }
+        TaskOutputTensors produced = producer.outputs();
         const SymbolicTensor produced_symbol0 = produced.get_symbol(0);
         const SymbolicTensor produced_symbol1 = produced.get_symbol(1);
 
         if ((i & 1) == 0) {
-            rt_submit_aic_task<0>(FUNC_CONSUMER_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-                builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
-                    return produced_symbol0;
-                });
-                builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
-                    return produced_symbol1;
-                });
-                builder.add_inout([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                    return output;
-                });
-                builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                    return i;
-                });
-            });
+            PreparedSubmit consumer = rt_prepare_aic_task<0>(FUNC_CONSUMER_AIC);
+            if (consumer.is_winner()) {
+                L0TaskArgs consumer_args;
+                consumer_args.add_input(produced_symbol0);
+                consumer_args.add_input(produced_symbol1);
+                consumer_args.add_inout(output);
+                consumer_args.add_scalar(i);
+                consumer.commit(consumer_args);
+            }
         } else {
             MixedKernels mixed;
             mixed.aic_kernel_id = FUNC_CONSUMER_AIC;
             mixed.aiv0_kernel_id = FUNC_CONSUMER_AIV;
-            rt_submit_task<0>(mixed, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-                builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
-                    return produced_symbol0;
-                });
-                builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
-                    return produced_symbol1;
-                });
-                builder.add_inout([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                    return output;
-                });
-                builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                    return i;
-                });
-            });
+            PreparedSubmit consumer = rt_prepare_task<0>(mixed);
+            if (consumer.is_winner()) {
+                L0TaskArgs consumer_args;
+                consumer_args.add_input(produced_symbol0);
+                consumer_args.add_input(produced_symbol1);
+                consumer_args.add_inout(output);
+                consumer_args.add_scalar(i);
+                consumer.commit(consumer_args);
+            }
         }
     }
 }

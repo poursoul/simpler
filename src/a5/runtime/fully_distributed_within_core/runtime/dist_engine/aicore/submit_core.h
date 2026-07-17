@@ -318,7 +318,12 @@ struct DistSubmitCtx {
     int32_t tensor_count;
     int32_t scalar_count;
     uint64_t output_bytes;
+#if PTO_FDWIC_SHARED_TENSORMAP
+    PTO2TaskId result_task_id;
+    uint32_t result_output_count;
+#else
     TaskOutputTensors result;
+#endif
     int32_t fanin[kMaxFanin];
     int32_t fanin_count;
     int32_t kernel_id;
@@ -339,7 +344,12 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
         ctx.task_id = ctx.self->local_index++;
         ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     }
+#if PTO_FDWIC_SHARED_TENSORMAP
+    ctx.result_task_id = PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id));
+    ctx.result_output_count = 0;
+#else
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
+#endif
     ctx.tensor_count = args.tensor_count();
     ctx.scalar_count = args.scalar_count();
     ctx.output_bytes = 0;
@@ -444,6 +454,12 @@ dist_submit_copy_arg_tensor(__gm__ Tensor &dst, const L0TaskArgs &args, const Di
         Tensor::copy(dst, ctx.payload->tensors[i]);
         return;
     }
+#if PTO_FDWIC_SHARED_TENSORMAP
+    if (args.tensor(i).tensor_is_symbolic()) {
+        Tensor::copy(dst, ctx.payload->tensors[i]);
+        return;
+    }
+#endif
 #if defined(__CCE_AICORE__)
     if (args.tensor(i).tensor_from_gm()) {
         Tensor::copy(dst, args.tensor(i).gm_ref());

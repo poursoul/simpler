@@ -181,6 +181,12 @@ class TestSharedBuilderExecSmoke(SceneTestCase):
             "params": {"n": 64, "mode": 5},
         },
         {
+            "name": "A5OnboardBd36PreparedLongProducerN1",
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 1, "mode": 6},
+        },
+        {
             "name": "A5OnboardBd36AivProducerAicConsumerN64",
             "platforms": ["a5"],
             "config": {"block_dim": 36},

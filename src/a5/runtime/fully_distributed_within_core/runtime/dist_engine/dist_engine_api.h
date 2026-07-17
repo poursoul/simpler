@@ -47,9 +47,22 @@
 struct PTO2Runtime;
 
 #if PTO_FDWIC_SHARED_TENSORMAP
-using DistSubmitBuildFn = void (*)(L0TaskArgs *args, void *ctx);
-PTO_DEVICE_FUNC TaskOutputTensors dist_submit_builder_impl(
-    PTO2Runtime *rt, const MixedKernels &mixed, uint32_t output_count, DistSubmitBuildFn build_fn, void *build_ctx
+struct DistPreparedSubmit {
+    int32_t task_id;
+    int32_t kernel_id;
+    int32_t joint_block;
+    int32_t joint_slot;
+    int32_t joint_count;
+    uint32_t output_count;
+    uint8_t won;
+    uint8_t joint;
+    uint8_t joint_init;
+};
+
+PTO_DEVICE_FUNC DistPreparedSubmit
+dist_prepare_submit_impl(PTO2Runtime *rt, const MixedKernels &mixed, uint32_t output_count);
+PTO_DEVICE_FUNC void dist_commit_prepared_submit_impl(
+    PTO2Runtime *rt, const MixedKernels &mixed, const DistPreparedSubmit &prepared, const L0TaskArgs &args
 );
 #endif
 

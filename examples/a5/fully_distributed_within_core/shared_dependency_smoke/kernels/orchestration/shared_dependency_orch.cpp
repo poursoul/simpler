@@ -152,14 +152,13 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     }
 
     if (mode == 31) {
-        rt_submit_aiv_task<0>(FUNC_BUMP_INOUT_AIV, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_inout([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
+        PreparedSubmit bump = rt_prepare_aiv_task<0>(FUNC_BUMP_INOUT_AIV);
+        if (bump.is_winner()) {
+            L0TaskArgs bump_args;
+            bump_args.add_inout(output);
+            bump_args.add_scalar(n);
+            bump.commit(bump_args);
+        }
         return;
     }
 

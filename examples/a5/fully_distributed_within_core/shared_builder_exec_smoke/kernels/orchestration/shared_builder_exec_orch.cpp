@@ -20,6 +20,78 @@
 #define FUNC_CONSUME_TEMP_AIV 4
 #define FUNC_MAKE_TEMP_AIV 5
 
+namespace {
+
+PTO_DEVICE_FUNC void submit_fill_output_aic(const Tensor &input, const Tensor &output, uint64_t n, TensorArgType tag) {
+    PreparedSubmit submit = rt_prepare_aic_task<0>(FUNC_FILL_OUTPUT_AIC);
+    if (!submit.is_winner()) return;
+    L0TaskArgs args;
+    args.add_input(input);
+    if (tag == TensorArgType::OUTPUT) {
+        args.add_output(output);
+    } else {
+        args.add_inout(output);
+    }
+    args.add_scalar(n);
+    submit.commit(args);
+}
+
+PTO_DEVICE_FUNC void submit_bump_output_aic(const Tensor &output, uint64_t n) {
+    PreparedSubmit submit = rt_prepare_aic_task<0>(FUNC_BUMP_OUTPUT_AIC);
+    if (!submit.is_winner()) return;
+    L0TaskArgs args;
+    args.add_inout(output);
+    args.add_scalar(n);
+    submit.commit(args);
+}
+
+PTO_DEVICE_FUNC TaskOutputTensors submit_make_temp_aic(const Tensor &input, TensorCreateInfo &temp_ci, uint64_t n) {
+    PreparedSubmit submit = rt_prepare_aic_task<1>(FUNC_MAKE_TEMP_AIC);
+    if (submit.is_winner()) {
+        L0TaskArgs args;
+        args.add_input(input);
+        args.add_output(temp_ci);
+        args.add_scalar(n);
+        submit.commit(args);
+    }
+    return submit.outputs();
+}
+
+PTO_DEVICE_FUNC TaskOutputTensors submit_make_temp_aiv(const Tensor &input, TensorCreateInfo &temp_ci, uint64_t n) {
+    PreparedSubmit submit = rt_prepare_aiv_task<1>(FUNC_MAKE_TEMP_AIV);
+    if (submit.is_winner()) {
+        L0TaskArgs args;
+        args.add_input(input);
+        args.add_output(temp_ci);
+        args.add_scalar(n);
+        submit.commit(args);
+    }
+    return submit.outputs();
+}
+
+PTO_DEVICE_FUNC void submit_consume_temp_aic(SymbolicTensor temp_symbol, const Tensor &output, uint64_t n) {
+    PreparedSubmit submit = rt_prepare_aic_task<0>(FUNC_CONSUME_TEMP_AIC);
+    if (!submit.is_winner()) return;
+    L0TaskArgs args;
+    args.add_input(temp_symbol);
+    args.add_output(output);
+    args.add_scalar(n);
+    submit.commit(args);
+}
+
+PTO_DEVICE_FUNC void
+submit_consume_temp_mixed(const MixedKernels &mixed, SymbolicTensor temp_symbol, const Tensor &output, uint64_t n) {
+    PreparedSubmit submit = rt_prepare_task<0>(mixed);
+    if (!submit.is_winner()) return;
+    L0TaskArgs args;
+    args.add_input(temp_symbol);
+    args.add_output(output);
+    args.add_scalar(n);
+    submit.commit(args);
+}
+
+}  // namespace
+
 extern "C" {
 
 __attribute__((visibility("default"), weak)) PTO2OrchestrationConfig
@@ -38,25 +110,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     const uint64_t mode = orch_args.scalar(1);
 
     if (mode == 1) {
-        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return input;
-            });
-            builder.add_inout([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
-        rt_submit_aic_task<0>(FUNC_BUMP_OUTPUT_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_inout([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
+        submit_fill_output_aic(input, output, n, TensorArgType::INOUT);
+        submit_bump_output_aic(output, n);
         return;
     }
 
@@ -65,48 +120,14 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         const uint32_t sub_shape[1] = {sub_n};
         const uint32_t sub_offset[1] = {static_cast<uint32_t>(n / 4)};
         Tensor sub_output = Tensor::view(output, sub_shape, sub_offset);
-        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return input;
-            });
-            builder.add_inout([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
-        rt_submit_aic_task<0>(FUNC_BUMP_OUTPUT_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_inout([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return sub_output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return sub_n;
-            });
-        });
+        submit_fill_output_aic(input, output, n, TensorArgType::INOUT);
+        submit_bump_output_aic(sub_output, sub_n);
         return;
     }
 
     if (mode == 3) {
-        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return input;
-            });
-            builder.add_output([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
-        rt_submit_aic_task<0>(FUNC_BUMP_OUTPUT_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_inout([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
+        submit_fill_output_aic(input, output, n, TensorArgType::OUTPUT);
+        submit_bump_output_aic(output, n);
         return;
     }
 
@@ -114,29 +135,9 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         const uint32_t shape[1] = {static_cast<uint32_t>(n)};
         TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
         for (int32_t i = 0; i < 96; i++) {
-            rt_submit_aic_task<1>(FUNC_MAKE_TEMP_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-                builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                    return input;
-                });
-                builder.add_output([&]() PTO_DEVICE_FUNC -> TensorCreateInfo & {
-                    return temp_ci;
-                });
-                builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                    return n;
-                });
-            });
+            submit_make_temp_aic(input, temp_ci, n);
         }
-        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return input;
-            });
-            builder.add_output([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
+        submit_fill_output_aic(input, output, n, TensorArgType::OUTPUT);
         return;
     }
 
@@ -144,58 +145,18 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         const uint32_t shape[1] = {static_cast<uint32_t>(n)};
         TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
         for (int32_t i = 0; i < 16500; i++) {
-            rt_submit_aic_task<1>(FUNC_MAKE_TEMP_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-                builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                    return input;
-                });
-                builder.add_output([&]() PTO_DEVICE_FUNC -> TensorCreateInfo & {
-                    return temp_ci;
-                });
-                builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                    return n;
-                });
-            });
+            submit_make_temp_aic(input, temp_ci, n);
         }
-        rt_submit_aic_task<0>(FUNC_FILL_OUTPUT_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return input;
-            });
-            builder.add_output([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
+        submit_fill_output_aic(input, output, n, TensorArgType::OUTPUT);
         return;
     }
 
     if (mode == 8) {
         const uint32_t shape[1] = {static_cast<uint32_t>(n)};
         TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
-        TaskOutputTensors temp = rt_submit_aiv_task<1>(FUNC_MAKE_TEMP_AIV, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return input;
-            });
-            builder.add_output([&]() PTO_DEVICE_FUNC -> TensorCreateInfo & {
-                return temp_ci;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
+        TaskOutputTensors temp = submit_make_temp_aiv(input, temp_ci, n);
         const SymbolicTensor temp_symbol = temp.get_symbol(0);
-        rt_submit_aic_task<0>(FUNC_CONSUME_TEMP_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
-                return temp_symbol;
-            });
-            builder.add_output([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
+        submit_consume_temp_aic(temp_symbol, output, n);
         return;
     }
 
@@ -203,17 +164,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     const uint32_t shape[1] = {static_cast<uint32_t>(n)};
     TensorCreateInfo temp_ci(shape, 1, DataType::FLOAT32);
 
-    TaskOutputTensors temp = rt_submit_aic_task<1>(FUNC_MAKE_TEMP_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-        builder.add_input([&]() PTO_DEVICE_FUNC -> const Tensor & {
-            return input;
-        });
-        builder.add_output([&]() PTO_DEVICE_FUNC -> TensorCreateInfo & {
-            return temp_ci;
-        });
-        builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-            return n;
-        });
-    });
+    TaskOutputTensors temp = submit_make_temp_aic(input, temp_ci, n);
     const SymbolicTensor temp_symbol = temp.get_symbol(0);
 
     if (use_mixed) {
@@ -225,31 +176,11 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             mixed.aiv0_kernel_id = FUNC_CONSUME_TEMP_AIV;
             mixed.aiv1_kernel_id = FUNC_CONSUME_TEMP_AIV;
         }
-        rt_submit_task<0>(mixed, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-            builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
-                return temp_symbol;
-            });
-            builder.add_output([&]() PTO_DEVICE_FUNC -> const Tensor & {
-                return output;
-            });
-            builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-                return n;
-            });
-        });
+        submit_consume_temp_mixed(mixed, temp_symbol, output, n);
         return;
     }
 
-    rt_submit_aic_task<0>(FUNC_CONSUME_TEMP_AIC, [&](SubmitBuilder &builder) PTO_DEVICE_FUNC {
-        builder.add_input([&]() PTO_DEVICE_FUNC -> SymbolicTensor {
-            return temp_symbol;
-        });
-        builder.add_output([&]() PTO_DEVICE_FUNC -> const Tensor & {
-            return output;
-        });
-        builder.add_scalar([&]() PTO_DEVICE_FUNC -> uint64_t {
-            return n;
-        });
-    });
+    submit_consume_temp_aic(temp_symbol, output, n);
 }
 
 }  // extern "C"

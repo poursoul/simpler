@@ -33,68 +33,48 @@
 struct PTO2Runtime;
 
 #if PTO_FDWIC_SHARED_TENSORMAP
-class SubmitBuilder {
+class PreparedSubmit {
 public:
-    explicit PTO_DEVICE_FUNC SubmitBuilder(L0TaskArgs &args) :
-        args_(args) {}
+    PTO_DEVICE_FUNC PreparedSubmit(const MixedKernels &mixed, const DistPreparedSubmit &prepared) :
+        mixed_(mixed),
+        prepared_(prepared) {}
 
-    template <typename Fn>
-    PTO_DEVICE_FUNC void add_input(Fn &&fn) {
-        args_.add_input(fn());
+    PTO_DEVICE_FUNC bool is_winner() const { return prepared_.won != 0; }
+    PTO_DEVICE_FUNC TaskOutputTensors outputs() const {
+        TaskOutputTensors result;
+        result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(prepared_.task_id)));
+        result.set_symbolic_output_count(prepared_.output_count);
+        return result;
     }
 
-    template <typename Fn>
-    PTO_DEVICE_FUNC void add_output(Fn &&fn) {
-        args_.add_output(fn());
-    }
-
-    template <typename Fn>
-    PTO_DEVICE_FUNC void add_inout(Fn &&fn) {
-        args_.add_inout(fn());
-    }
-
-    template <typename Fn>
-    PTO_DEVICE_FUNC void add_no_dep(Fn &&fn) {
-        args_.add_no_dep(fn());
-    }
-
-    template <typename Fn>
-    PTO_DEVICE_FUNC void add_scalar(Fn &&fn) {
-        args_.add_scalar(fn());
+    PTO_DEVICE_FUNC void commit(const L0TaskArgs &args) const {
+        if (dist_is_fatal_query()) return;
+        dist_commit_prepared_submit_impl(nullptr, mixed_, prepared_, args);
     }
 
 private:
-    L0TaskArgs &args_;
+    MixedKernels mixed_;
+    DistPreparedSubmit prepared_;
 };
 
-template <typename BuildFn>
-PTO_DEVICE_FUNC void dist_submit_builder_trampoline(L0TaskArgs *args, void *ctx) {
-    BuildFn &build_fn = *reinterpret_cast<BuildFn *>(ctx);
-    SubmitBuilder builder(*args);
-    build_fn(builder);
+template <uint32_t OutputCount>
+PTO_DEVICE_FUNC inline PreparedSubmit rt_prepare_task(const MixedKernels &mixed_kernels) {
+    if (dist_is_fatal_query()) return PreparedSubmit(mixed_kernels, DistPreparedSubmit{});
+    return PreparedSubmit(mixed_kernels, dist_prepare_submit_impl(nullptr, mixed_kernels, OutputCount));
 }
 
-template <uint32_t OutputCount, typename BuildFn>
-PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, BuildFn &&build_fn) {
-    if (dist_is_fatal_query()) return TaskOutputTensors{};
-    using Fn = std::remove_reference_t<BuildFn>;
-    return dist_submit_builder_impl(
-        nullptr, mixed_kernels, OutputCount, &dist_submit_builder_trampoline<Fn>, static_cast<void *>(&build_fn)
-    );
-}
-
-template <uint32_t OutputCount, typename BuildFn>
-PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, BuildFn &&build_fn) {
+template <uint32_t OutputCount>
+PTO_DEVICE_FUNC inline PreparedSubmit rt_prepare_aic_task(int32_t kernel_id) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
-    return rt_submit_task<OutputCount>(mk, static_cast<BuildFn &&>(build_fn));
+    return rt_prepare_task<OutputCount>(mk);
 }
 
-template <uint32_t OutputCount, typename BuildFn>
-PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, BuildFn &&build_fn) {
+template <uint32_t OutputCount>
+PTO_DEVICE_FUNC inline PreparedSubmit rt_prepare_aiv_task(int32_t kernel_id) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
-    return rt_submit_task<OutputCount>(mk, static_cast<BuildFn &&>(build_fn));
+    return rt_prepare_task<OutputCount>(mk);
 }
 #endif
 

@@ -1877,7 +1877,11 @@ class Worker:
         compile_definitions = self._config.get("runtime_compile_definitions")
 
         builder = RuntimeBuilder(platform)
-        binaries = builder.get_binaries(runtime, compile_definitions=compile_definitions)
+        binaries = builder.get_binaries(
+            runtime,
+            build=bool(compile_definitions),
+            compile_definitions=compile_definitions,
+        )
         aicore_path_override = self._config.get("aicore_path_override")
         if aicore_path_override:
             binaries = replace(binaries, aicore_path=Path(aicore_path_override))
@@ -1914,7 +1918,11 @@ class Worker:
             runtime = self._config["runtime"]
             compile_definitions = self._config.get("runtime_compile_definitions")
             builder = RuntimeBuilder(platform)
-            binaries = builder.get_binaries(runtime, compile_definitions=compile_definitions)
+            binaries = builder.get_binaries(
+                runtime,
+                build=bool(compile_definitions),
+                compile_definitions=compile_definitions,
+            )
 
             # Stash the full RuntimeBinaries so forked chip children can
             # construct a ChipWorker with one call (`cw.init(device_id, bins)`)

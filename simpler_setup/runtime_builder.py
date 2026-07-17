@@ -323,6 +323,8 @@ class RuntimeBuilder:
 
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
+            fingerprint_paths = [*(Path(p) for p in include_dirs), *(Path(p) for p in source_dirs)]
+            current_state = _SOURCE_STATE_VERSION + ":" + current_commit + ":" + _source_fingerprint(fingerprint_paths)
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name
             if definition_signature:
@@ -335,7 +337,7 @@ class RuntimeBuilder:
             lock_path = cache_dir / f".{target}.lock"
             with open(lock_path, "w") as lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                _invalidate_cache_if_stale(cache_dir / target, current_commit)
+                _invalidate_cache_if_stale(cache_dir / target, current_state)
                 return compiler.compile(  # type: ignore[return-value]
                     target,
                     include_dirs,

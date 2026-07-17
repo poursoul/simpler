@@ -248,6 +248,12 @@ class TestSharedDependencySmoke(SceneTestCase):
             "params": {"n": 512, "mode": 39},
         },
         {
+            "name": "A5SimBd36FaninRingReuseStress",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 512, "mode": 40},
+        },
+        {
             "name": "A5OnboardBd36EagerFullInout",
             "manual": True,
             "platforms": ["a5"],
@@ -316,6 +322,13 @@ class TestSharedDependencySmoke(SceneTestCase):
             "platforms": ["a5"],
             "config": {"block_dim": 1},
             "params": {"n": 512, "mode": 39},
+        },
+        {
+            "name": "A5OnboardBd36FaninRingReuseStress",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"block_dim": 36},
+            "params": {"n": 512, "mode": 40},
         },
         {
             "name": "A5OnboardBd36L0TaskArgsTagPersistence",
@@ -396,6 +409,12 @@ class TestSharedDependencySmoke(SceneTestCase):
             args.output[:] = -1.0
             expected = args.input[:sub_n] * 2.0 + 10.0
             args.output[: repeat * sub_n] = expected.repeat(repeat)
+            return
+        if mode == 40:
+            sub_n = 32
+            args.output[:] = -1.0
+            expected = args.input[:sub_n] * 5.0 + 21.0
+            args.output[: 12 * sub_n] = expected.repeat(12)
             return
         raise AssertionError(f"unsupported mode {mode}")
 

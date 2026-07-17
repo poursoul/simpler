@@ -53,6 +53,39 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     const uint64_t n = orch_args.scalar(0);
     const uint64_t mode = orch_args.scalar(1);
 
+    if (mode == 37) {
+        const uint32_t shape[1] = {static_cast<uint32_t>(n)};
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+        L0TaskArgs alloc_args;
+        alloc_args.add_output(scratch_ci);
+        TaskOutputTensors seed_out = alloc_tensors(alloc_args);
+        __gm__ const Tensor &seed = seed_out.get_ref(0);
+
+        L0TaskArgs fill_args;
+        fill_args.add_input(input);
+        fill_args.add_inout(seed);
+        fill_args.add_scalar(n);
+        fill_args.add_scalar(static_cast<uint64_t>(2000000));
+        rt_submit_aic_task(FUNC_FILL_INOUT_AIC, fill_args);
+
+        const uint32_t sub_n = static_cast<uint32_t>(n / 8);
+        const uint32_t sub_shape[1] = {sub_n};
+        const uint32_t seed_offset[1] = {0};
+        Tensor seed_view = Tensor::view(seed, sub_shape, seed_offset);
+        for (uint64_t i = 0; i < 6; i++) {
+            const uint32_t out_offset[1] = {static_cast<uint32_t>(i * sub_n)};
+            Tensor output_view = Tensor::view(output, sub_shape, out_offset);
+            L0TaskArgs fanin_args;
+            fanin_args.add_input(seed_view);
+            fanin_args.add_input(seed_view);
+            fanin_args.add_input(seed_view);
+            fanin_args.add_inout(output_view);
+            fanin_args.add_scalar(sub_n);
+            rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        }
+        return;
+    }
+
     if (mode == 36) {
         const uint32_t shape[1] = {static_cast<uint32_t>(n)};
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);

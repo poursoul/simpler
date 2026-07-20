@@ -67,6 +67,10 @@ set(AICORE_FLAGS
     ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}"
 )
 separate_arguments(AICORE_FLAGS)
+if(DEFINED ENV{CXXFLAGS})
+    separate_arguments(PTO_AICORE_ENV_CXXFLAGS UNIX_COMMAND "$ENV{CXXFLAGS}")
+    list(APPEND AICORE_FLAGS ${PTO_AICORE_ENV_CXXFLAGS})
+endif()
 
 # Step 1: Compile each source file to individual .o files for AIC and AIV
 set(ALL_AIC_OBJECTS "")

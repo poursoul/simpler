@@ -66,6 +66,30 @@ enum class PTO2ScopeMode : uint8_t {
     MANUAL = 1,
 };
 
+#ifndef PTO_FDWIC_SHARED_MAP
+#define PTO_FDWIC_SHARED_MAP 0
+#endif
+
+struct SubmitToken {
+    int32_t task_id{-1};
+    int32_t kernel_id{INVALID_KERNEL_ID};
+    uint8_t active_mask{0};
+    uint8_t anchor_lane{0};
+    bool candidate{false};
+    bool won{false};
+    bool replay_outputs{true};
+    bool joint{false};
+    int32_t joint_block{-1};
+    int32_t joint_count{0};
+    MixedKernels mixed{};
+};
+
+struct FdwicOutputRef {
+    int32_t producer_task_id{-1};
+    int16_t output_slot{-1};
+    uint16_t flags{0};
+};
+
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
  *
@@ -104,6 +128,18 @@ public:
     PTO_DEVICE_FUNC bool empty() const { return output_count_ == 0; }
     PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
 
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC void add_symbolic_output(int32_t producer_task_id, int16_t output_slot) {
+        always_assert(output_count_ < MAX_TENSOR_ARGS);
+        refs_[output_count_++] = FdwicOutputRef{producer_task_id, output_slot, 0};
+    }
+
+    PTO_DEVICE_FUNC FdwicOutputRef output_ref(uint32_t index) const {
+        always_assert(index < output_count_);
+        return refs_[index];
+    }
+#endif
+
     /// Borrow a materialized output tensor by index (lvalue only). Under
     /// CCEC the pointed-to Tensor lives in the submitting task's payload on GM
     /// at run time — that's why the stored pointer is __gm__-qualified; sim
@@ -128,6 +164,9 @@ public:
 private:
     PTO2TaskId task_id_;
     uint32_t output_count_;
+#if PTO_FDWIC_SHARED_MAP
+    FdwicOutputRef refs_[MAX_TENSOR_ARGS];
+#endif
     // Upper bound: a task cannot have more outputs than total tensor args
     // (every OUTPUT/OUTPUT_EXISTING slot is one of the Arg's tensor slots).
     // __gm__ so the aicore build can point at Tensors that live in the shared

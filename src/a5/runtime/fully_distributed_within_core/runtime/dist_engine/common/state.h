@@ -49,8 +49,10 @@ static_assert(sizeof(DistTaskPayload) % 64 == 0, "DistTaskPayload must not share
 static_assert(offsetof(DistTaskPayload, tensors) % 64 == 0, "payload tensors must be cacheline-aligned");
 
 struct DistOutputLayout {
+    int32_t output_indices[MAX_TENSOR_ARGS];
     uint64_t buffer_sizes[MAX_TENSOR_ARGS];
     uint64_t total_output_size;
+    int32_t output_count;
 };
 
 [[maybe_unused]] constexpr size_t kHeapRingDefault = 64ull << 20;
@@ -239,6 +241,19 @@ struct DistTaskCell {
 };
 static_assert(sizeof(DistTaskCell) == kCacheLine);
 
+#if PTO_FDWIC_SHARED_MAP
+constexpr int32_t kSharedOutputMaxPerTask = 8;
+
+struct SharedOutputCell {
+    volatile int64_t published;
+    uint8_t published_pad[kCacheLine - sizeof(int64_t)];
+    Tensor tensors[kSharedOutputMaxPerTask];
+};
+static_assert(offsetof(SharedOutputCell, published) % 64 == 0, "shared output flag must be cacheline-aligned");
+static_assert(offsetof(SharedOutputCell, tensors) % 64 == 0, "shared output tensors must be cacheline-aligned");
+static_assert(sizeof(SharedOutputCell) % 64 == 0, "SharedOutputCell must not share cachelines");
+#endif
+
 struct DistGlobal {
     PaddedCursor cube_cursor[kCursorShards];
     PaddedCursor vector_cursor[kCursorShards];
@@ -249,6 +264,9 @@ struct DistGlobal {
     int32_t H;
     uint8_t tasks_pad[kCacheLine - sizeof(int32_t)];
     DistTaskCell tasks[kFlagCap];
+#if PTO_FDWIC_SHARED_MAP
+    SharedOutputCell shared_outputs[kFlagCap];
+#endif
 
     uint8_t *heap_base;
     size_t heap_size;
@@ -277,6 +295,9 @@ struct DistGlobal {
 };
 static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be cacheline-aligned");
+#if PTO_FDWIC_SHARED_MAP
+static_assert(offsetof(DistGlobal, shared_outputs) % 64 == 0, "DistGlobal shared_outputs must be cacheline-aligned");
+#endif
 static_assert(offsetof(DistGlobal, fatal) % 64 == 0, "DistGlobal fatal must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, blocks) % 64 == 0, "DistGlobal blocks must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, replay_done) % 64 == 0, "DistGlobal replay_done must be cacheline-aligned");

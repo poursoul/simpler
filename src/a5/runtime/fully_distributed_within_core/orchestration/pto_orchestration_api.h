@@ -36,9 +36,54 @@ PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
     return dist_alloc_tensors(nullptr, args);
 }
 
+PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_task(const MixedKernels &mixed_kernels) {
+    if (dist_is_fatal_query()) return SubmitToken{};
+    return dist_presubmit_task_impl(nullptr, mixed_kernels);
+}
+
+PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_aic_task(int32_t kernel_id) {
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    return rt_presubmit_task(mk);
+}
+
+PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_aiv_task(int32_t kernel_id) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return rt_presubmit_task(mk);
+}
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_winner(const SubmitToken &tok, const L0TaskArgs &args) {
+    if (dist_is_fatal_query()) return TaskOutputTensors{};
+    return dist_submit_winner_impl(nullptr, tok, args);
+}
+
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_loser(const SubmitToken &tok, uint32_t output_count) {
+    if (dist_is_fatal_query()) return TaskOutputTensors{};
+    return dist_submit_loser_impl(nullptr, tok, output_count);
+}
+
+PTO_DEVICE_FUNC inline Tensor rt_resolve_output(const TaskOutputTensors &outs, uint32_t slot) {
+    if (dist_is_fatal_query()) return Tensor{};
+    return dist_resolve_output_impl(nullptr, outs.output_ref(slot));
+}
+#else
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_winner(const SubmitToken &tok, const L0TaskArgs &args) {
+    if (dist_is_fatal_query()) return TaskOutputTensors{};
+    return dist_submit_winner_impl(nullptr, tok, args);
+}
+
+PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_loser(const SubmitToken &tok, const L0TaskArgs &outputs) {
+    if (dist_is_fatal_query()) return TaskOutputTensors{};
+    return dist_submit_loser_impl(nullptr, tok, outputs);
+}
+
 PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};
-    return dist_submit_impl(nullptr, mixed_kernels, args);
+    SubmitToken tok = rt_presubmit_task(mixed_kernels);
+    if (tok.won) return rt_submit_winner(tok, args);
+    return rt_submit_loser(tok, args);
 }
 
 PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const L0TaskArgs &args) {
@@ -52,6 +97,7 @@ PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, c
     mk.aiv0_kernel_id = kernel_id;
     return rt_submit_task(mk, args);
 }
+#endif
 
 PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};

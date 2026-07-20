@@ -50,6 +50,17 @@ struct PTO2Runtime;
 // stashed by dist_core_main / thread_local sim. CCEC definitions use the same
 // materialize/map/fanin/register stages, then dispatch through the current
 // direct AICore execution backend.
+PTO_DEVICE_FUNC SubmitToken dist_presubmit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed);
+PTO_DEVICE_FUNC TaskOutputTensors
+dist_submit_winner_impl(PTO2Runtime *rt, const SubmitToken &tok, const L0TaskArgs &args);
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC
+TaskOutputTensors dist_submit_loser_impl(PTO2Runtime *rt, const SubmitToken &tok, uint32_t output_count);
+#else
+PTO_DEVICE_FUNC
+TaskOutputTensors dist_submit_loser_impl(PTO2Runtime *rt, const SubmitToken &tok, const L0TaskArgs &outputs);
+#endif
+PTO_DEVICE_FUNC Tensor dist_resolve_output_impl(PTO2Runtime *rt, FdwicOutputRef ref);
 PTO_DEVICE_FUNC TaskOutputTensors dist_submit_impl(PTO2Runtime *rt, const MixedKernels &mixed, const L0TaskArgs &args);
 PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0TaskArgs &args);
 

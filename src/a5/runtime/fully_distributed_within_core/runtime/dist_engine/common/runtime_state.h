@@ -68,6 +68,12 @@ PTO_DEVICE_FUNC inline __gm__ DistTaskCell &task_cell(int32_t task_id) {
     return g_dist.tasks[task_id & (kFlagCap - 1)];
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC inline __gm__ SharedOutputCell &shared_output_cell(int32_t task_id) {
+    return g_dist.shared_outputs[task_id & (kFlagCap - 1)];
+}
+#endif
+
 PTO_DEVICE_FUNC void reset_task_cell(int32_t task_id) {
     __gm__ DistTaskCell &cell = task_cell(task_id);
     atomic_exchange(cell.flag, int64_t{0}, __ATOMIC_RELAXED);

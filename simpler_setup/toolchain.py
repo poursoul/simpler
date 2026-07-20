@@ -53,6 +53,13 @@ def _parse_compiler_env(var_name: str, default: str) -> tuple[str, list[str]]:
     return tokens[0], tokens[1:]
 
 
+def _cxx_extra_flags() -> list[str]:
+    raw_cxxflags = os.environ.get("CXXFLAGS", "")
+    flags = shlex.split(raw_cxxflags) if raw_cxxflags else []
+    flags.extend(_parse_compiler_env("CXX", "")[1])
+    return flags
+
+
 def _matches_pinned_name(actual: str, pinned: str) -> bool:
     """True if *actual* (a CC/CXX value) names the *pinned* compiler.
 
@@ -225,6 +232,7 @@ class Gxx15Toolchain(Toolchain):
             flags.append("-D__DAV_VEC__")
         elif core_type == "aic":
             flags.append("-D__DAV_CUBE__")
+        flags.extend(_cxx_extra_flags())
         return flags
 
     def get_cmake_args(self) -> list[str]:
@@ -255,6 +263,7 @@ class GxxToolchain(Toolchain):
         # unloads the SO.  GCC-only; clang does not produce STB_GNU_UNIQUE.
         if self._gcc:
             flags.append("-fno-gnu-unique")
+        flags.extend(_cxx_extra_flags())
         return flags
 
     def get_cmake_args(self) -> list[str]:
@@ -305,6 +314,7 @@ class Aarch64GxxToolchain(Toolchain):
         # -fno-gnu-unique: prevent STB_GNU_UNIQUE binding so dlclose actually unloads the SO.
         if self._gcc:
             flags.append("-fno-gnu-unique")
+        flags.extend(_cxx_extra_flags())
         return flags
 
     def get_cmake_args(self) -> list[str]:

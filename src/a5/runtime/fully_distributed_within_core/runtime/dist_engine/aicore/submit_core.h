@@ -312,6 +312,9 @@ struct DistSubmitCtx {
     int32_t scalar_count;
     uint64_t output_bytes;
     TaskOutputTensors result;
+#if PTO_FDWIC_SHARED_MAP
+    SharedTaskOutputs shared_result;
+#endif
     int32_t fanin[kMaxFanin];
     int32_t fanin_count;
     int32_t kernel_id;
@@ -333,6 +336,9 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
         ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     }
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
+#if PTO_FDWIC_SHARED_MAP
+    ctx.shared_result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
+#endif
     ctx.tensor_count = args.tensor_count();
     ctx.scalar_count = args.scalar_count();
     ctx.output_bytes = 0;
@@ -356,6 +362,9 @@ PTO_DEVICE_FUNC void dist_submit_begin_presubmit(__gm__ DistCore *self, DistSubm
         ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     }
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
+#if PTO_FDWIC_SHARED_MAP
+    ctx.shared_result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
+#endif
     ctx.tensor_count = 0;
     ctx.scalar_count = 0;
     ctx.output_bytes = 0;
@@ -380,6 +389,9 @@ PTO_DEVICE_FUNC void dist_submit_begin_from_token(
         ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     }
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
+#if PTO_FDWIC_SHARED_MAP
+    ctx.shared_result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
+#endif
     ctx.tensor_count = args.tensor_count();
     ctx.scalar_count = args.scalar_count();
     ctx.output_bytes = 0;
@@ -469,6 +481,9 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, buffer_size);
         slot_t.owner_task_id.raw = ctx.result.task_id().raw;
         ctx.result.materialize_output(slot_t);
+#if PTO_FDWIC_SHARED_MAP
+        ctx.shared_result.add_output_ref(ctx.task_id, static_cast<int16_t>(output_ordinal));
+#endif
         output_offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
     }
     ctx.self->heap_next = task_base + layout.total_output_size;
@@ -476,12 +491,41 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     return true;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC Tensor dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self) {
+    Tensor resolved;
+    if (ref.producer_task_id < 0 || ref.producer_task_id >= kFlagCap) {
+        set_fatal();
+        return resolved;
+    }
+    __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
+    while (!fatal_set() && atomic_load(cell.published, __ATOMIC_ACQUIRE) != ref.producer_task_id) {
+        drain_block_won(self);
+        if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
+    }
+    if (fatal_set()) return resolved;
+    always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&cell.tensors[ref.output_slot], sizeof(Tensor));
+#endif
+    Tensor::copy(resolved, cell.tensors[ref.output_slot]);
+    return resolved;
+}
+#endif
+
 PTO_DEVICE_FUNC inline void
 dist_submit_copy_arg_tensor(__gm__ Tensor &dst, const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t i) {
     if (args.tag(i) == TensorArgType::OUTPUT) {
         Tensor::copy(dst, ctx.payload->tensors[i]);
         return;
     }
+#if PTO_FDWIC_SHARED_MAP
+    if (args.tensor(i).tensor_from_shared_output()) {
+        Tensor resolved = dist_resolve_shared_output_ref(args.tensor(i).shared_output_ref(), ctx.self);
+        Tensor::copy(dst, resolved);
+        return;
+    }
+#endif
 #if defined(__CCE_AICORE__)
     if (args.tensor(i).tensor_from_gm()) {
         Tensor::copy(dst, args.tensor(i).gm_ref());

@@ -90,6 +90,36 @@ struct FdwicOutputRef {
     uint16_t flags{0};
 };
 
+#if PTO_FDWIC_SHARED_MAP
+class SharedTaskOutputs {
+public:
+    PTO_DEVICE_FUNC SharedTaskOutputs() :
+        task_id_(PTO2TaskId::invalid()),
+        output_count_(0) {}
+
+    PTO_DEVICE_FUNC bool empty() const { return output_count_ == 0; }
+    PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
+
+    PTO_DEVICE_FUNC void add_output_ref(int32_t producer_task_id, int16_t output_slot) {
+        always_assert(output_count_ < MAX_TENSOR_ARGS);
+        refs_[output_count_++] = FdwicOutputRef{producer_task_id, output_slot, 0};
+    }
+
+    PTO_DEVICE_FUNC FdwicOutputRef output_ref(uint32_t index) const {
+        always_assert(index < output_count_);
+        return refs_[index];
+    }
+
+    PTO_DEVICE_FUNC void set_task_id(PTO2TaskId id) { task_id_ = id; }
+    PTO_DEVICE_FUNC PTO2TaskId task_id() const { return task_id_; }
+
+private:
+    PTO2TaskId task_id_;
+    uint32_t output_count_;
+    FdwicOutputRef refs_[MAX_TENSOR_ARGS];
+};
+#endif
+
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
  *
@@ -128,18 +158,6 @@ public:
     PTO_DEVICE_FUNC bool empty() const { return output_count_ == 0; }
     PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
 
-#if PTO_FDWIC_SHARED_MAP
-    PTO_DEVICE_FUNC void add_symbolic_output(int32_t producer_task_id, int16_t output_slot) {
-        always_assert(output_count_ < MAX_TENSOR_ARGS);
-        refs_[output_count_++] = FdwicOutputRef{producer_task_id, output_slot, 0};
-    }
-
-    PTO_DEVICE_FUNC FdwicOutputRef output_ref(uint32_t index) const {
-        always_assert(index < output_count_);
-        return refs_[index];
-    }
-#endif
-
     /// Borrow a materialized output tensor by index (lvalue only). Under
     /// CCEC the pointed-to Tensor lives in the submitting task's payload on GM
     /// at run time — that's why the stored pointer is __gm__-qualified; sim
@@ -164,9 +182,6 @@ public:
 private:
     PTO2TaskId task_id_;
     uint32_t output_count_;
-#if PTO_FDWIC_SHARED_MAP
-    FdwicOutputRef refs_[MAX_TENSOR_ARGS];
-#endif
     // Upper bound: a task cannot have more outputs than total tensor args
     // (every OUTPUT/OUTPUT_EXISTING slot is one of the Arg's tensor slots).
     // __gm__ so the aicore build can point at Tensors that live in the shared
@@ -202,6 +217,9 @@ class TensorRef {
         __gm__ const Tensor *gm_ptr_;
 #endif
         const TensorCreateInfo *create_info_;
+#if PTO_FDWIC_SHARED_MAP
+        FdwicOutputRef output_ref_;
+#endif
     };
     uint8_t kind_;
 
@@ -209,6 +227,9 @@ class TensorRef {
         kTensor = 0,
         kGmTensor = 1,
         kCreateInfo = 2,
+#if PTO_FDWIC_SHARED_MAP
+        kSharedOutputRef = 3,
+#endif
     };
 
 public:
@@ -230,6 +251,13 @@ public:
         kind_ = kCreateInfo;
         return *this;
     }
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC TensorRef &operator=(const FdwicOutputRef &ref) {
+        output_ref_ = ref;
+        kind_ = kSharedOutputRef;
+        return *this;
+    }
+#endif
 #if defined(__CCE_AICORE__)
     PTO_DEVICE_FUNC TensorRef &set_gm_tensor(__gm__ const Tensor *p) {
         gm_ptr_ = p;
@@ -243,6 +271,10 @@ public:
 #endif
     PTO_DEVICE_FUNC const TensorCreateInfo &create_info() const { return *create_info_; }
     PTO_DEVICE_FUNC bool tensor_from_gm() const { return kind_ == kGmTensor; }
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC bool tensor_from_shared_output() const { return kind_ == kSharedOutputRef; }
+    PTO_DEVICE_FUNC FdwicOutputRef shared_output_ref() const { return output_ref_; }
+#endif
     PTO_DEVICE_FUNC bool refers_to(const Tensor *t) const { return ptr_ == t; }
     PTO_DEVICE_FUNC bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
 };
@@ -359,6 +391,13 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             (add_tensor_ref(args, TensorArgType::INPUT), ...);
         }
     }
+
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC void add_input(FdwicOutputRef ref) {
+        if (!check_add_tensor_capacity(1)) return;
+        add_symbolic_input_ref(ref);
+    }
+#endif
 
     /// Batch add outputs — all Tensor or all TensorCreateInfo:
     ///   add_output(ci1, ci2)         — runtime allocates buffers (OUTPUT)
@@ -724,6 +763,14 @@ private:
     PTO_DEVICE_FUNC void add_tensor_ref(__gm__ const Tensor &tensor, TensorArgType tag) {
         tensors_[tensor_count_].set_gm_tensor(&tensor);
         tags_[tensor_count_] = tag;
+        tensor_count_++;
+    }
+#endif
+
+#if PTO_FDWIC_SHARED_MAP
+    PTO_DEVICE_FUNC void add_symbolic_input_ref(FdwicOutputRef ref) {
+        tensors_[tensor_count_] = ref;
+        tags_[tensor_count_] = TensorArgType::INPUT;
         tensor_count_++;
     }
 #endif

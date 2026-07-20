@@ -25,7 +25,7 @@
 #include "dist_engine/dist_engine_api.h"  // NOLINT(build/include_subdir)
 #include "pto_runtime2_types.h"           // PTO2_ERROR_*
 #include "pto_submit_types.h"             // MixedKernels, INVALID_KERNEL_ID
-#include "pto_types.h"                    // Arg, TaskOutputTensors, TensorArgType
+#include "pto_types.h"                    // Arg, SharedTaskOutputs, TaskOutputTensors, TensorArgType
 #include "task_args.h"                    // ChipStorageTaskArgs, Tensor
 #include "tensor.h"                       // Tensor, TensorCreateInfo
 
@@ -54,19 +54,14 @@ PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_aiv_task(int32_t kernel_id) {
 }
 
 #if PTO_FDWIC_SHARED_MAP
-PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_winner(const SubmitToken &tok, const L0TaskArgs &args) {
-    if (dist_is_fatal_query()) return TaskOutputTensors{};
+PTO_DEVICE_FUNC inline SharedTaskOutputs rt_submit_winner(const SubmitToken &tok, const L0TaskArgs &args) {
+    if (dist_is_fatal_query()) return SharedTaskOutputs{};
     return dist_submit_winner_impl(nullptr, tok, args);
 }
 
-PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_loser(const SubmitToken &tok, uint32_t output_count) {
-    if (dist_is_fatal_query()) return TaskOutputTensors{};
+PTO_DEVICE_FUNC inline SharedTaskOutputs rt_submit_loser(const SubmitToken &tok, uint32_t output_count) {
+    if (dist_is_fatal_query()) return SharedTaskOutputs{};
     return dist_submit_loser_impl(nullptr, tok, output_count);
-}
-
-PTO_DEVICE_FUNC inline Tensor rt_resolve_output(const TaskOutputTensors &outs, uint32_t slot) {
-    if (dist_is_fatal_query()) return Tensor{};
-    return dist_resolve_output_impl(nullptr, outs.output_ref(slot));
 }
 #else
 PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_winner(const SubmitToken &tok, const L0TaskArgs &args) {

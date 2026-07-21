@@ -38,6 +38,22 @@ constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
 
 PTO_DEVICE_FUNC inline uint64_t min_u64(uint64_t a, uint64_t b) { return a < b ? a : b; }
 
+#if PTO_FDWIC_SHARED_MAP
+using SubmitOutputs = SharedTaskOutputs;
+using OutputHandle = FdwicOutputRef;
+
+PTO_DEVICE_FUNC inline OutputHandle output_handle(const SubmitOutputs &outputs, uint32_t slot) {
+    return outputs.output_ref(slot);
+}
+#else
+using SubmitOutputs = TaskOutputTensors;
+using OutputHandle = __gm__ const Tensor &;
+
+PTO_DEVICE_FUNC inline OutputHandle output_handle(const SubmitOutputs &outputs, uint32_t slot) {
+    return outputs.get_ref(slot);
+}
+#endif
+
 inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
 }
@@ -199,6 +215,29 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     CYCLE_COUNT_LAP(prof_param_extract);
 
                     // === Task 1: Batched QK matmul ===
+#if PTO_FDWIC_SHARED_MAP
+                    SubmitToken qk_tok = rt_presubmit_aic_task(FUNC_QK_MATMUL);
+                    SubmitOutputs qk_outs;
+                    if (qk_tok.won) {
+                        uint32_t sij_buf_shapes[2] = {
+                            static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
+                        };
+                        TensorCreateInfo sij_buf_ci(sij_buf_shapes, 2, DataType::FLOAT32);
+#ifdef ENABLE_PROFILING
+                        prof_make_count += 1;
+                        CYCLE_COUNT_LAP(prof_make_tensor);
+#endif
+
+                        params_qk.reset();
+                        params_qk.add_input(qi, key_cache, block_table);
+                        params_qk.add_output(sij_buf_ci);
+                        params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        qk_outs = rt_submit_winner(qk_tok, params_qk);
+                    } else {
+                        qk_outs = rt_submit_loser(qk_tok, 1);
+                    }
+#else
                     uint32_t sij_buf_shapes[2] = {
                         static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
                     };
@@ -213,14 +252,37 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     params_qk.add_output(sij_buf_ci);
                     params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
-                    __gm__ const Tensor &sij_buf = qk_outs.get_ref(0);
+                    SubmitOutputs qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
+#endif
+                    OutputHandle sij_buf = output_handle(qk_outs, 0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 #endif
-
                     // === Task 2: Two-pass softmax over all blocks in group ===
+#if PTO_FDWIC_SHARED_MAP
+                    SubmitToken sf_tok = rt_presubmit_aiv_task(FUNC_SOFTMAX_PREPARE);
+                    SubmitOutputs sf_outs;
+                    if (sf_tok.won) {
+                        uint32_t pij_buf_shapes[2] = {
+                            static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
+                        };
+                        TensorCreateInfo pij_buf_ci(pij_buf_shapes, 2, data_type);
+#ifdef ENABLE_PROFILING
+                        prof_make_count += 1;
+                        CYCLE_COUNT_LAP(prof_make_tensor);
+#endif
+
+                        params_sf.reset();
+                        params_sf.add_input(sij_buf);
+                        params_sf.add_output(pij_buf_ci, scalar_ci, scalar_ci);
+                        params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        sf_outs = rt_submit_winner(sf_tok, params_sf);
+                    } else {
+                        sf_outs = rt_submit_loser(sf_tok, 3);
+                    }
+#else
                     uint32_t pij_buf_shapes[2] = {
                         static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
                     };
@@ -235,23 +297,40 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     params_sf.add_output(pij_buf_ci, scalar_ci, scalar_ci);
                     params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-                    __gm__ const Tensor &pij_buf = sf_outs.get_ref(0);
-                    __gm__ const Tensor &mi = sf_outs.get_ref(1);
-                    __gm__ const Tensor &li = sf_outs.get_ref(2);
+                    SubmitOutputs sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+#endif
+                    OutputHandle pij_buf = output_handle(sf_outs, 0);
+                    OutputHandle mi = output_handle(sf_outs, 1);
+                    OutputHandle li = output_handle(sf_outs, 2);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 #endif
-
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
+#if PTO_FDWIC_SHARED_MAP
+                    SubmitToken pv_tok = rt_presubmit_aic_task(FUNC_PV_MATMUL);
+                    SubmitOutputs pv_outs;
+                    if (pv_tok.won) {
+                        params_pv.reset();
+                        params_pv.add_input(pij_buf);
+                        params_pv.add_input(value_cache);
+                        params_pv.add_input(block_table);
+                        params_pv.add_output(tile2d_ci);
+                        params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        pv_outs = rt_submit_winner(pv_tok, params_pv);
+                    } else {
+                        pv_outs = rt_submit_loser(pv_tok, 1);
+                    }
+#else
                     params_pv.reset();
                     params_pv.add_input(pij_buf, value_cache, block_table);
                     params_pv.add_output(tile2d_ci);
                     params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
-                    __gm__ const Tensor &oi_new = pv_outs.get_ref(0);
+                    SubmitOutputs pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+#endif
+                    OutputHandle oi_new = output_handle(pv_outs, 0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -262,11 +341,26 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
 
                     params_up.reset();
+#if PTO_FDWIC_SHARED_MAP
+                    SubmitToken up_tok = rt_presubmit_aiv_task(FUNC_ONLINE_UPDATE);
+                    if (up_tok.won) {
+                        params_up.add_input(mi);
+                        params_up.add_input(li);
+                        params_up.add_input(oi_new);
+                        params_up.add_inout(mi_update, li_update, oi, out_view);
+                        params_up.add_scalar(is_first, is_last);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        rt_submit_winner(up_tok, params_up);
+                    } else {
+                        rt_submit_loser(up_tok, 0);
+                    }
+#else
                     params_up.add_input(mi, li, oi_new);
                     params_up.add_inout(mi_update, li_update, oi, out_view);
                     params_up.add_scalar(is_first, is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+#endif
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);

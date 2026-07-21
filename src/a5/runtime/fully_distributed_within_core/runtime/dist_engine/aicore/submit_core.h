@@ -205,7 +205,7 @@ PTO_DEVICE_FUNC void build_ring_slot(
     s.task_id = task_id;
     s.func_id = func_id;
     s.function_bin_addr = fn_addr;
-    s.built = true;
+    s.built = false;
     s.tensor_count = tc;
     s.scalar_count = sc;
     for (int32_t i = 0; i < tc; i++)
@@ -233,6 +233,7 @@ PTO_DEVICE_FUNC void build_ring_slot(
     s.is_multicore = is_multicore;
     s.won_block = won_block;
     s.won_slot = won_slot;
+    s.built = true;
 }
 
 PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
@@ -431,6 +432,58 @@ PTO_DEVICE_FUNC void calculate_output_layout(const L0TaskArgs &args, DistOutputL
     }
 }
 
+PTO_DEVICE_FUNC bool
+dist_submit_reserve_output_heap(DistSubmitCtx &ctx, uint64_t total, DistSubmitKind kind, uint64_t &task_base) {
+    const size_t ring = g_dist.heap_size;
+#if PTO_FDWIC_SHARED_MAP
+    const uint64_t shard_raw = static_cast<uint64_t>(ring / kSharedHeapActiveShards);
+    const uint64_t shard_span = (shard_raw / PTO2_PACKED_OUTPUT_ALIGN) * PTO2_PACKED_OUTPUT_ALIGN;
+    if (shard_span == 0 || total > shard_span) {
+        set_fatal();
+        DIST_ERRF(
+            "[dist_engine] shared heap shard too small for task %d outputs %llu B (heap=%zu shards=%d)\n", ctx.task_id,
+            (unsigned long long)total, ring, kSharedHeapActiveShards
+        );
+        return false;
+    }
+    const int32_t shard = ctx.task_id % kSharedHeapActiveShards;
+    const uint64_t reserve = PTO2_ALIGN_UP(total, PTO2_PACKED_OUTPUT_ALIGN);
+    uint64_t cursor = 0;
+    uint64_t offset = 0;
+    for (int32_t retry = 0; retry < 64; retry++) {
+        cursor = static_cast<uint64_t>(atomic_fetch_add<int64_t>(g_dist.shared_heap_cursor[shard].v, reserve));
+        offset = cursor % shard_span;
+        if (offset + total <= shard_span) break;
+        const uint64_t after = cursor + reserve;
+        const uint64_t after_offset = after % shard_span;
+        if (after_offset != 0) {
+            atomic_fetch_add<int64_t>(g_dist.shared_heap_cursor[shard].v, shard_span - after_offset);
+        }
+        offset = shard_span;
+    }
+    if (offset + total > shard_span) {
+        set_fatal();
+        DIST_ERRF(
+            "[dist_engine] shared heap shard wrap retry exhausted for task %d outputs %llu B at offset %llu/%llu\n",
+            ctx.task_id, (unsigned long long)total, (unsigned long long)offset, (unsigned long long)shard_span
+        );
+        return false;
+    }
+    const uint64_t global_vend =
+        static_cast<uint64_t>(atomic_fetch_add<int64_t>(g_dist.shared_heap_vend.v, reserve)) + reserve;
+    if (ctx.self != nullptr) ctx.self->heap_next = global_vend;
+    task_base = static_cast<uint64_t>(shard) * shard_span + offset;
+#else
+    task_base = PTO2_ALIGN_UP(ctx.self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    if ((task_base % ring) + total > ring) {
+        task_base = ((task_base / ring) + 1) * ring;
+    }
+    ctx.self->heap_next = task_base + total;
+#endif
+    (void)kind;
+    return true;
+}
+
 PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.payload == nullptr) return false;
     ctx.tensor_count = args.tensor_count();
@@ -440,7 +493,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     DistOutputLayout layout;
     calculate_output_layout(args, layout);
     const uint64_t total = layout.total_output_size;
-    uint64_t task_base = PTO2_ALIGN_UP(ctx.self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
+    uint64_t task_base = 0;
     if (total > 0 && g_dist.heap_base != nullptr) {
         if (total > ring) {
             set_fatal();
@@ -457,9 +510,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
             }
             return false;
         }
-        if ((task_base % ring) + total > ring) {
-            task_base = ((task_base / ring) + 1) * ring;
-        }
+        if (!dist_submit_reserve_output_heap(ctx, total, kind, task_base)) return false;
     }
 
     uint64_t output_offset = 0;
@@ -486,7 +537,9 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 #endif
         output_offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
     }
-    ctx.self->heap_next = task_base + layout.total_output_size;
+#if !PTO_FDWIC_SHARED_MAP
+    if (total > 0 && g_dist.heap_base != nullptr) ctx.self->heap_next = task_base + layout.total_output_size;
+#endif
     ctx.output_bytes = total;
     return true;
 }
@@ -498,13 +551,16 @@ PTO_DEVICE_FUNC Tensor dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__
         set_fatal();
         return resolved;
     }
+    always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
     __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
-    while (!fatal_set() && atomic_load(cell.published, __ATOMIC_ACQUIRE) != ref.producer_task_id) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&cell.published[0]), sizeof(cell.published));
+#endif
+    while (!fatal_set() && atomic_load(cell.published[ref.output_slot], __ATOMIC_ACQUIRE) != ref.producer_task_id) {
         drain_block_won(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }
     if (fatal_set()) return resolved;
-    always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
 #if defined(__CCE_AICORE__)
     dist_aicore_invalidate_region(&cell.tensors[ref.output_slot], sizeof(Tensor));
 #endif
@@ -547,7 +603,7 @@ PTO_DEVICE_FUNC void build_ring_slot_from_submit(
     s.task_id = task_id;
     s.func_id = func_id;
     s.function_bin_addr = fn_addr;
-    s.built = true;
+    s.built = false;
     s.tensor_count = ctx.tensor_count;
     s.scalar_count = ctx.scalar_count;
     for (int32_t i = 0; i < ctx.tensor_count; i++)
@@ -575,6 +631,7 @@ PTO_DEVICE_FUNC void build_ring_slot_from_submit(
     s.is_multicore = is_multicore;
     s.won_block = won_block;
     s.won_slot = won_slot;
+    s.built = true;
 }
 
 PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {

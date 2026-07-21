@@ -17,6 +17,8 @@
 #define FUNC_PRODUCE_AIV 1
 #define FUNC_CONSUME_AIC 2
 #define FUNC_CONSUME_AIV 3
+#define FUNC_PRODUCE_PAIR_AIC 4
+#define FUNC_PRODUCE_PAIR_AIV 5
 
 #if PTO_FDWIC_SHARED_MAP
 using SymbolOutputs = SharedTaskOutputs;
@@ -24,31 +26,34 @@ using SymbolOutputs = SharedTaskOutputs;
 using SymbolOutputs = TaskOutputTensors;
 #endif
 
-static PTO_DEVICE_FUNC
-    SymbolOutputs submit_producer(const MixedKernels &mk, const Tensor &input, const uint32_t shape[1], uint64_t n) {
+static PTO_DEVICE_FUNC SymbolOutputs submit_producer(
+    const MixedKernels &mk, const Tensor &input, const uint32_t shape[1], uint64_t n, uint32_t output_count
+) {
     TensorCreateInfo tmp_ci(shape, 1, DataType::FLOAT32);
     L0TaskArgs args;
     args.add_input(input);
     args.add_output(tmp_ci);
+    if (output_count == 2) args.add_output(tmp_ci);
     args.add_scalar(n);
 #if PTO_FDWIC_SHARED_MAP
     SubmitToken tok = rt_presubmit_task(mk);
     if (tok.won) return rt_submit_winner(tok, args);
-    return rt_submit_loser(tok, 1);
+    return rt_submit_loser(tok, output_count);
 #else
     return rt_submit_task(mk, args);
 #endif
 }
 
 static PTO_DEVICE_FUNC void submit_consumer(
-    const MixedKernels &mk, const Tensor &input, const SymbolOutputs &producer, const Tensor &output, uint64_t n
+    const MixedKernels &mk, const Tensor &input, const SymbolOutputs &producer, uint32_t producer_slot,
+    const Tensor &output, uint64_t n
 ) {
     L0TaskArgs args;
     args.add_input(input);
 #if PTO_FDWIC_SHARED_MAP
-    args.add_input(producer.output_ref(0));
+    args.add_input(producer.output_ref(producer_slot));
 #else
-    args.add_input(producer.get_ref(0));
+    args.add_input(producer.get_ref(producer_slot));
 #endif
     args.add_inout(output);
     args.add_scalar(n);
@@ -81,19 +86,38 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     const uint64_t n = orch_args.scalar(0);
     const uint64_t mode = orch_args.scalar(1);
     const uint32_t shape[1] = {static_cast<uint32_t>(n)};
+    uint64_t effective_mode = mode;
+
+    if (mode == 4) {
+        MixedKernels pad_aic;
+        pad_aic.aic_kernel_id = FUNC_PRODUCE_AIC;
+        (void)submit_producer(pad_aic, input, shape, n, 1);
+        MixedKernels pad_aiv;
+        pad_aiv.aiv0_kernel_id = FUNC_PRODUCE_AIV;
+        (void)submit_producer(pad_aiv, input, shape, n, 1);
+        effective_mode = 2;
+    }
 
     MixedKernels producer_mk;
     MixedKernels consumer_mk;
-    if (mode == 0) {
+    if (effective_mode == 0) {
         producer_mk.aic_kernel_id = FUNC_PRODUCE_AIC;
         consumer_mk.aiv0_kernel_id = FUNC_CONSUME_AIV;
-    } else {
+    } else if (effective_mode == 1) {
         producer_mk.aiv0_kernel_id = FUNC_PRODUCE_AIV;
+        consumer_mk.aic_kernel_id = FUNC_CONSUME_AIC;
+    } else if (effective_mode == 2) {
+        producer_mk.aic_kernel_id = FUNC_PRODUCE_PAIR_AIC;
+        consumer_mk.aiv0_kernel_id = FUNC_CONSUME_AIV;
+    } else {
+        producer_mk.aiv0_kernel_id = FUNC_PRODUCE_PAIR_AIV;
         consumer_mk.aic_kernel_id = FUNC_CONSUME_AIC;
     }
 
-    SymbolOutputs produced = submit_producer(producer_mk, input, shape, n);
-    submit_consumer(consumer_mk, input, produced, output, n);
+    const uint32_t output_count = effective_mode >= 2 ? 2 : 1;
+    SymbolOutputs produced = submit_producer(producer_mk, input, shape, n, output_count);
+    const uint32_t producer_slot = effective_mode >= 2 ? 1 : 0;
+    submit_consumer(consumer_mk, input, produced, producer_slot, output, n);
 }
 
 }  // extern "C"

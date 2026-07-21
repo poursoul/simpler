@@ -28,6 +28,17 @@ PTO_DEVICE_FUNC __gm__ DistCore *dist_aicore_attach_worker(__gm__ Runtime *runti
     g_ccec_runtime = runtime;
     g_ccec_core_idx = core_idx;
     g_ccec_core_type = core_type_int;
+    dist_aicore_invalidate_region(g_dist.cube_cursor, sizeof(g_dist.cube_cursor));
+    dist_aicore_invalidate_region(g_dist.vector_cursor, sizeof(g_dist.vector_cursor));
+    dist_aicore_invalidate_region(g_dist.alloc_cursor, sizeof(g_dist.alloc_cursor));
+    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.frontier), 64);
+    dist_aicore_invalidate_region(const_cast<__gm__ int32_t *>(&g_dist.fatal), 64);
+    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.replay_done), 64);
+    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&g_dist.started_count), 64);
+#if PTO_FDWIC_SHARED_MAP
+    dist_aicore_invalidate_region(g_dist.shared_heap_cursor, sizeof(g_dist.shared_heap_cursor));
+    dist_aicore_invalidate_region(&g_dist.shared_heap_vend, sizeof(g_dist.shared_heap_vend));
+#endif
 #endif
     g_self = &g_dist.cores[core_idx];
 

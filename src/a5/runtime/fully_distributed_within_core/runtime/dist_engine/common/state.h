@@ -243,13 +243,16 @@ static_assert(sizeof(DistTaskCell) == kCacheLine);
 
 #if PTO_FDWIC_SHARED_MAP
 constexpr int32_t kSharedOutputMaxPerTask = 8;
+constexpr int32_t kSharedHeapShards = kCursorShards;
+constexpr int32_t kSharedHeapActiveShards = kSharedHeapShards;
+static_assert(kSharedHeapActiveShards > 0 && kSharedHeapActiveShards <= kSharedHeapShards);
 
 struct SharedOutputCell {
-    volatile int64_t published;
-    uint8_t published_pad[kCacheLine - sizeof(int64_t)];
+    volatile int64_t published[kSharedOutputMaxPerTask];
+    uint8_t published_pad[kCacheLine - sizeof(int64_t) * kSharedOutputMaxPerTask];
     Tensor tensors[kSharedOutputMaxPerTask];
 };
-static_assert(offsetof(SharedOutputCell, published) % 64 == 0, "shared output flag must be cacheline-aligned");
+static_assert(offsetof(SharedOutputCell, published) % 64 == 0, "shared output flags must be cacheline-aligned");
 static_assert(offsetof(SharedOutputCell, tensors) % 64 == 0, "shared output tensors must be cacheline-aligned");
 static_assert(sizeof(SharedOutputCell) % 64 == 0, "SharedOutputCell must not share cachelines");
 #endif
@@ -265,6 +268,8 @@ struct DistGlobal {
     uint8_t tasks_pad[kCacheLine - sizeof(int32_t)];
     DistTaskCell tasks[kFlagCap];
 #if PTO_FDWIC_SHARED_MAP
+    PaddedCursor shared_heap_cursor[kSharedHeapShards];
+    PaddedCursor shared_heap_vend;
     SharedOutputCell shared_outputs[kFlagCap];
 #endif
 

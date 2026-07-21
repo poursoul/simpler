@@ -260,10 +260,12 @@ PTO_DEVICE_FUNC void dist_submit_publish_shared_outputs(const DistSubmitCtx &ctx
     for (uint32_t i = 0; i < outputs.size(); i++)
         Tensor::copy(cell.tensors[i], outputs.get_ref(i));
 #if defined(__CCE_AICORE__)
-    dist_aicore_flush_region(cell.tensors, sizeof(cell.tensors));
+    for (uint32_t i = 0; i < outputs.size(); i++)
+        dist_aicore_flush_region(&cell.tensors[i], sizeof(Tensor));
 #endif
     store_barrier();
-    atomic_exchange(cell.published, static_cast<int64_t>(ctx.task_id), __ATOMIC_RELEASE);
+    for (uint32_t i = 0; i < outputs.size(); i++)
+        atomic_exchange(cell.published[i], static_cast<int64_t>(ctx.task_id), __ATOMIC_RELEASE);
 #else
     (void)ctx;
     (void)outputs;

@@ -50,6 +50,14 @@ PTO_DEVICE_FUNC inline FdwicSwimlanePhase trace_phase_to_swimlane_phase(TracePha
         return FdwicSwimlanePhase::Fanin;
     case TracePhase::Register:
         return FdwicSwimlanePhase::Register;
+    case TracePhase::Resolve:
+        return FdwicSwimlanePhase::Resolve;
+    case TracePhase::ResolveWait:
+        return FdwicSwimlanePhase::ResolveWait;
+    case TracePhase::ResolveInvalidate:
+        return FdwicSwimlanePhase::ResolveInvalidate;
+    case TracePhase::ResolveCopy:
+        return FdwicSwimlanePhase::ResolveCopy;
     }
     return FdwicSwimlanePhase::Kernel;
 }

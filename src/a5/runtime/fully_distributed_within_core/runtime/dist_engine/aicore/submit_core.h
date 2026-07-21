@@ -648,14 +648,21 @@ dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, __gm__
     }
     always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
     __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
+    TRACE_SPAN_BEGIN(resolve_wait_trace);
     while (!fatal_set() && atomic_load(cell.published[ref.output_slot].v, __ATOMIC_ACQUIRE) != ref.producer_task_id) {
         drain_block_won(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }
     if (fatal_set()) return false;
+    TRACE_SPAN_END(resolve_wait_trace, self, ref.producer_task_id, -1, TracePhase::ResolveWait, 0, ref.output_slot);
 #if defined(__CCE_AICORE__)
+    TRACE_SPAN_BEGIN(resolve_invalidate_trace);
     dist_aicore_invalidate_region(&cell.tensors[ref.output_slot], sizeof(Tensor));
+    TRACE_SPAN_END(
+        resolve_invalidate_trace, self, ref.producer_task_id, -1, TracePhase::ResolveInvalidate, 0, ref.output_slot
+    );
 #endif
+    TRACE_SPAN_BEGIN(resolve_copy_trace);
     if ((ref.flags & 1u) != 0u) {
         always_assert(ref.view_ndims == 1 && cell.tensors[ref.output_slot].ndims == 1);
         const uint32_t view_shapes[1] = {ref.view_shape0};
@@ -664,6 +671,9 @@ dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, __gm__
     } else {
         Tensor::copy(resolved, cell.tensors[ref.output_slot]);
     }
+    TRACE_SPAN_END(
+        resolve_copy_trace, self, ref.producer_task_id, -1, TracePhase::ResolveCopy, ref.flags & 1u, ref.output_slot
+    );
     return true;
 }
 

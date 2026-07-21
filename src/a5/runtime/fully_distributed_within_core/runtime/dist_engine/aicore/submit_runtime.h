@@ -55,7 +55,11 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
         const int32_t anchor_lane = anchor_lane_for_mask(M);
         if (!dist_submit_self_is_lane(ctx.self, block, anchor_lane)) return false;
         __gm__ PaddedCursor *cursors = anchor_lane == LANE_AIC ? g_dist.cube_cursor : g_dist.vector_cursor;
+        TRACE_SPAN_BEGIN(claim_trace);
         ctx.won = claim(cursors[ctx.task_id % kCursorShards].v, ctx.task_id);
+        TRACE_SPAN_END(
+            claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, static_cast<uint32_t>(ctx.won), 0
+        );
         if (!ctx.won) return false;
         ctx.kernel_id = kernel_id_for_lane(mixed, anchor_lane);
         ctx.joint_init = true;
@@ -63,14 +67,22 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
     }
     if (lane_active(M, LANE_AIC)) {
         if (ctx.self->role != CoreType::AIC) return false;
+        TRACE_SPAN_BEGIN(claim_trace);
         ctx.won = claim(g_dist.cube_cursor[ctx.task_id % kCursorShards].v, ctx.task_id);
+        TRACE_SPAN_END(
+            claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, static_cast<uint32_t>(ctx.won), 0
+        );
         if (!ctx.won) return false;
         ctx.kernel_id = mixed.aic_kernel_id;
         return true;
     }
     if (lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) {
         if (ctx.self->role != CoreType::AIV) return false;
+        TRACE_SPAN_BEGIN(claim_trace);
         ctx.won = claim(g_dist.vector_cursor[ctx.task_id % kCursorShards].v, ctx.task_id);
+        TRACE_SPAN_END(
+            claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, static_cast<uint32_t>(ctx.won), 0
+        );
         if (!ctx.won) return false;
         const int32_t own_lane = lane_active(M, LANE_AIV0) ? LANE_AIV0 : LANE_AIV1;
         ctx.kernel_id = kernel_id_for_lane(mixed, own_lane);
@@ -82,7 +94,9 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
 PTO_DEVICE_FUNC bool dist_submit_claim_alloc(DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
     if (ctx.self == nullptr || ctx.task_id < 0 || ctx.task_id >= kFlagCap) return false;
+    TRACE_SPAN_BEGIN(claim_trace);
     ctx.won = claim(g_dist.alloc_cursor[ctx.task_id % kCursorShards].v, ctx.task_id);
+    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, static_cast<uint32_t>(ctx.won), 1);
     return ctx.won;
 }
 
@@ -371,11 +385,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC SubmitToken dist_presubmit_task_impl(PTO2Runtime *
     drain_block_won(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
-    TRACE_SPAN_BEGIN(claim_trace);
     const bool is_winner = dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
-    TRACE_SPAN_END(
-        claim_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Claim, static_cast<uint32_t>(is_winner), 0
-    );
     return dist_submit_token_from_ctx(mixed, ctx);
 }
 
@@ -408,9 +418,12 @@ DIST_API_ATTR PTO_DEVICE_FUNC
         fanin_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, region_fanin_count > 0 ? 3u : 1u,
         static_cast<uint32_t>(ctx.fanin_count)
     );
+    TRACE_SPAN_BEGIN(resolve_trace);
     if (!dist_submit_resolve_shared_arg_tensors(args, ctx)) return;
-    TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
+    TRACE_SPAN_END(resolve_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Resolve, 0, 0);
+    TRACE_SPAN_BEGIN(build_trace);
     dist_submit_build_winner_task(ctx, tok.mixed, args);
+    TRACE_SPAN_END(build_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build, 0, 0);
     TRACE_SPAN_END(
         submit_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit, static_cast<uint32_t>(true), 1
     );
@@ -426,8 +439,9 @@ DIST_API_ATTR PTO_DEVICE_FUNC
     TRACE_SPAN_BEGIN(register_trace);
     dist_submit_register_outputs(ctx, args, /*include_existing=*/true);
     TRACE_SPAN_END(register_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, 0, 1);
-    TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
+    TRACE_SPAN_BEGIN(build_trace);
     dist_submit_build_winner_task(ctx, tok.mixed, args);
+    TRACE_SPAN_END(build_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build, 0, 0);
     TRACE_SPAN_END(
         submit_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Submit, static_cast<uint32_t>(true), 0
     );
@@ -516,9 +530,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC int32_t dist_alloc_outputs_impl(PTO2Runtime *, con
     drain_phase_b(ctx.self);
     TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
     if (!dist_submit_check_task_cap(ctx, DistSubmitKind::Alloc)) return -1;
-    TRACE_SPAN_BEGIN(claim_trace);
     const bool is_winner = dist_submit_claim(DistSubmitKind::Alloc, nullptr, ctx);
-    TRACE_SPAN_END(claim_trace, ctx.self, ctx.task_id, -1, TracePhase::Claim, static_cast<uint32_t>(is_winner), 1);
     if (is_winner) {
         TRACE_SPAN_BEGIN(materialize_trace);
         if (!dist_submit_materialize_args(args, ctx, DistSubmitKind::Alloc)) return -1;

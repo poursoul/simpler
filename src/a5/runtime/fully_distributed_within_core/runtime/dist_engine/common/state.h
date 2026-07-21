@@ -109,6 +109,10 @@ enum class TracePhase : int32_t {
     Claim = 11,
     Fanin = 12,
     Register = 13,
+    Resolve = 14,
+    ResolveWait = 15,
+    ResolveInvalidate = 16,
+    ResolveCopy = 17,
 };
 
 struct RingSlot {

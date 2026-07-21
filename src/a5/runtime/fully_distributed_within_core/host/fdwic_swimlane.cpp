@@ -56,6 +56,14 @@ const char *phase_name(int32_t phase) {
         return "Fanin";
     case FdwicSwimlanePhase::Register:
         return "Register";
+    case FdwicSwimlanePhase::Resolve:
+        return "Resolve";
+    case FdwicSwimlanePhase::ResolveWait:
+        return "ResolveWait";
+    case FdwicSwimlanePhase::ResolveInvalidate:
+        return "ResolveInvalidate";
+    case FdwicSwimlanePhase::ResolveCopy:
+        return "ResolveCopy";
     }
     return "Unknown";
 }

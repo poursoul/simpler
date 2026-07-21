@@ -78,8 +78,8 @@ constexpr int32_t kMapBuckets = 1 << 13;
 constexpr int32_t kMapBucketShift = 13;
 constexpr int32_t kTaskWindow = 1 << 10;
 constexpr int32_t kTaskWindowMask = kTaskWindow - 1;
-constexpr size_t kDistTensorMapPayloadBytes = sizeof(MapEntry) * kMapCap + sizeof(int32_t) * kMapBuckets +
-    sizeof(int32_t) * kTaskWindow + sizeof(int32_t) * 4;
+constexpr size_t kDistTensorMapPayloadBytes =
+    sizeof(MapEntry) * kMapCap + sizeof(int32_t) * kMapBuckets + sizeof(int32_t) * kTaskWindow + sizeof(int32_t) * 4;
 constexpr size_t kDistTensorMapTailPad = 64 - (kDistTensorMapPayloadBytes % 64);
 
 struct DistTensorMap {
@@ -266,10 +266,13 @@ static_assert(kSharedHeapActiveShards > 0 && kSharedHeapActiveShards <= kSharedH
 
 struct SharedOutputCell {
     PaddedCursor published[kSharedOutputMaxPerTask];
+    PaddedCursor last_writer[kSharedOutputMaxPerTask];
     Tensor tensors[kSharedOutputMaxPerTask];
 };
 static_assert(offsetof(SharedOutputCell, published) % 64 == 0, "shared output flags must be cacheline-aligned");
 static_assert(sizeof(SharedOutputCell::published[0]) == kCacheLine, "shared output flag must own one cacheline");
+static_assert(offsetof(SharedOutputCell, last_writer) % 64 == 0, "shared output writers must be cacheline-aligned");
+static_assert(sizeof(SharedOutputCell::last_writer[0]) == kCacheLine, "shared output writer must own one cacheline");
 static_assert(offsetof(SharedOutputCell, tensors) % 64 == 0, "shared output tensors must be cacheline-aligned");
 static_assert(sizeof(SharedOutputCell) % 64 == 0, "SharedOutputCell must not share cachelines");
 

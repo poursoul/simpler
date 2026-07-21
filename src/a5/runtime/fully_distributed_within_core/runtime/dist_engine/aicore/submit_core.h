@@ -603,6 +603,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 #if defined(__CCE_AICORE__)
         dist_aicore_flush_region(&shared_cell.tensors[output_ordinal], sizeof(Tensor));
 #endif
+        atomic_exchange(shared_cell.last_writer[output_ordinal].v, static_cast<int64_t>(ctx.task_id), __ATOMIC_RELEASE);
         ctx.shared_result.add_output_ref(ctx.task_id, static_cast<int16_t>(output_ordinal));
 #endif
         output_offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
@@ -620,7 +621,27 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 }
 
 #if PTO_FDWIC_SHARED_MAP
-PTO_DEVICE_FUNC bool dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, Tensor &resolved) {
+PTO_DEVICE_FUNC int32_t dist_shared_output_last_writer(FdwicOutputRef ref) {
+    if (ref.producer_task_id < 0 || ref.producer_task_id >= kFlagCap) return -1;
+    always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
+    __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
+    return static_cast<int32_t>(atomic_load(cell.last_writer[ref.output_slot].v, __ATOMIC_ACQUIRE));
+}
+
+PTO_DEVICE_FUNC int32_t dist_shared_output_claim_writer(FdwicOutputRef ref, int32_t writer_task_id) {
+    if (ref.producer_task_id < 0 || ref.producer_task_id >= kFlagCap || writer_task_id < 0) {
+        set_fatal();
+        return -1;
+    }
+    always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
+    __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
+    return static_cast<int32_t>(
+        atomic_exchange(cell.last_writer[ref.output_slot].v, static_cast<int64_t>(writer_task_id), __ATOMIC_ACQ_REL)
+    );
+}
+
+PTO_DEVICE_FUNC bool
+dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, __gm__ Tensor &resolved) {
     if (ref.producer_task_id < 0 || ref.producer_task_id >= kFlagCap) {
         set_fatal();
         return false;
@@ -635,12 +656,13 @@ PTO_DEVICE_FUNC bool dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ D
 #if defined(__CCE_AICORE__)
     dist_aicore_invalidate_region(&cell.tensors[ref.output_slot], sizeof(Tensor));
 #endif
-    Tensor::copy(resolved, cell.tensors[ref.output_slot]);
     if ((ref.flags & 1u) != 0u) {
-        always_assert(ref.view_ndims == 1 && resolved.ndims == 1);
+        always_assert(ref.view_ndims == 1 && cell.tensors[ref.output_slot].ndims == 1);
         const uint32_t view_shapes[1] = {ref.view_shape0};
         const uint32_t view_offsets[1] = {ref.view_offset0};
-        resolved = Tensor::view(resolved, view_shapes, view_offsets);
+        Tensor::copy(resolved, Tensor::view(cell.tensors[ref.output_slot], view_shapes, view_offsets));
+    } else {
+        Tensor::copy(resolved, cell.tensors[ref.output_slot]);
     }
     return true;
 }
@@ -658,15 +680,9 @@ PTO_DEVICE_FUNC int32_t dist_shared_region_lookup(const Tensor &tensor, int32_t 
     dist_shared_region_byte_range(tensor, addr, lo, hi);
     int32_t best = -1;
     const uint32_t bucket = dist_shared_region_hash(addr);
-#if defined(__CCE_AICORE__)
-    dist_aicore_invalidate_region(&g_dist.shared_region.buckets[bucket], sizeof(g_dist.shared_region.buckets[bucket]));
-#endif
     int32_t cur = static_cast<int32_t>(atomic_load(g_dist.shared_region.buckets[bucket].v, __ATOMIC_ACQUIRE));
     while (cur == -2 && !fatal_set()) {
         SPIN_WAIT_HINT();
-#if defined(__CCE_AICORE__)
-        dist_aicore_invalidate_region(&g_dist.shared_region.buckets[bucket], sizeof(g_dist.shared_region.buckets[bucket]));
-#endif
         cur = static_cast<int32_t>(atomic_load(g_dist.shared_region.buckets[bucket].v, __ATOMIC_ACQUIRE));
     }
     for (; cur >= 0;) {
@@ -700,8 +716,7 @@ PTO_DEVICE_FUNC void dist_shared_region_unlock() {
 
 PTO_DEVICE_FUNC void dist_shared_region_insert(const Tensor &tensor, int32_t producer) {
     if (tensor.manual_dep || producer < 0) return;
-    const int32_t slot =
-        static_cast<int32_t>(atomic_fetch_add<int64_t>(g_dist.shared_region.high_water.v, int64_t{1}));
+    const int32_t slot = static_cast<int32_t>(atomic_fetch_add<int64_t>(g_dist.shared_region.high_water.v, int64_t{1}));
     if (slot < 0 || slot >= kSharedRegionCap) {
         set_fatal();
         DIST_ERRF("[dist_engine] shared region map capacity exceeded at task %d\n", producer);
@@ -762,9 +777,7 @@ dist_submit_copy_arg_tensor(__gm__ Tensor &dst, const L0TaskArgs &args, const Di
     }
 #if PTO_FDWIC_SHARED_MAP
     if (args.tensor(i).tensor_from_shared_output()) {
-        Tensor resolved;
-        if (!dist_resolve_shared_output_ref(args.tensor(i).shared_output_ref(), ctx.self, resolved)) return;
-        Tensor::copy(dst, resolved);
+        Tensor::copy(dst, ctx.payload->tensors[i]);
         return;
     }
 #endif

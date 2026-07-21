@@ -57,8 +57,10 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     for (int32_t i = 0; i < kFlagCap; i++) {
         reset_task_cell(i);
 #if PTO_FDWIC_SHARED_MAP
-        for (int32_t slot = 0; slot < kSharedOutputMaxPerTask; slot++)
+        for (int32_t slot = 0; slot < kSharedOutputMaxPerTask; slot++) {
             atomic_exchange(g_dist.shared_outputs[i].published[slot].v, int64_t{-1}, __ATOMIC_RELAXED);
+            atomic_exchange(g_dist.shared_outputs[i].last_writer[slot].v, int64_t{-1}, __ATOMIC_RELAXED);
+        }
 #endif
     }
     atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);

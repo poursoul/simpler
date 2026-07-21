@@ -62,12 +62,7 @@ PTO_DEVICE_FUNC inline OutputHandle output_handle(const SubmitOutputs &outputs, 
 
 PTO_DEVICE_FUNC inline ViewHandle
 output_view(OutputHandle source, const uint32_t view_shapes[], const uint32_t view_offsets[], uint32_t ndims) {
-    always_assert(ndims == 1);
-    source.flags |= 1u;
-    source.view_ndims = static_cast<uint8_t>(ndims);
-    source.view_shape0 = view_shapes[0];
-    source.view_offset0 = view_offsets[0];
-    return source;
+    return source.view(view_shapes, view_offsets, ndims);
 }
 
 PTO_DEVICE_FUNC inline SubmitOutputs

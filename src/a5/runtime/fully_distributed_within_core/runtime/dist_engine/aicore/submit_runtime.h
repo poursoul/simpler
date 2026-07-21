@@ -259,13 +259,21 @@ dist_submit_collect_shared_fanin(const L0TaskArgs &args, const DistSubmitCtx &ct
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
         if (tag == TensorArgType::OUTPUT) continue;
-        Tensor tensor;
         if (args.tensor(i).tensor_from_shared_output()) {
-            dist_submit_add_fanin(fanin, fc, args.tensor(i).shared_output_ref().producer_task_id);
-            if (!dist_resolve_shared_output_ref(args.tensor(i).shared_output_ref(), ctx.self, tensor)) return fc;
-        } else {
-            dist_submit_arg_tensor_local(args, i, tensor);
+            const FdwicOutputRef ref = args.tensor(i).shared_output_ref();
+            int32_t writer = -1;
+            if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
+                writer = dist_shared_output_claim_writer(ref, ctx.task_id);
+            } else {
+                writer = dist_shared_output_last_writer(ref);
+            }
+            if (writer < 0) writer = ref.producer_task_id;
+            dist_submit_add_fanin(fanin, fc, writer);
+            continue;
         }
+
+        Tensor tensor;
+        dist_submit_arg_tensor_local(args, i, tensor);
         const uint64_t owner_raw = tensor.owner_task_id.raw;
         if (owner_raw != UINT64_MAX) {
             dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
@@ -284,17 +292,24 @@ PTO_DEVICE_FUNC int32_t dist_submit_register_shared_regions(const L0TaskArgs &ar
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
         if (tag != TensorArgType::INOUT && tag != TensorArgType::OUTPUT_EXISTING) continue;
+        if (args.tensor(i).tensor_from_shared_output()) continue;
         Tensor tensor;
-        if (args.tensor(i).tensor_from_shared_output()) {
-            if (!dist_resolve_shared_output_ref(args.tensor(i).shared_output_ref(), ctx.self, tensor)) continue;
-        } else {
-            dist_submit_arg_tensor_local(args, i, tensor);
-        }
+        dist_submit_arg_tensor_local(args, i, tensor);
         if (!dist_shared_region_register_relevant(tag, tensor)) continue;
         dist_shared_region_insert(tensor, ctx.task_id);
         registered++;
     }
     return registered;
+}
+
+PTO_DEVICE_FUNC bool dist_submit_resolve_shared_arg_tensors(const L0TaskArgs &args, const DistSubmitCtx &ctx) {
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        if (args.tag(i) == TensorArgType::OUTPUT) continue;
+        if (!args.tensor(i).tensor_from_shared_output()) continue;
+        if (!dist_resolve_shared_output_ref(args.tensor(i).shared_output_ref(), ctx.self, ctx.payload->tensors[i]))
+            return false;
+    }
+    return true;
 }
 #endif
 
@@ -393,6 +408,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC
         fanin_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, region_fanin_count > 0 ? 3u : 1u,
         static_cast<uint32_t>(ctx.fanin_count)
     );
+    if (!dist_submit_resolve_shared_arg_tensors(args, ctx)) return;
     TRACE_LAP(ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Build);
     dist_submit_build_winner_task(ctx, tok.mixed, args);
     TRACE_SPAN_END(

@@ -91,6 +91,23 @@ struct FdwicOutputRef {
     uint8_t view_ndims{0};
     uint32_t view_shape0{0};
     uint32_t view_offset0{0};
+
+    PTO_DEVICE_FUNC FdwicOutputRef
+    view(const uint32_t view_shapes[], const uint32_t view_offsets[], uint32_t ndims) const {
+        always_assert(ndims == 1);
+        FdwicOutputRef out = *this;
+        if ((out.flags & 1u) != 0u) {
+            always_assert(out.view_ndims == 1);
+            always_assert(view_offsets[0] + view_shapes[0] <= out.view_shape0);
+            out.view_offset0 += view_offsets[0];
+        } else {
+            out.flags |= 1u;
+            out.view_ndims = static_cast<uint8_t>(ndims);
+            out.view_offset0 = view_offsets[0];
+        }
+        out.view_shape0 = view_shapes[0];
+        return out;
+    }
 };
 
 #if PTO_FDWIC_SHARED_MAP

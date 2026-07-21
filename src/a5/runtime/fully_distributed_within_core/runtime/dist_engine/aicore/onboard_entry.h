@@ -38,6 +38,9 @@ PTO_DEVICE_FUNC __gm__ DistCore *dist_aicore_attach_worker(__gm__ Runtime *runti
 #if PTO_FDWIC_SHARED_MAP
     dist_aicore_invalidate_region(g_dist.shared_heap_cursor, sizeof(g_dist.shared_heap_cursor));
     dist_aicore_invalidate_region(&g_dist.shared_heap_vend, sizeof(g_dist.shared_heap_vend));
+    dist_aicore_invalidate_region(&g_dist.shared_region.high_water, sizeof(g_dist.shared_region.high_water));
+    dist_aicore_invalidate_region(&g_dist.shared_region.insert_lock, sizeof(g_dist.shared_region.insert_lock));
+    dist_aicore_invalidate_region(&g_dist.shared_region.buckets[0], sizeof(g_dist.shared_region.buckets));
 #endif
 #endif
     g_self = &g_dist.cores[core_idx];

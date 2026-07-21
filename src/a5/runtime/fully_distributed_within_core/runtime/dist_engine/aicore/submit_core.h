@@ -44,6 +44,31 @@ PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder) {
     return atomic_load(cell.flag, memorder) != 0;
 }
 
+PTO_DEVICE_FUNC void flush_ring_slot_payload(__gm__ RingSlot &s, int32_t tc, int32_t sc, int32_t arg_count) {
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&s, offsetof(RingSlot, tensors));
+    dist_aicore_flush_region(s.tensors, static_cast<uint64_t>(tc) * sizeof(Tensor));
+    dist_aicore_flush_region(s.scalars, static_cast<uint64_t>(sc) * sizeof(uint64_t));
+    dist_aicore_flush_region(s.args, static_cast<uint64_t>(arg_count) * sizeof(uint64_t));
+    dist_aicore_flush_region(&s.local_ctx, sizeof(LocalContext));
+    dist_aicore_flush_region(&s.global_ctx, sizeof(GlobalContext));
+    dist_aicore_flush_region(&s.fanin[0], offsetof(RingSlot, tail_pad) - offsetof(RingSlot, fanin));
+#else
+    (void)s;
+    (void)tc;
+    (void)sc;
+    (void)arg_count;
+#endif
+}
+
+PTO_DEVICE_FUNC void publish_ring_slot_built(__gm__ RingSlot &s) {
+    store_barrier();
+    s.built = true;
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&s.built, sizeof(s.built));
+#endif
+}
+
 PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
@@ -233,7 +258,8 @@ PTO_DEVICE_FUNC void build_ring_slot(
     s.is_multicore = is_multicore;
     s.won_block = won_block;
     s.won_slot = won_slot;
-    s.built = true;
+    flush_ring_slot_payload(s, tc, sc, n);
+    publish_ring_slot_built(s);
 }
 
 PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
@@ -420,6 +446,15 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
     return false;
 }
 
+PTO_DEVICE_FUNC void dist_submit_wait_heap_reuse_window(__gm__ DistCore *self, int32_t task_id) {
+    const int32_t target = task_id - g_dist.H;
+    if (target < 0) return;
+    while (!fatal_set() && static_cast<int32_t>(atomic_load(g_dist.frontier, __ATOMIC_ACQUIRE)) < target) {
+        drain_block_won(self);
+        if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
+    }
+}
+
 PTO_DEVICE_FUNC void calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout) {
     layout.total_output_size = 0;
     layout.output_count = 0;
@@ -453,6 +488,10 @@ dist_submit_reserve_output_heap(DistSubmitCtx &ctx, uint64_t total, DistSubmitKi
     for (int32_t retry = 0; retry < 64; retry++) {
         cursor = static_cast<uint64_t>(atomic_fetch_add<int64_t>(g_dist.shared_heap_cursor[shard].v, reserve));
         offset = cursor % shard_span;
+        if (cursor >= shard_span) {
+            dist_submit_wait_heap_reuse_window(ctx.self, ctx.task_id);
+            if (fatal_set()) return false;
+        }
         if (offset + total <= shard_span) break;
         const uint64_t after = cursor + reserve;
         const uint64_t after_offset = after % shard_span;
@@ -514,6 +553,9 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     }
 
     uint64_t output_offset = 0;
+#if PTO_FDWIC_SHARED_MAP
+    __gm__ SharedOutputCell &shared_cell = shared_output_cell(ctx.task_id);
+#endif
     for (int32_t output_ordinal = 0; output_ordinal < layout.output_count; output_ordinal++) {
         const int32_t i = layout.output_indices[output_ordinal];
         const auto &ci = args.tensor(i).create_info();
@@ -529,14 +571,47 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         const uint64_t buffer_size = layout.buffer_sizes[output_ordinal];
         const uint64_t phys = (task_base + output_offset) % ring;
         __gm__ Tensor &slot_t = ctx.payload->tensors[i];
-        init_tensor_from_create_info(slot_t, ci, g_dist.heap_base + phys, buffer_size);
-        slot_t.owner_task_id.raw = ctx.result.task_id().raw;
+        Tensor materialized;
+        always_assert(ci.ndims > 0 && ci.ndims <= MAX_TENSOR_DIMS);
+        materialized.buffer.addr = reinterpret_cast<uint64_t>(g_dist.heap_base + phys);
+        materialized.buffer.size = buffer_size;
+        materialized.owner_task_id.raw = UINT64_MAX;
+        materialized.start_offset = ci.start_offset;
+        materialized.version = ci.version;
+        materialized.ndims = ci.ndims;
+        materialized.dtype = ci.dtype;
+        materialized.manual_dep = ci.manual_dep;
+        materialized.is_contiguous = ci.is_contiguous;
+        materialized.child_memory = ci.__pad_flags__;
+        for (uint32_t dim = 0; dim < MAX_TENSOR_DIMS; dim++) {
+            materialized.shapes[dim] = ci.shapes[dim];
+        }
+        uint32_t stride = 1;
+        for (int32_t dim = static_cast<int32_t>(materialized.ndims) - 1; dim >= 0; --dim) {
+            materialized.strides[dim] = stride;
+            stride *= materialized.shapes[dim];
+        }
+        materialized.extent_elem_cache = stride;
+        materialized.owner_task_id.raw = ctx.result.task_id().raw;
+        Tensor::copy(slot_t, materialized);
+        if (ci.has_initial_value) {
+            fill_tensor_initial_value(slot_t, ci.initial_value);
+        }
         ctx.result.materialize_output(slot_t);
 #if PTO_FDWIC_SHARED_MAP
+        Tensor::copy(shared_cell.tensors[output_ordinal], materialized);
+#if defined(__CCE_AICORE__)
+        dist_aicore_flush_region(&shared_cell.tensors[output_ordinal], sizeof(Tensor));
+#endif
         ctx.shared_result.add_output_ref(ctx.task_id, static_cast<int16_t>(output_ordinal));
 #endif
         output_offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
     }
+#if PTO_FDWIC_SHARED_MAP
+    store_barrier();
+    for (int32_t output_ordinal = 0; output_ordinal < layout.output_count; output_ordinal++)
+        atomic_exchange(shared_cell.published[output_ordinal].v, static_cast<int64_t>(ctx.task_id), __ATOMIC_RELEASE);
+#endif
 #if !PTO_FDWIC_SHARED_MAP
     if (total > 0 && g_dist.heap_base != nullptr) ctx.self->heap_next = task_base + layout.total_output_size;
 #endif
@@ -545,28 +620,138 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 }
 
 #if PTO_FDWIC_SHARED_MAP
-PTO_DEVICE_FUNC Tensor dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self) {
-    Tensor resolved;
+PTO_DEVICE_FUNC bool dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, Tensor &resolved) {
     if (ref.producer_task_id < 0 || ref.producer_task_id >= kFlagCap) {
         set_fatal();
-        return resolved;
+        return false;
     }
     always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
     __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
-#if defined(__CCE_AICORE__)
-    dist_aicore_invalidate_region(const_cast<__gm__ int64_t *>(&cell.published[0]), sizeof(cell.published));
-#endif
-    while (!fatal_set() && atomic_load(cell.published[ref.output_slot], __ATOMIC_ACQUIRE) != ref.producer_task_id) {
+    while (!fatal_set() && atomic_load(cell.published[ref.output_slot].v, __ATOMIC_ACQUIRE) != ref.producer_task_id) {
         drain_block_won(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }
-    if (fatal_set()) return resolved;
+    if (fatal_set()) return false;
 #if defined(__CCE_AICORE__)
     dist_aicore_invalidate_region(&cell.tensors[ref.output_slot], sizeof(Tensor));
 #endif
     Tensor::copy(resolved, cell.tensors[ref.output_slot]);
-    return resolved;
+    if ((ref.flags & 1u) != 0u) {
+        always_assert(ref.view_ndims == 1 && resolved.ndims == 1);
+        const uint32_t view_shapes[1] = {ref.view_shape0};
+        const uint32_t view_offsets[1] = {ref.view_offset0};
+        resolved = Tensor::view(resolved, view_shapes, view_offsets);
+    }
+    return true;
 }
+
+PTO_DEVICE_FUNC uint32_t dist_shared_region_hash(uint64_t addr) { return dist_tensor_map_hash(addr); }
+
+template <typename TensorRef>
+PTO_DEVICE_FUNC void dist_shared_region_byte_range(const TensorRef &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
+    dist_tensor_map_byte_range(t, addr, lo, hi);
+}
+
+PTO_DEVICE_FUNC int32_t dist_shared_region_lookup(const Tensor &tensor, int32_t before_task_id) {
+    if (tensor.manual_dep) return -1;
+    uint64_t addr, lo, hi;
+    dist_shared_region_byte_range(tensor, addr, lo, hi);
+    int32_t best = -1;
+    const uint32_t bucket = dist_shared_region_hash(addr);
+#if defined(__CCE_AICORE__)
+    dist_aicore_invalidate_region(&g_dist.shared_region.buckets[bucket], sizeof(g_dist.shared_region.buckets[bucket]));
+#endif
+    int32_t cur = static_cast<int32_t>(atomic_load(g_dist.shared_region.buckets[bucket].v, __ATOMIC_ACQUIRE));
+    while (cur == -2 && !fatal_set()) {
+        SPIN_WAIT_HINT();
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&g_dist.shared_region.buckets[bucket], sizeof(g_dist.shared_region.buckets[bucket]));
+#endif
+        cur = static_cast<int32_t>(atomic_load(g_dist.shared_region.buckets[bucket].v, __ATOMIC_ACQUIRE));
+    }
+    for (; cur >= 0;) {
+        if (cur >= kSharedRegionCap) {
+            set_fatal();
+            return best;
+        }
+        __gm__ SharedRegionEntry &entry = g_dist.shared_region.entries[cur];
+#if defined(__CCE_AICORE__)
+        dist_aicore_invalidate_region(&entry, sizeof(SharedRegionEntry));
+#endif
+        if (entry.producer < before_task_id && entry.buf_addr == addr && lo < entry.hi && entry.lo < hi &&
+            entry.producer > best) {
+            best = entry.producer;
+        }
+        cur = entry.next_in_bucket;
+    }
+    return best;
+}
+
+PTO_DEVICE_FUNC void dist_shared_region_lock() {
+    while (atomic_exchange(g_dist.shared_region.insert_lock.v, int64_t{1}, __ATOMIC_ACQUIRE) != 0) {
+        SPIN_WAIT_HINT();
+    }
+}
+
+PTO_DEVICE_FUNC void dist_shared_region_unlock() {
+    store_barrier();
+    atomic_exchange(g_dist.shared_region.insert_lock.v, int64_t{0}, __ATOMIC_RELEASE);
+}
+
+PTO_DEVICE_FUNC void dist_shared_region_insert(const Tensor &tensor, int32_t producer) {
+    if (tensor.manual_dep || producer < 0) return;
+    const int32_t slot =
+        static_cast<int32_t>(atomic_fetch_add<int64_t>(g_dist.shared_region.high_water.v, int64_t{1}));
+    if (slot < 0 || slot >= kSharedRegionCap) {
+        set_fatal();
+        DIST_ERRF("[dist_engine] shared region map capacity exceeded at task %d\n", producer);
+        return;
+    }
+    uint64_t addr, lo, hi;
+    dist_shared_region_byte_range(tensor, addr, lo, hi);
+    const uint32_t bucket = dist_shared_region_hash(addr);
+    int64_t old_head = 0;
+    while (true) {
+        old_head = atomic_exchange(g_dist.shared_region.buckets[bucket].v, int64_t{-2}, __ATOMIC_ACQUIRE);
+        if (old_head != -2) break;
+        SPIN_WAIT_HINT();
+    }
+    __gm__ SharedRegionEntry &entry = g_dist.shared_region.entries[slot];
+    entry.buf_addr = addr;
+    entry.lo = lo;
+    entry.hi = hi;
+    entry.producer = producer;
+    entry.next_in_bucket = static_cast<int32_t>(old_head);
+    store_barrier();
+#if defined(__CCE_AICORE__)
+    dist_aicore_flush_region(&entry, sizeof(SharedRegionEntry));
+#endif
+    atomic_exchange(g_dist.shared_region.buckets[bucket].v, static_cast<int64_t>(slot), __ATOMIC_RELEASE);
+}
+
+PTO_DEVICE_FUNC bool dist_shared_region_collect_relevant(TensorArgType tag, const Tensor &tensor) {
+    if (tensor.manual_dep) return false;
+    if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) return true;
+    if (tag == TensorArgType::INPUT && tensor.owner_task_id.raw != UINT64_MAX) return true;
+    return false;
+}
+
+PTO_DEVICE_FUNC bool dist_shared_region_register_relevant(TensorArgType tag, const Tensor &tensor) {
+    if (tensor.manual_dep) return false;
+    return tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING;
+}
+
+PTO_DEVICE_FUNC void dist_submit_arg_tensor_local(const L0TaskArgs &args, int32_t i, Tensor &tensor) {
+#if defined(__CCE_AICORE__)
+    if (args.tensor(i).tensor_from_gm()) {
+        Tensor::copy(tensor, args.tensor(i).gm_ref());
+    } else
+#endif
+    {
+        Tensor::copy(tensor, args.tensor(i).ref());
+    }
+}
+
 #endif
 
 PTO_DEVICE_FUNC inline void
@@ -577,7 +762,8 @@ dist_submit_copy_arg_tensor(__gm__ Tensor &dst, const L0TaskArgs &args, const Di
     }
 #if PTO_FDWIC_SHARED_MAP
     if (args.tensor(i).tensor_from_shared_output()) {
-        Tensor resolved = dist_resolve_shared_output_ref(args.tensor(i).shared_output_ref(), ctx.self);
+        Tensor resolved;
+        if (!dist_resolve_shared_output_ref(args.tensor(i).shared_output_ref(), ctx.self, resolved)) return;
         Tensor::copy(dst, resolved);
         return;
     }
@@ -631,12 +817,8 @@ PTO_DEVICE_FUNC void build_ring_slot_from_submit(
     s.is_multicore = is_multicore;
     s.won_block = won_block;
     s.won_slot = won_slot;
-    s.built = true;
-}
-
-PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
-    if (self == nullptr) return;
-    dist_tensor_map_advance_retire(self->map, task_id, g_dist.H);
+    flush_ring_slot_payload(s, ctx.tensor_count, ctx.scalar_count, n);
+    publish_ring_slot_built(s);
 }
 
 PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count, int32_t producer) {
@@ -644,6 +826,12 @@ PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count
     for (int32_t k = 0; k < fanin_count; k++)
         if (fanin[k] == producer) return;
     if (fanin_count < kMaxFanin) fanin[fanin_count++] = producer;
+}
+
+#if !PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
+    if (self == nullptr) return;
+    dist_tensor_map_advance_retire(self->map, task_id, g_dist.H);
 }
 
 PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[]) {
@@ -724,5 +912,6 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
     TRACE_SPAN_END(prepare_map_trace, self, ctx.task_id, -1, TracePhase::PrepareMap, 0, static_cast<uint32_t>(kind));
     return true;
 }
+#endif
 
 }  // namespace

@@ -87,36 +87,42 @@ struct SubmitToken {
 struct FdwicOutputRef {
     int32_t producer_task_id{-1};
     int16_t output_slot{-1};
-    uint16_t flags{0};
+    uint8_t flags{0};
+    uint8_t view_ndims{0};
+    uint32_t view_shape0{0};
+    uint32_t view_offset0{0};
 };
 
 #if PTO_FDWIC_SHARED_MAP
 class SharedTaskOutputs {
 public:
-    PTO_DEVICE_FUNC SharedTaskOutputs() :
-        task_id_(PTO2TaskId::invalid()),
-        output_count_(0) {}
-
     PTO_DEVICE_FUNC bool empty() const { return output_count_ == 0; }
     PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
 
     PTO_DEVICE_FUNC void add_output_ref(int32_t producer_task_id, int16_t output_slot) {
         always_assert(output_count_ < MAX_TENSOR_ARGS);
-        refs_[output_count_++] = FdwicOutputRef{producer_task_id, output_slot, 0};
+        always_assert(producer_task_id_ >= 0);
+        always_assert(producer_task_id == producer_task_id_);
+        always_assert(output_slot == static_cast<int16_t>(output_count_));
+        output_count_++;
     }
 
     PTO_DEVICE_FUNC FdwicOutputRef output_ref(uint32_t index) const {
         always_assert(index < output_count_);
-        return refs_[index];
+        return FdwicOutputRef{
+            producer_task_id_, static_cast<int16_t>(index), 0, 0, 0, 0,
+        };
     }
 
-    PTO_DEVICE_FUNC void set_task_id(PTO2TaskId id) { task_id_ = id; }
-    PTO_DEVICE_FUNC PTO2TaskId task_id() const { return task_id_; }
+    PTO_DEVICE_FUNC void set_task_id(PTO2TaskId id) { producer_task_id_ = static_cast<int32_t>(id.raw & 0xFFFFFFFFu); }
+    PTO_DEVICE_FUNC PTO2TaskId task_id() const {
+        if (producer_task_id_ < 0) return PTO2TaskId::invalid();
+        return PTO2TaskId::make(0, static_cast<uint32_t>(producer_task_id_));
+    }
 
 private:
-    PTO2TaskId task_id_;
-    uint32_t output_count_;
-    FdwicOutputRef refs_[MAX_TENSOR_ARGS];
+    int32_t producer_task_id_{-1};
+    uint32_t output_count_{0};
 };
 #endif
 
@@ -154,6 +160,20 @@ public:
     PTO_DEVICE_FUNC TaskOutputTensors() :
         task_id_(PTO2TaskId::invalid()),
         output_count_(0) {}
+    PTO_DEVICE_FUNC TaskOutputTensors(const TaskOutputTensors &other) :
+        task_id_(other.task_id_),
+        output_count_(other.output_count_) {
+        for (uint32_t i = 0; i < output_count_; i++)
+            tensors_[i] = other.tensors_[i];
+    }
+    PTO_DEVICE_FUNC TaskOutputTensors &operator=(const TaskOutputTensors &other) {
+        if (this == &other) return *this;
+        task_id_ = other.task_id_;
+        output_count_ = other.output_count_;
+        for (uint32_t i = 0; i < output_count_; i++)
+            tensors_[i] = other.tensors_[i];
+        return *this;
+    }
 
     PTO_DEVICE_FUNC bool empty() const { return output_count_ == 0; }
     PTO_DEVICE_FUNC uint32_t size() const { return output_count_; }
@@ -396,6 +416,16 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     PTO_DEVICE_FUNC void add_input(FdwicOutputRef ref) {
         if (!check_add_tensor_capacity(1)) return;
         add_symbolic_input_ref(ref);
+    }
+
+    PTO_DEVICE_FUNC void add_output(FdwicOutputRef ref) {
+        if (!check_add_tensor_capacity(1)) return;
+        add_symbolic_tensor_ref(ref, TensorArgType::OUTPUT_EXISTING);
+    }
+
+    PTO_DEVICE_FUNC void add_inout(FdwicOutputRef ref) {
+        if (!check_add_tensor_capacity(1)) return;
+        add_symbolic_tensor_ref(ref, TensorArgType::INOUT);
     }
 #endif
 
@@ -769,8 +799,12 @@ private:
 
 #if PTO_FDWIC_SHARED_MAP
     PTO_DEVICE_FUNC void add_symbolic_input_ref(FdwicOutputRef ref) {
+        add_symbolic_tensor_ref(ref, TensorArgType::INPUT);
+    }
+
+    PTO_DEVICE_FUNC void add_symbolic_tensor_ref(FdwicOutputRef ref, TensorArgType tag) {
         tensors_[tensor_count_] = ref;
-        tags_[tensor_count_] = TensorArgType::INPUT;
+        tags_[tensor_count_] = tag;
         tensor_count_++;
     }
 #endif

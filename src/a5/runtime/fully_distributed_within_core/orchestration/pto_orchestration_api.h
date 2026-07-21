@@ -31,10 +31,34 @@
 
 struct PTO2Runtime;
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC inline uint32_t rt_count_outputs(const L0TaskArgs &args) {
+    uint32_t count = 0;
+    for (int32_t i = 0; i < args.tensor_count(); i++)
+        if (args.tag(i) == TensorArgType::OUTPUT) count++;
+    return count;
+}
+
+PTO_DEVICE_FUNC inline SharedTaskOutputs rt_output_refs(int32_t task_id, uint32_t output_count) {
+    if (task_id < 0) return SharedTaskOutputs{};
+    SharedTaskOutputs outputs;
+    outputs.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(task_id)));
+    for (uint32_t i = 0; i < output_count; i++)
+        outputs.add_output_ref(task_id, static_cast<int16_t>(i));
+    return outputs;
+}
+
+PTO_DEVICE_FUNC inline SharedTaskOutputs alloc_tensors(const L0TaskArgs &args) {
+    if (dist_is_fatal_query()) return SharedTaskOutputs{};
+    const int32_t task_id = dist_alloc_outputs_impl(nullptr, args);
+    return rt_output_refs(task_id, rt_count_outputs(args));
+}
+#else
 PTO_DEVICE_FUNC inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return TaskOutputTensors{};
     return dist_alloc_tensors(nullptr, args);
 }
+#endif
 
 PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_task(const MixedKernels &mixed_kernels) {
     if (dist_is_fatal_query()) return SubmitToken{};
@@ -56,12 +80,13 @@ PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_aiv_task(int32_t kernel_id) {
 #if PTO_FDWIC_SHARED_MAP
 PTO_DEVICE_FUNC inline SharedTaskOutputs rt_submit_winner(const SubmitToken &tok, const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return SharedTaskOutputs{};
-    return dist_submit_winner_impl(nullptr, tok, args);
+    dist_submit_winner_impl(nullptr, tok, args);
+    return rt_output_refs(tok.task_id, rt_count_outputs(args));
 }
 
 PTO_DEVICE_FUNC inline SharedTaskOutputs rt_submit_loser(const SubmitToken &tok, uint32_t output_count) {
     if (dist_is_fatal_query()) return SharedTaskOutputs{};
-    return dist_submit_loser_impl(nullptr, tok, output_count);
+    return rt_output_refs(tok.task_id, output_count);
 }
 #else
 PTO_DEVICE_FUNC inline TaskOutputTensors rt_submit_winner(const SubmitToken &tok, const L0TaskArgs &args) {

@@ -51,6 +51,108 @@ write_descriptor_checks(TensorT &tensor, __gm__ float *out, uint32_t base, uint6
     out[base + 9] = tensor.buffer.addr != reference.buffer.addr ? 1.0f : 0.0f;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+using SubmitOutputs = SharedTaskOutputs;
+using OutputHandle = FdwicOutputRef;
+using ViewHandle = FdwicOutputRef;
+
+PTO_DEVICE_FUNC inline OutputHandle output_handle(const SubmitOutputs &outputs, uint32_t slot) {
+    return outputs.output_ref(slot);
+}
+
+PTO_DEVICE_FUNC inline ViewHandle
+output_view(OutputHandle source, const uint32_t view_shapes[], const uint32_t view_offsets[], uint32_t ndims) {
+    always_assert(ndims == 1);
+    source.flags |= 1u;
+    source.view_ndims = static_cast<uint8_t>(ndims);
+    source.view_shape0 = view_shapes[0];
+    source.view_offset0 = view_offsets[0];
+    return source;
+}
+
+PTO_DEVICE_FUNC inline SubmitOutputs
+submit_aic_task(int32_t func_id, const L0TaskArgs &args, uint32_t output_count = 0) {
+    SubmitToken tok = rt_presubmit_aic_task(func_id);
+    if (tok.won) return rt_submit_winner(tok, args);
+    return rt_submit_loser(tok, output_count);
+}
+
+PTO_DEVICE_FUNC inline SubmitOutputs
+submit_aiv_task(int32_t func_id, const L0TaskArgs &args, uint32_t output_count = 0) {
+    SubmitToken tok = rt_presubmit_aiv_task(func_id);
+    if (tok.won) return rt_submit_winner(tok, args);
+    return rt_submit_loser(tok, output_count);
+}
+
+PTO_DEVICE_FUNC inline SubmitOutputs
+submit_task(const MixedKernels &mixed, const L0TaskArgs &args, uint32_t output_count = 0) {
+    SubmitToken tok = rt_presubmit_task(mixed);
+    if (tok.won) return rt_submit_winner(tok, args);
+    return rt_submit_loser(tok, output_count);
+}
+#else
+using SubmitOutputs = TaskOutputTensors;
+using OutputHandle = __gm__ const Tensor &;
+using ViewHandle = Tensor;
+
+PTO_DEVICE_FUNC inline OutputHandle output_handle(const SubmitOutputs &outputs, uint32_t slot) {
+    return outputs.get_ref(slot);
+}
+
+PTO_DEVICE_FUNC inline ViewHandle
+output_view(OutputHandle source, const uint32_t view_shapes[], const uint32_t view_offsets[], uint32_t ndims) {
+    (void)ndims;
+    return Tensor::view(source, view_shapes, view_offsets);
+}
+
+PTO_DEVICE_FUNC inline SubmitOutputs
+submit_aic_task(int32_t func_id, const L0TaskArgs &args, uint32_t output_count = 0) {
+    (void)output_count;
+    return rt_submit_aic_task(func_id, args);
+}
+
+PTO_DEVICE_FUNC inline SubmitOutputs
+submit_aiv_task(int32_t func_id, const L0TaskArgs &args, uint32_t output_count = 0) {
+    (void)output_count;
+    return rt_submit_aiv_task(func_id, args);
+}
+
+PTO_DEVICE_FUNC inline SubmitOutputs
+submit_task(const MixedKernels &mixed, const L0TaskArgs &args, uint32_t output_count = 0) {
+    (void)output_count;
+    return rt_submit_task(mixed, args);
+}
+#endif
+
+PTO_DEVICE_FUNC inline OutputHandle
+alloc_output_handle(const L0TaskArgs &args, SubmitOutputs &outputs, uint32_t slot = 0) {
+#if PTO_FDWIC_SHARED_MAP
+    const int32_t task_id = dist_alloc_outputs_impl(nullptr, args);
+    outputs = rt_output_refs(task_id, rt_count_outputs(args));
+    return FdwicOutputRef{task_id, static_cast<int16_t>(slot), 0, 0, 0, 0};
+#else
+    outputs = alloc_tensors(args);
+    return output_handle(outputs, slot);
+#endif
+}
+
+static PTO_DEVICE_FUNC void run_alloc_fill_runahead(const Tensor &input, uint64_t n) {
+    const uint32_t shape[1] = {static_cast<uint32_t>(n)};
+    TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+    for (uint64_t i = 0; i < n; i++) {
+        (void)i;
+        L0TaskArgs alloc_args;
+        alloc_args.add_output(scratch_ci);
+        SubmitOutputs scratch_out;
+        OutputHandle scratch = alloc_output_handle(alloc_args, scratch_out);
+        L0TaskArgs fill_args;
+        fill_args.add_input(input);
+        fill_args.add_output(scratch);
+        fill_args.add_scalar(n);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+    }
+}
+
 extern "C" {
 
 __attribute__((visibility("default"), weak)) PTO2OrchestrationConfig
@@ -80,12 +182,12 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fill_full_args.add_input(input);
         fill_full_args.add_inout(output);
         fill_full_args.add_scalar(n);
-        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_full_args);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_full_args);
 
         L0TaskArgs bump_sub_args;
         bump_sub_args.add_inout(sub_output);
         bump_sub_args.add_scalar(sub_n);
-        rt_submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_sub_args);
+        submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_sub_args);
         return;
     }
 
@@ -94,12 +196,12 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fill_full_args.add_input(input);
         fill_full_args.add_inout(output);
         fill_full_args.add_scalar(n);
-        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_full_args);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_full_args);
 
         L0TaskArgs bump_full_args;
         bump_full_args.add_inout(output);
         bump_full_args.add_scalar(n);
-        rt_submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_full_args);
+        submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_full_args);
         return;
     }
 
@@ -112,7 +214,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         L0TaskArgs bump_sub_args;
         bump_sub_args.add_inout(sub_output);
         bump_sub_args.add_scalar(sub_n);
-        rt_submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_sub_args);
+        submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_sub_args);
         return;
     }
 
@@ -124,7 +226,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         bump_offset_args.add_inout(output);
         bump_offset_args.add_scalar(sub_n);
         bump_offset_args.add_scalar(sub_offset);
-        rt_submit_aiv_task(FUNC_BUMP_OFFSET_AIV, bump_offset_args);
+        submit_aiv_task(FUNC_BUMP_OFFSET_AIV, bump_offset_args);
         return;
     }
 
@@ -181,7 +283,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         check_output[107] = after_full_args.start_offset == sub_offset[0] ? 1.0f : 0.0f;
         check_output[108] = after_full_args.shapes[0] == sub_n ? 1.0f : 0.0f;
         check_output[109] = after_full_args.strides[0] == 1 ? 1.0f : 0.0f;
-        rt_submit_aiv_task(FUNC_INSPECT_VIEW_AIV, inspect_args);
+        submit_aiv_task(FUNC_INSPECT_VIEW_AIV, inspect_args);
         return;
     }
 
@@ -269,7 +371,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         inspect_args.add_inout(dump);
         inspect_args.add_scalar(0);
         inspect_args.add_scalar(n);
-        rt_submit_aiv_task(FUNC_INSPECT_VIEW_AIV, inspect_args);
+        submit_aiv_task(FUNC_INSPECT_VIEW_AIV, inspect_args);
         return;
     }
 
@@ -277,8 +379,27 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs alloc_args;
         alloc_args.add_output(scratch_ci);
-        TaskOutputTensors seed_out = alloc_tensors(alloc_args);
-        __gm__ const Tensor &seed = seed_out.get_ref(0);
+        SubmitOutputs seed_out;
+        OutputHandle seed = alloc_output_handle(alloc_args, seed_out);
+#if PTO_FDWIC_SHARED_MAP
+        const uint32_t check_shape[1] = {10};
+        const uint32_t first_offset[1] = {0};
+        const uint32_t second_offset[1] = {16};
+        Tensor first_check = Tensor::view(output, check_shape, first_offset);
+        Tensor second_check = Tensor::view(output, check_shape, second_offset);
+        L0TaskArgs inspect_args;
+        inspect_args.add_input(seed);
+        inspect_args.add_inout(first_check);
+        inspect_args.add_inout(first_check);
+        inspect_args.add_scalar(n);
+        submit_aic_task(FUNC_INSPECT_ALLOC_AIC, inspect_args);
+        L0TaskArgs inspect_again_args;
+        inspect_again_args.add_input(seed);
+        inspect_again_args.add_inout(second_check);
+        inspect_again_args.add_inout(second_check);
+        inspect_again_args.add_scalar(n);
+        submit_aic_task(FUNC_INSPECT_ALLOC_AIC, inspect_again_args);
+#else
         __gm__ float *check_output =
             reinterpret_cast<__gm__ float *>(static_cast<uintptr_t>(output.buffer.addr)) + output.start_offset;
         write_descriptor_checks(seed, check_output, 0, n, output);
@@ -295,6 +416,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         }
         dcci(check_output, SINGLE_CACHE_LINE, CACHELINE_OUT);
         dcci(check_output + 16, SINGLE_CACHE_LINE, CACHELINE_OUT);
+#endif
         return;
     }
 
@@ -302,14 +424,14 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs alloc_args;
         alloc_args.add_output(scratch_ci);
-        TaskOutputTensors seed_out = alloc_tensors(alloc_args);
-        __gm__ const Tensor &seed = seed_out.get_ref(0);
+        SubmitOutputs seed_out;
+        OutputHandle seed = alloc_output_handle(alloc_args, seed_out);
 
         L0TaskArgs fill_args;
         fill_args.add_input(input);
         fill_args.add_inout(seed);
         fill_args.add_scalar(n);
-        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
 
         L0TaskArgs fanin_args;
         fanin_args.add_input(seed);
@@ -317,7 +439,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fanin_args.add_input(seed);
         fanin_args.add_inout(output);
         fanin_args.add_scalar(n);
-        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         return;
     }
 
@@ -325,14 +447,14 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs alloc_args;
         alloc_args.add_output(scratch_ci);
-        TaskOutputTensors seed_out = alloc_tensors(alloc_args);
-        __gm__ const Tensor &seed = seed_out.get_ref(0);
+        SubmitOutputs seed_out;
+        OutputHandle seed = alloc_output_handle(alloc_args, seed_out);
 
         L0TaskArgs fill_args;
         fill_args.add_input(input);
         fill_args.add_inout(seed);
         fill_args.add_scalar(n);
-        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
         return;
     }
 
@@ -342,8 +464,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         left_args.add_input(input);
         left_args.add_output(scratch_ci);
         left_args.add_scalar(n);
-        TaskOutputTensors left_out = rt_submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
-        __gm__ const Tensor &left = left_out.get_ref(0);
+        SubmitOutputs left_out = submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args, 1);
+        OutputHandle left = output_handle(left_out, 0);
 
         L0TaskArgs fanin_args;
         fanin_args.add_input(left);
@@ -351,7 +473,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fanin_args.add_input(left);
         fanin_args.add_inout(output);
         fanin_args.add_scalar(n);
-        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         return;
     }
 
@@ -361,8 +483,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         right_args.add_input(input);
         right_args.add_output(scratch_ci);
         right_args.add_scalar(n);
-        TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
-        __gm__ const Tensor &right = right_out.get_ref(0);
+        SubmitOutputs right_out = submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args, 1);
+        OutputHandle right = output_handle(right_out, 0);
 
         L0TaskArgs fanin_args;
         fanin_args.add_input(right);
@@ -370,7 +492,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fanin_args.add_input(right);
         fanin_args.add_inout(output);
         fanin_args.add_scalar(n);
-        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         return;
     }
 
@@ -380,13 +502,13 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         left_args.add_input(input);
         left_args.add_output(scratch_ci);
         left_args.add_scalar(n);
-        TaskOutputTensors left_out = rt_submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
-        __gm__ const Tensor &left = left_out.get_ref(0);
+        SubmitOutputs left_out = submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args, 1);
+        OutputHandle left = output_handle(left_out, 0);
 
         const uint32_t sub_n = static_cast<uint32_t>(n / 2);
         const uint32_t sub_shape[1] = {sub_n};
         const uint32_t sub_offset[1] = {static_cast<uint32_t>(n / 4)};
-        Tensor left_view = Tensor::view(left, sub_shape, sub_offset);
+        ViewHandle left_view = output_view(left, sub_shape, sub_offset, 1);
 
         L0TaskArgs fanin_args;
         fanin_args.add_input(left_view);
@@ -394,7 +516,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fanin_args.add_input(left_view);
         fanin_args.add_inout(output);
         fanin_args.add_scalar(sub_n);
-        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         return;
     }
 
@@ -402,20 +524,20 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs alloc_args;
         alloc_args.add_output(scratch_ci);
-        TaskOutputTensors seed_out = alloc_tensors(alloc_args);
-        __gm__ const Tensor &seed = seed_out.get_ref(0);
+        SubmitOutputs seed_out;
+        OutputHandle seed = alloc_output_handle(alloc_args, seed_out);
 
         L0TaskArgs fill_args;
         fill_args.add_input(input);
         fill_args.add_inout(seed);
         fill_args.add_scalar(n);
         fill_args.add_scalar(static_cast<uint64_t>(2000000));
-        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
 
         const uint32_t sub_n = static_cast<uint32_t>(n / 8);
         const uint32_t sub_shape[1] = {sub_n};
         const uint32_t seed_offset[1] = {0};
-        Tensor seed_view = Tensor::view(seed, sub_shape, seed_offset);
+        ViewHandle seed_view = output_view(seed, sub_shape, seed_offset, 1);
         for (uint64_t i = 0; i < 6; i++) {
             const uint32_t out_offset[1] = {static_cast<uint32_t>(i * sub_n)};
             Tensor output_view = Tensor::view(output, sub_shape, out_offset);
@@ -425,7 +547,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             fanin_args.add_input(seed_view);
             fanin_args.add_inout(output_view);
             fanin_args.add_scalar(sub_n);
-            rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+            submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         }
         return;
     }
@@ -436,14 +558,14 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         right_args.add_input(input);
         right_args.add_output(scratch_ci);
         right_args.add_scalar(n);
-        TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
-        __gm__ const Tensor &right = right_out.get_ref(0);
+        SubmitOutputs right_out = submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args, 1);
+        OutputHandle right = output_handle(right_out, 0);
 
         L0TaskArgs fill_args;
         fill_args.add_input(right);
         fill_args.add_inout(output);
         fill_args.add_scalar(n);
-        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
         return;
     }
 
@@ -454,13 +576,13 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         right_args.add_output(scratch_ci);
         right_args.add_scalar(n);
         right_args.add_scalar(static_cast<uint64_t>(8000000));
-        TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
-        __gm__ const Tensor &right = right_out.get_ref(0);
+        SubmitOutputs right_out = submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args, 1);
+        OutputHandle right = output_handle(right_out, 0);
 
         const uint32_t sub_n = 32;
         const uint32_t sub_shape[1] = {sub_n};
         const uint32_t right_offset[1] = {0};
-        Tensor right_view = Tensor::view(right, sub_shape, right_offset);
+        ViewHandle right_view = output_view(right, sub_shape, right_offset, 1);
         for (uint64_t i = 0; i < 6; i++) {
             const uint32_t out_offset[1] = {static_cast<uint32_t>(i * sub_n)};
             Tensor output_view = Tensor::view(output, sub_shape, out_offset);
@@ -468,7 +590,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             fill_args.add_input(right_view);
             fill_args.add_inout(output_view);
             fill_args.add_scalar(sub_n);
-            rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+            submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
         }
         return;
     }
@@ -480,13 +602,13 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         right_args.add_output(scratch_ci);
         right_args.add_scalar(n);
         right_args.add_scalar(static_cast<uint64_t>(8000000));
-        TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
-        __gm__ const Tensor &right = right_out.get_ref(0);
+        SubmitOutputs right_out = submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args, 1);
+        OutputHandle right = output_handle(right_out, 0);
 
         const uint32_t sub_n = 32;
         const uint32_t sub_shape[1] = {sub_n};
         const uint32_t right_offset[1] = {0};
-        Tensor right_view = Tensor::view(right, sub_shape, right_offset);
+        ViewHandle right_view = output_view(right, sub_shape, right_offset, 1);
         for (uint64_t i = 0; i < 12; i++) {
             const uint32_t out_offset[1] = {static_cast<uint32_t>(i * sub_n)};
             Tensor output_view = Tensor::view(output, sub_shape, out_offset);
@@ -494,7 +616,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             fill_args.add_input(right_view);
             fill_args.add_inout(output_view);
             fill_args.add_scalar(sub_n);
-            rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+            submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
         }
         return;
     }
@@ -506,30 +628,30 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         seed_args.add_input(input);
         seed_args.add_output(scratch_ci);
         seed_args.add_scalar(n);
-        TaskOutputTensors seed_out = rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, seed_args);
-        __gm__ const Tensor &seed = seed_out.get_ref(0);
+        SubmitOutputs seed_out = submit_aic_task(FUNC_FILL_ALLOC_AIC, seed_args, 1);
+        OutputHandle seed = output_handle(seed_out, 0);
 
         L0TaskArgs left_args;
         left_args.add_input(input);
         left_args.add_output(scratch_ci);
         left_args.add_scalar(n);
-        TaskOutputTensors left_out = rt_submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
-        __gm__ const Tensor &left = left_out.get_ref(0);
+        SubmitOutputs left_out = submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args, 1);
+        OutputHandle left = output_handle(left_out, 0);
 
         L0TaskArgs right_args;
         right_args.add_input(input);
         right_args.add_output(scratch_ci);
         right_args.add_scalar(n);
         right_args.add_scalar(static_cast<uint64_t>(8000000));
-        TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
-        __gm__ const Tensor &right = right_out.get_ref(0);
+        SubmitOutputs right_out = submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args, 1);
+        OutputHandle right = output_handle(right_out, 0);
 
         const uint32_t sub_n = 32;
         const uint32_t sub_shape[1] = {sub_n};
         const uint32_t src_offset[1] = {0};
-        Tensor seed_view = Tensor::view(seed, sub_shape, src_offset);
-        Tensor left_view = Tensor::view(left, sub_shape, src_offset);
-        Tensor right_view = Tensor::view(right, sub_shape, src_offset);
+        ViewHandle seed_view = output_view(seed, sub_shape, src_offset, 1);
+        ViewHandle left_view = output_view(left, sub_shape, src_offset, 1);
+        ViewHandle right_view = output_view(right, sub_shape, src_offset, 1);
         for (uint64_t i = 0; i < 12; i++) {
             const uint32_t out_offset[1] = {static_cast<uint32_t>(i * sub_n)};
             Tensor output_view = Tensor::view(output, sub_shape, out_offset);
@@ -539,7 +661,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             fanin_args.add_input(right_view);
             fanin_args.add_inout(output_view);
             fanin_args.add_scalar(sub_n);
-            rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+            submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         }
         return;
     }
@@ -551,30 +673,30 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         seed_args.add_input(input);
         seed_args.add_output(scratch_ci);
         seed_args.add_scalar(n);
-        TaskOutputTensors seed_out = rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, seed_args);
-        __gm__ const Tensor &seed = seed_out.get_ref(0);
+        SubmitOutputs seed_out = submit_aic_task(FUNC_FILL_ALLOC_AIC, seed_args, 1);
+        OutputHandle seed = output_handle(seed_out, 0);
 
         L0TaskArgs left_args;
         left_args.add_input(input);
         left_args.add_output(scratch_ci);
         left_args.add_scalar(n);
-        TaskOutputTensors left_out = rt_submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
-        __gm__ const Tensor &left = left_out.get_ref(0);
+        SubmitOutputs left_out = submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args, 1);
+        OutputHandle left = output_handle(left_out, 0);
 
         L0TaskArgs right_args;
         right_args.add_input(input);
         right_args.add_output(scratch_ci);
         right_args.add_scalar(n);
         right_args.add_scalar(static_cast<uint64_t>(8000000));
-        TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
-        __gm__ const Tensor &right = right_out.get_ref(0);
+        SubmitOutputs right_out = submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args, 1);
+        OutputHandle right = output_handle(right_out, 0);
 
         const uint32_t sub_n = 32;
         const uint32_t sub_shape[1] = {sub_n};
         const uint32_t src_offset[1] = {0};
-        Tensor seed_view = Tensor::view(seed, sub_shape, src_offset);
-        Tensor left_view = Tensor::view(left, sub_shape, src_offset);
-        Tensor right_view = Tensor::view(right, sub_shape, src_offset);
+        ViewHandle seed_view = output_view(seed, sub_shape, src_offset, 1);
+        ViewHandle left_view = output_view(left, sub_shape, src_offset, 1);
+        ViewHandle right_view = output_view(right, sub_shape, src_offset, 1);
         for (uint64_t i = 0; i < 96; i++) {
             const uint32_t out_offset[1] = {static_cast<uint32_t>(i * sub_n)};
             Tensor output_view = Tensor::view(output, sub_shape, out_offset);
@@ -584,24 +706,13 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
             fanin_args.add_input(right_view);
             fanin_args.add_inout(output_view);
             fanin_args.add_scalar(sub_n);
-            rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+            submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         }
         return;
     }
 
     if (mode == 22) {
-        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
-        for (uint64_t i = 0; i < n; i++) {
-            L0TaskArgs alloc_args;
-            alloc_args.add_output(scratch_ci);
-            TaskOutputTensors scratch_out = alloc_tensors(alloc_args);
-            __gm__ const Tensor &scratch = scratch_out.get_ref(0);
-            L0TaskArgs fill_args;
-            fill_args.add_input(input);
-            fill_args.add_output(scratch);
-            fill_args.add_scalar(n);
-            rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
-        }
+        run_alloc_fill_runahead(input, n);
         return;
     }
 
@@ -610,7 +721,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         for (uint64_t i = 0; i < n; i++) {
             L0TaskArgs alloc_args;
             alloc_args.add_output(scratch_ci);
-            TaskOutputTensors scratch_out = alloc_tensors(alloc_args);
+            SubmitOutputs scratch_out;
+            (void)alloc_output_handle(alloc_args, scratch_out);
             (void)scratch_out;
         }
         return;
@@ -621,7 +733,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fill_args.add_input(input);
         fill_args.add_inout(output);
         fill_args.add_scalar(n);
-        rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
         return;
     }
 
@@ -631,7 +743,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         left_args.add_input(input);
         left_args.add_output(scratch_ci);
         left_args.add_scalar(n);
-        rt_submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
+        submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
         return;
     }
 
@@ -639,15 +751,15 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs alloc_args;
         alloc_args.add_output(scratch_ci);
-        TaskOutputTensors scratch_out = alloc_tensors(alloc_args);
-        __gm__ const Tensor &scratch = scratch_out.get_ref(0);
+        SubmitOutputs scratch_out;
+        OutputHandle scratch = alloc_output_handle(alloc_args, scratch_out);
         L0TaskArgs inspect_args;
         inspect_args.add_input(scratch);
         inspect_args.add_inout(output);
         inspect_args.add_inout(dump);
         inspect_args.add_scalar(0);
         inspect_args.add_scalar(n);
-        rt_submit_aiv_task(FUNC_INSPECT_VIEW_AIV, inspect_args);
+        submit_aiv_task(FUNC_INSPECT_VIEW_AIV, inspect_args);
         return;
     }
 
@@ -655,14 +767,14 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
         L0TaskArgs alloc_args;
         alloc_args.add_output(scratch_ci);
-        TaskOutputTensors scratch_out = alloc_tensors(alloc_args);
-        __gm__ const Tensor &scratch = scratch_out.get_ref(0);
+        SubmitOutputs scratch_out;
+        OutputHandle scratch = alloc_output_handle(alloc_args, scratch_out);
         L0TaskArgs inspect_args;
         inspect_args.add_input(scratch);
         inspect_args.add_inout(output);
         inspect_args.add_inout(dump);
         inspect_args.add_scalar(n);
-        rt_submit_aic_task(FUNC_INSPECT_ALLOC_AIC, inspect_args);
+        submit_aic_task(FUNC_INSPECT_ALLOC_AIC, inspect_args);
         return;
     }
 
@@ -673,8 +785,8 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         left_args.add_output(scratch_ci);
         left_args.add_scalar(n);
         left_args.add_scalar(static_cast<uint64_t>(12000000));
-        TaskOutputTensors left_out = rt_submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
-        __gm__ const Tensor &left = left_out.get_ref(0);
+        SubmitOutputs left_out = submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args, 1);
+        OutputHandle left = output_handle(left_out, 0);
 
         L0TaskArgs fanin_args;
         fanin_args.add_input(left);
@@ -683,18 +795,18 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fanin_args.add_inout(output);
         fanin_args.add_scalar(n);
         fanin_args.add_scalar(static_cast<uint64_t>(12000000));
-        rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
 
         for (uint64_t i = 0; i < 70; i++) {
             L0TaskArgs alloc_args;
             alloc_args.add_output(scratch_ci);
-            TaskOutputTensors scratch_out = alloc_tensors(alloc_args);
-            __gm__ const Tensor &scratch = scratch_out.get_ref(0);
+            SubmitOutputs scratch_out;
+            OutputHandle scratch = alloc_output_handle(alloc_args, scratch_out);
             L0TaskArgs fill_args;
             fill_args.add_input(input);
             fill_args.add_inout(scratch);
             fill_args.add_scalar(n);
-            rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+            submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
         }
         return;
     }
@@ -705,7 +817,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         MixedKernels mk;
         mk.aic_kernel_id = FUNC_DCCI_ATOMIC_CLOBBER_AIC;
         mk.aiv0_kernel_id = FUNC_DCCI_ATOMIC_CLOBBER_AIV;
-        rt_submit_task(mk, probe_args);
+        submit_task(mk, probe_args);
         return;
     }
 
@@ -713,28 +825,28 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 
     L0TaskArgs alloc_args;
     alloc_args.add_output(scratch_ci);
-    TaskOutputTensors seed_out = alloc_tensors(alloc_args);
-    __gm__ const Tensor &seed = seed_out.get_ref(0);
+    SubmitOutputs seed_out;
+    OutputHandle seed = alloc_output_handle(alloc_args, seed_out);
 
     L0TaskArgs fill_args;
     fill_args.add_input(input);
     fill_args.add_inout(seed);
     fill_args.add_scalar(n);
-    rt_submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+    submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
 
     L0TaskArgs left_args;
     left_args.add_input(input);
     left_args.add_output(scratch_ci);
     left_args.add_scalar(n);
-    TaskOutputTensors left_out = rt_submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args);
-    __gm__ const Tensor &left = left_out.get_ref(0);
+    SubmitOutputs left_out = submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args, 1);
+    OutputHandle left = output_handle(left_out, 0);
 
     L0TaskArgs right_args;
     right_args.add_input(input);
     right_args.add_output(scratch_ci);
     right_args.add_scalar(n);
-    TaskOutputTensors right_out = rt_submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args);
-    __gm__ const Tensor &right = right_out.get_ref(0);
+    SubmitOutputs right_out = submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args, 1);
+    OutputHandle right = output_handle(right_out, 0);
 
     L0TaskArgs fanin_args;
     fanin_args.add_input(seed);
@@ -742,7 +854,7 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     fanin_args.add_input(right);
     fanin_args.add_inout(output);
     fanin_args.add_scalar(n);
-    rt_submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+    submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
 }
 
 }  // extern "C"

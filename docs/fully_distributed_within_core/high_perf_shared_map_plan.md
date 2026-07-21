@@ -1504,6 +1504,68 @@ task-submit --timeout 90 --max-time 90 --device 6 \
 - follower swimlane 不出现 shared map lookup。
 - joint output descriptor 只发布一次。
 
+#### Phase 6 设计草案：winner-gated lane inbox
+
+以下内容原本被误写入 `docs/fully_distributed_within_core.md`，现作为未验证的
+phase 6 草案保留在本 plan。它不是主设计文档的替代方案；只有在实现、sim、
+上板和泳道数据都闭环后，才能再讨论是否同步到主文档。
+
+目标是把 joint task 的 follower 依赖解析从 follower 本地 fanin 轮询中移出：
+
+- joint task 仍由 anchor/winner 负责 claim 和完整 fanin resolve。
+- anchor/winner 先把自己的子任务构建进私有环，槽内保留 `fanin[]`。
+- Phase B 中 anchor/winner 观察到 fanin 全部 ready 后，向同 block 的目标
+  follower lane 发布一条 launch。
+- follower 不参与该 joint task 的 claim，不查 shared map，不解析 fanin；
+  只 drain 自己 lane 的 inbox。
+- follower 收到 launch 后构建本核私有环槽，`fanin_count = 0`，表示依赖已经
+  由 winner 收敛完成。
+- joint task 仍只有一个 task completion flag。各 co-owner 执行完自己的子任务后
+  递减同一个 `task_cell[N].remaining`，最后一个完成者发布 `flag(N)`。
+
+建议状态模型：
+
+```text
+lane_inbox[block][lane]:
+    单 writer：该 block 的 anchor/winner
+    单 reader：对应 follower lane
+    entry：kernel/args/payload 引用，不携带 fanin 列表
+    push：release
+    pop：acquire
+```
+
+关键语义：
+
+- launch 只表示 winner 已经确认 joint task 的 fanin ready，不表示 winner
+  自己的 kernel 已完成。
+- follower 进入 kernel 前，在非一致缓存平台上仍需对 launch 中输入地址做必要的
+  invalidate / 旁路读；launch 的 acquire 不能替代数据面可见性维护。
+- follower 不按编排走位等待 anchor 决定，也不通过 task id 查询
+  `block.won[N]`；没有 launch 就继续执行本 lane 其它就绪工作。
+- anchor 超前时，launch 在 inbox 中累积；inbox 满时 anchor 在 claim/build
+  前反压，先执行 Phase B / drain，不能无限超前。
+
+这个草案和 shared map 的关系：
+
+- shared map 只服务 submit 依赖与 output descriptor 发布。
+- joint follower launch 是多核任务内部的 owner handoff，不应让 follower 再走
+  shared region lookup/register。
+- shared winner 只发布一次 output descriptor；follower 不重复发布 output
+  descriptor。
+- 如果后续 phase 6 发现 follower swimlane 仍出现 shared map lookup，说明 joint
+  handoff 没隔离好，不能进入 phase 7。
+
+落地风险：
+
+- 当前 a5 代码仍可能使用 `BlockWon` / `WonSlot` 这类 block 内多方共享结构；
+  迁移到 `lane_inbox` 必须先审计现有 joint completion 和反压语义。
+- `remaining` 不应放在 inbox entry 中，否则多个 follower / anchor 的完成路径
+  会重新引入 block-local 多方共享状态；应放在 per-task completion cell。
+- inbox entry 不能按 task id 简单取模覆盖；必须有容量反压和 release/acquire
+  可见性。
+- 不能用该草案规避 PA shared map 的真实性能问题。PA 的 `INOUT`/alias 路径必须
+  由 shared map runtime 正向优化，不能在用例侧手动建立依赖。
+
 sim / 上板目标：
 
 ```bash

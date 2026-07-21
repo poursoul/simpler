@@ -193,10 +193,10 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                 alloc_args.add_output(tile2d_ci);
                 alloc_args.add_output(scalar_ci);
                 alloc_args.add_output(scalar_ci);
-                TaskOutputTensors alloc_outs = alloc_tensors(alloc_args);
-                __gm__ const Tensor &oi = alloc_outs.get_ref(0);
-                __gm__ const Tensor &li_update = alloc_outs.get_ref(1);
-                __gm__ const Tensor &mi_update = alloc_outs.get_ref(2);
+                SubmitOutputs alloc_outs = alloc_tensors(alloc_args);
+                OutputHandle oi = output_handle(alloc_outs, 0);
+                OutputHandle li_update = output_handle(alloc_outs, 1);
+                OutputHandle mi_update = output_handle(alloc_outs, 2);
 #ifdef ENABLE_PROFILING
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
@@ -343,16 +343,20 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
                     params_up.reset();
 #if PTO_FDWIC_SHARED_MAP
                     SubmitToken up_tok = rt_presubmit_aiv_task(FUNC_ONLINE_UPDATE);
+                    SubmitOutputs up_outs;
                     if (up_tok.won) {
                         params_up.add_input(mi);
                         params_up.add_input(li);
                         params_up.add_input(oi_new);
-                        params_up.add_inout(mi_update, li_update, oi, out_view);
+                        params_up.add_inout(mi_update);
+                        params_up.add_inout(li_update);
+                        params_up.add_inout(oi);
+                        params_up.add_inout(out_view);
                         params_up.add_scalar(is_first, is_last);
                         CYCLE_COUNT_LAP(prof_param_setup);
-                        rt_submit_winner(up_tok, params_up);
+                        up_outs = rt_submit_winner(up_tok, params_up);
                     } else {
-                        rt_submit_loser(up_tok, 0);
+                        up_outs = rt_submit_loser(up_tok, 0);
                     }
 #else
                     params_up.add_input(mi, li, oi_new);

@@ -69,6 +69,62 @@ PTO_DEVICE_FUNC void publish_ring_slot_built(__gm__ RingSlot &s) {
 #endif
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC FdwicOutputRef dist_shared_ref_load(__gm__ const FdwicOutputRef &src) {
+    FdwicOutputRef out;
+    out.producer_task_id = src.producer_task_id;
+    out.output_slot = src.output_slot;
+    out.flags = src.flags;
+    out.view_ndims = src.view_ndims;
+    out.view_shape0 = src.view_shape0;
+    out.view_offset0 = src.view_offset0;
+    return out;
+}
+
+PTO_DEVICE_FUNC void dist_shared_ref_copy(__gm__ FdwicOutputRef &dst, FdwicOutputRef src) {
+    dst.producer_task_id = src.producer_task_id;
+    dst.output_slot = src.output_slot;
+    dst.flags = src.flags;
+    dst.view_ndims = src.view_ndims;
+    dst.view_shape0 = src.view_shape0;
+    dst.view_offset0 = src.view_offset0;
+}
+
+PTO_DEVICE_FUNC void dist_shared_ref_copy_from_gm(__gm__ FdwicOutputRef &dst, __gm__ const FdwicOutputRef &src) {
+    dist_shared_ref_copy(dst, dist_shared_ref_load(src));
+}
+
+PTO_DEVICE_FUNC bool dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, __gm__ Tensor &resolved);
+PTO_DEVICE_FUNC bool
+dist_resolve_ready_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, __gm__ Tensor &resolved);
+
+PTO_DEVICE_FUNC bool
+dist_try_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, __gm__ Tensor &resolved) {
+    if (ref.producer_task_id < 0 || ref.producer_task_id >= kFlagCap) {
+        set_fatal();
+        return false;
+    }
+    always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
+    __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
+    if (atomic_load(cell.published[ref.output_slot].v, __ATOMIC_ACQUIRE) != ref.producer_task_id) return false;
+    return dist_resolve_ready_shared_output_ref(ref, self, resolved);
+}
+
+PTO_DEVICE_FUNC bool dist_resolve_slot_shared_refs(__gm__ DistCore *self, __gm__ RingSlot &s) {
+    if (s.shared_ref_mask == 0) return true;
+    TRACE_SPAN_BEGIN(resolve_trace);
+    int32_t resolved_count = 0;
+    for (int32_t i = 0; i < s.tensor_count; i++) {
+        if ((s.shared_ref_mask & (1u << static_cast<uint32_t>(i))) == 0) continue;
+        if (!dist_resolve_ready_shared_output_ref(dist_shared_ref_load(s.shared_refs[i]), self, s.tensors[i]))
+            return false;
+        resolved_count++;
+    }
+    TRACE_SPAN_END(resolve_trace, self, s.task_id, s.func_id, TracePhase::Resolve, 1u, resolved_count);
+    return true;
+}
+#endif
+
 PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
@@ -104,29 +160,43 @@ PTO_DEVICE_FUNC bool try_advance_frontier_to(int64_t &frontier, int64_t next) {
     return next > old;
 }
 
-PTO_DEVICE_FUNC void advance_frontier() {
+PTO_DEVICE_FUNC void advance_frontier_until(int32_t target_task_id, int32_t max_steps) {
 #if defined(__CCE_AICORE__)
     if (g_dist_ptr == nullptr) return;
 #endif
     int64_t f = load_frontier_for_advance();
-    while (true) {
+    int32_t steps = 0;
+    while (max_steps < 0 || steps < max_steps) {
         const int64_t next = f + 1;
         if (next >= kFlagCap) break;
+        if (target_task_id >= 0 && next > target_task_id) break;
         if (!task_flag_ready(static_cast<int32_t>(next), __ATOMIC_ACQUIRE)) break;
         try_advance_frontier_to(f, next);
+        steps++;
     }
 }
 
+PTO_DEVICE_FUNC void advance_frontier() { advance_frontier_until(/*target_task_id=*/-1, /*max_steps=*/-1); }
+
 PTO_DEVICE_FUNC void complete_executed_task(__gm__ DistCore *self, int32_t task_id) {
+    TRACE_SPAN_BEGIN(commit_trace);
     if (self != nullptr) {
         store_task_vend(task_id, self->heap_next);
     }
     store_barrier();
     publish_task_flag(task_id);
+#if PTO_FDWIC_SHARED_MAP
+    advance_frontier_until(task_id, /*max_steps=*/8);
+#else
     advance_frontier();
+#endif
+    TRACE_SPAN_END(commit_trace, self, task_id, -1, TracePhase::Commit, 0, 0);
 }
 
 PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__ RingSlot &s) {
+#if PTO_FDWIC_SHARED_MAP
+    if (!dist_resolve_slot_shared_refs(self, s)) return;
+#endif
     typedef void (*KernelFn)(__gm__ int64_t *);
 #if DIST_SIM_HOST_CLOCK
     const Runtime *rt = g_dist.runtime;
@@ -220,27 +290,30 @@ PTO_DEVICE_FUNC inline bool lane_active(const ActiveMask &M, int32_t lane) {
     return M.subtask_active(static_cast<PTO2SubtaskSlot>(lane));
 }
 
-template <typename TensorArrPtr, typename ScalarArrPtr, typename FaninArrPtr>
-PTO_DEVICE_FUNC void build_ring_slot(
-    __gm__ RingSlot &s, int32_t task_id, int32_t func_id, uint64_t fn_addr, TensorArrPtr tensors, int32_t tc,
-    ScalarArrPtr scalars, int32_t sc, FaninArrPtr fanin, int32_t fc, int32_t sub_block_id, bool is_multicore,
-    int32_t won_block, int32_t won_slot
+PTO_DEVICE_FUNC void build_ring_slot_from_built_subtask(
+    __gm__ RingSlot &s, int32_t task_id, __gm__ const BuiltSubtask &b, int32_t won_block, int32_t won_slot
 ) {
     s.occupied = true;
     s.task_id = task_id;
-    s.func_id = func_id;
-    s.function_bin_addr = fn_addr;
+    s.func_id = b.func_id;
+    s.function_bin_addr = b.function_bin_addr;
     s.built = false;
-    s.tensor_count = tc;
-    s.scalar_count = sc;
-    for (int32_t i = 0; i < tc; i++)
-        Tensor::copy(s.tensors[i], tensors[i]);
-    for (int32_t j = 0; j < sc; j++)
-        s.scalars[j] = scalars[j];
+    s.tensor_count = b.tensor_count;
+    s.scalar_count = b.scalar_count;
+    for (int32_t i = 0; i < b.tensor_count; i++)
+        Tensor::copy(s.tensors[i], b.tensors[i]);
+    for (int32_t j = 0; j < b.scalar_count; j++)
+        s.scalars[j] = b.scalars[j];
+#if PTO_FDWIC_SHARED_MAP
+    s.shared_ref_mask = b.shared_ref_mask;
+    for (int32_t i = 0; i < b.tensor_count; i++)
+        if ((b.shared_ref_mask & (1u << static_cast<uint32_t>(i))) != 0)
+            dist_shared_ref_copy_from_gm(s.shared_refs[i], b.shared_refs[i]);
+#endif
     int32_t n = 0;
-    for (int32_t i = 0; i < tc; i++)
+    for (int32_t i = 0; i < b.tensor_count; i++)
         s.args[n++] = reinterpret_cast<uint64_t>(&s.tensors[i]);
-    for (int32_t j = 0; j < sc; j++)
+    for (int32_t j = 0; j < b.scalar_count; j++)
         s.args[n++] = s.scalars[j];
     s.local_ctx.s_block_idx = 0;
     s.local_ctx.s_block_num = 1;
@@ -249,16 +322,16 @@ PTO_DEVICE_FUNC void build_ring_slot(
     s.local_ctx.async_ctx.completion_entries = nullptr;
     s.local_ctx.async_ctx.completion_capacity = 0;
     s.local_ctx.async_ctx.task_token.raw = UINT64_MAX;
-    s.global_ctx.sub_block_id = sub_block_id;
+    s.global_ctx.sub_block_id = b.sub_block_id;
     s.args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&s.local_ctx);
     s.args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&s.global_ctx);
-    s.fanin_count = fc;
-    for (int32_t k = 0; k < fc; k++)
-        s.fanin[k] = fanin[k];
-    s.is_multicore = is_multicore;
+    s.fanin_count = b.fanin_count;
+    for (int32_t k = 0; k < b.fanin_count; k++)
+        s.fanin[k] = b.fanin[k];
+    s.is_multicore = true;
     s.won_block = won_block;
     s.won_slot = won_slot;
-    flush_ring_slot_payload(s, tc, sc, n);
+    flush_ring_slot_payload(s, b.tensor_count, b.scalar_count, n);
     publish_ring_slot_built(s);
 }
 
@@ -287,10 +360,7 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
         const int32_t task_id = w.meta.task_id;
         __gm__ const BuiltSubtask &b = w.lane[self->lane];
         TRACE_SPAN_BEGIN(drain_won_trace);
-        build_ring_slot(
-            self->slots[si], task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars,
-            b.scalar_count, b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, i
-        );
+        build_ring_slot_from_built_subtask(self->slots[si], task_id, b, self->block_id, i);
         TRACE_SPAN_END(
             drain_won_trace, self, task_id, b.func_id, TracePhase::DrainWon, /*flags=*/1u, static_cast<uint32_t>(i)
         );
@@ -299,6 +369,11 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
         drained = true;
     }
     return drained;
+}
+
+PTO_DEVICE_FUNC bool drain_block_won_if_enabled(__gm__ DistCore *self) {
+    if (!g_fdwic_block_won_enabled) return false;
+    return drain_block_won(self);
 }
 
 PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
@@ -320,7 +395,7 @@ PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
 PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {
     TRACE_LAP_RESET(self);
     if (!fatal_set()) {
-        drain_block_won(self);
+        drain_block_won_if_enabled(self);
         drain_phase_b(self);
     }
     TRACE_LAP(self, self->local_index, -1, TracePhase::EfDrain);
@@ -352,6 +427,23 @@ struct DistSubmitCtx {
     int32_t joint_slot;
     int32_t joint_count;
 };
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC void
+dist_populate_built_subtask_shared_refs(__gm__ BuiltSubtask &b, const L0TaskArgs &args, const DistSubmitCtx &ctx) {
+    b.shared_ref_mask = 0;
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        if (!args.tensor(i).tensor_from_shared_output()) continue;
+        const FdwicOutputRef ref = args.tensor(i).shared_output_ref();
+        if (dist_try_resolve_shared_output_ref(ref, ctx.self, b.tensors[i])) continue;
+        b.shared_ref_mask |= 1u << static_cast<uint32_t>(i);
+        dist_shared_ref_copy(b.shared_refs[i], ref);
+    }
+}
+#else
+PTO_DEVICE_FUNC void
+dist_populate_built_subtask_shared_refs(__gm__ BuiltSubtask &, const L0TaskArgs &, const DistSubmitCtx &) {}
+#endif
 
 PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx) {
     ctx.self = self != nullptr ? self : g_self;
@@ -450,7 +542,8 @@ PTO_DEVICE_FUNC void dist_submit_wait_heap_reuse_window(__gm__ DistCore *self, i
     const int32_t target = task_id - g_dist.H;
     if (target < 0) return;
     while (!fatal_set() && static_cast<int32_t>(atomic_load(g_dist.frontier, __ATOMIC_ACQUIRE)) < target) {
-        drain_block_won(self);
+        advance_frontier_until(target, /*max_steps=*/64);
+        drain_block_won_if_enabled(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }
 }
@@ -650,11 +743,41 @@ dist_resolve_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, __gm__
     __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
     TRACE_SPAN_BEGIN(resolve_wait_trace);
     while (!fatal_set() && atomic_load(cell.published[ref.output_slot].v, __ATOMIC_ACQUIRE) != ref.producer_task_id) {
-        drain_block_won(self);
+        drain_block_won_if_enabled(self);
         if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
     }
     if (fatal_set()) return false;
     TRACE_SPAN_END(resolve_wait_trace, self, ref.producer_task_id, -1, TracePhase::ResolveWait, 0, ref.output_slot);
+#if defined(__CCE_AICORE__)
+    TRACE_SPAN_BEGIN(resolve_invalidate_trace);
+    dist_aicore_invalidate_region(&cell.tensors[ref.output_slot], sizeof(Tensor));
+    TRACE_SPAN_END(
+        resolve_invalidate_trace, self, ref.producer_task_id, -1, TracePhase::ResolveInvalidate, 0, ref.output_slot
+    );
+#endif
+    TRACE_SPAN_BEGIN(resolve_copy_trace);
+    if ((ref.flags & 1u) != 0u) {
+        always_assert(ref.view_ndims == 1 && cell.tensors[ref.output_slot].ndims == 1);
+        const uint32_t view_shapes[1] = {ref.view_shape0};
+        const uint32_t view_offsets[1] = {ref.view_offset0};
+        Tensor::copy(resolved, Tensor::view(cell.tensors[ref.output_slot], view_shapes, view_offsets));
+    } else {
+        Tensor::copy(resolved, cell.tensors[ref.output_slot]);
+    }
+    TRACE_SPAN_END(
+        resolve_copy_trace, self, ref.producer_task_id, -1, TracePhase::ResolveCopy, ref.flags & 1u, ref.output_slot
+    );
+    return true;
+}
+
+PTO_DEVICE_FUNC bool
+dist_resolve_ready_shared_output_ref(FdwicOutputRef ref, __gm__ DistCore *self, __gm__ Tensor &resolved) {
+    if (ref.producer_task_id < 0 || ref.producer_task_id >= kFlagCap) {
+        set_fatal();
+        return false;
+    }
+    always_assert(ref.output_slot >= 0 && ref.output_slot < kSharedOutputMaxPerTask);
+    __gm__ SharedOutputCell &cell = shared_output_cell(ref.producer_task_id);
 #if defined(__CCE_AICORE__)
     TRACE_SPAN_BEGIN(resolve_invalidate_trace);
     dist_aicore_invalidate_region(&cell.tensors[ref.output_slot], sizeof(Tensor));
@@ -786,10 +909,7 @@ dist_submit_copy_arg_tensor(__gm__ Tensor &dst, const L0TaskArgs &args, const Di
         return;
     }
 #if PTO_FDWIC_SHARED_MAP
-    if (args.tensor(i).tensor_from_shared_output()) {
-        Tensor::copy(dst, ctx.payload->tensors[i]);
-        return;
-    }
+    if (args.tensor(i).tensor_from_shared_output()) return;
 #endif
 #if defined(__CCE_AICORE__)
     if (args.tensor(i).tensor_from_gm()) {
@@ -815,8 +935,20 @@ PTO_DEVICE_FUNC void build_ring_slot_from_submit(
     s.built = false;
     s.tensor_count = ctx.tensor_count;
     s.scalar_count = ctx.scalar_count;
+#if PTO_FDWIC_SHARED_MAP
+    s.shared_ref_mask = 0;
+#endif
     for (int32_t i = 0; i < ctx.tensor_count; i++)
         dist_submit_copy_arg_tensor(s.tensors[i], args, ctx, i);
+#if PTO_FDWIC_SHARED_MAP
+    for (int32_t i = 0; i < ctx.tensor_count; i++) {
+        if (!args.tensor(i).tensor_from_shared_output()) continue;
+        const FdwicOutputRef ref = args.tensor(i).shared_output_ref();
+        if (dist_try_resolve_shared_output_ref(ref, ctx.self, s.tensors[i])) continue;
+        s.shared_ref_mask |= 1u << static_cast<uint32_t>(i);
+        dist_shared_ref_copy(s.shared_refs[i], ref);
+    }
+#endif
     for (int32_t j = 0; j < ctx.scalar_count; j++)
         s.scalars[j] = args.scalar(j);
     int32_t n = 0;

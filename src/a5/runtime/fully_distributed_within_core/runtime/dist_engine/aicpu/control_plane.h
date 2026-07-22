@@ -42,10 +42,12 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
         atomic_exchange(g_dist.cube_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
         atomic_exchange(g_dist.vector_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
         atomic_exchange(g_dist.alloc_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
-#if PTO_FDWIC_SHARED_MAP
-        atomic_exchange(g_dist.shared_heap_cursor[s].v, int64_t{0}, __ATOMIC_RELAXED);
-#endif
     }
+#if PTO_FDWIC_SHARED_MAP
+    for (int32_t s = 0; s < kSharedHeapShards; s++) {
+        atomic_exchange(g_dist.shared_heap_cursor[s].v, int64_t{0}, __ATOMIC_RELAXED);
+    }
+#endif
 #if PTO_FDWIC_SHARED_MAP
     atomic_exchange(g_dist.shared_heap_vend.v, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.shared_region.high_water.v, int64_t{0}, __ATOMIC_RELAXED);

@@ -115,6 +115,14 @@ enum class TracePhase : int32_t {
     ResolveCopy = 17,
 };
 
+#if PTO_FDWIC_SHARED_MAP
+constexpr int32_t kRingSlotTailPad = 96;
+constexpr int32_t kBuiltSubtaskTailPad = 112;
+#else
+constexpr int32_t kRingSlotTailPad = 40;
+constexpr int32_t kBuiltSubtaskTailPad = 56;
+#endif
+
 struct RingSlot {
     bool occupied;
     bool built;
@@ -127,6 +135,10 @@ struct RingSlot {
     uint8_t tensors_pad[32];
     Tensor tensors[MAX_TENSOR_ARGS];
     uint64_t scalars[MAX_SCALAR_ARGS];
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t shared_ref_mask;
+    FdwicOutputRef shared_refs[MAX_TENSOR_ARGS];
+#endif
 
     uint64_t args[PTO2_DISPATCH_MAX_ARGS];
     LocalContext local_ctx;
@@ -138,7 +150,7 @@ struct RingSlot {
     bool is_multicore;
     int32_t won_block;
     int32_t won_slot;
-    uint8_t tail_pad[40];
+    uint8_t tail_pad[kRingSlotTailPad];
 };
 
 struct BuiltSubtask {
@@ -150,10 +162,14 @@ struct BuiltSubtask {
     uint8_t tensors_pad[40];
     Tensor tensors[MAX_TENSOR_ARGS];
     uint64_t scalars[MAX_SCALAR_ARGS];
+#if PTO_FDWIC_SHARED_MAP
+    uint32_t shared_ref_mask;
+    FdwicOutputRef shared_refs[MAX_TENSOR_ARGS];
+#endif
     int32_t fanin[kMaxFanin];
     int32_t fanin_count;
     int32_t sub_block_id;
-    uint8_t tail_pad[56];
+    uint8_t tail_pad[kBuiltSubtaskTailPad];
 };
 
 static_assert(offsetof(RingSlot, tensors) % kCacheLine == 0, "RingSlot tensors must be cacheline-aligned");
@@ -211,6 +227,7 @@ static_assert(offsetof(BlockWon, any_pub) % 64 == 0, "BlockWon any_pub must be c
 static_assert(sizeof(BlockWon) % 64 == 0, "BlockWon must not share cachelines");
 
 enum LaneId : int32_t { LANE_AIC = 0, LANE_AIV0 = 1, LANE_AIV1 = 2, LANE_NONE = -1 };
+constexpr int32_t kLaneCount = 3;
 
 struct CoreLayout {
     int32_t block_id;
@@ -243,9 +260,12 @@ static_assert(offsetof(DistCore, map) % 64 == 0, "DistCore map must be cacheline
 static_assert(offsetof(DistCore, slots) % 64 == 0, "DistCore slots must be cacheline-aligned");
 static_assert(offsetof(DistCore, task_payloads) % 64 == 0, "DistCore task_payloads must be cacheline-aligned");
 
-constexpr int32_t kCursorShards = 4;
 static_assert(PTO2_PACKED_OUTPUT_ALIGN >= kCacheLine);
 static_assert((PTO2_PACKED_OUTPUT_ALIGN % kCacheLine) == 0);
+
+constexpr int32_t kCursorShards = 8;
+constexpr int32_t kCursorShardMask = kCursorShards - 1;
+static_assert((kCursorShards & kCursorShardMask) == 0, "cursor shards must be a power of two");
 
 struct PaddedCursor {
     volatile int64_t v;
@@ -262,7 +282,7 @@ static_assert(sizeof(DistTaskCell) == kCacheLine);
 
 #if PTO_FDWIC_SHARED_MAP
 constexpr int32_t kSharedOutputMaxPerTask = 8;
-constexpr int32_t kSharedHeapShards = kCursorShards;
+constexpr int32_t kSharedHeapShards = 8;
 constexpr int32_t kSharedHeapActiveShards = kSharedHeapShards;
 constexpr int32_t kSharedRegionCap = kFlagCap;
 constexpr int32_t kSharedRegionBuckets = kMapBuckets;
@@ -344,6 +364,7 @@ struct DistGlobal {
 
     DistCore cores[kDistRuntimeMaxWorker];
 };
+static_assert(offsetof(DistGlobal, cube_cursor) % 64 == 0, "DistGlobal cube cursor must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, frontier) % 64 == 0, "DistGlobal frontier must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be cacheline-aligned");
 #if PTO_FDWIC_SHARED_MAP

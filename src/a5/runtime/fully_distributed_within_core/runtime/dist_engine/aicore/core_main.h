@@ -17,6 +17,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC void dist_core_main(__gm__ Runtime *runtime, int c
     if (self == nullptr) return;
     fdwic_swimlane_attach(runtime);
     trace_reset_core(self);
+    g_fdwic_block_won_enabled = false;
 
     if (!fatal_set()) {
         atomic_fetch_add<int64_t>(g_dist.started_count, 1);

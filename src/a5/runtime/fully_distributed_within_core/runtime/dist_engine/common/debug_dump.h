@@ -24,19 +24,6 @@ void dist_dump_state(int) {
         static_cast<long>(atomic_load(g_dist.replay_done, __ATOMIC_RELAXED)), g_dist.num_workers, g_dist.num_blocks,
         atomic_load(g_dist.fatal, __ATOMIC_RELAXED)
     );
-    fprintf(stderr, "cube_cursor[%d]=", kCursorShards);
-    for (int32_t s = 0; s < kCursorShards; s++)
-        fprintf(
-            stderr, "%ld%s", static_cast<long>(atomic_load(g_dist.cube_cursor[s].v, __ATOMIC_RELAXED)),
-            s + 1 < kCursorShards ? "," : ""
-        );
-    fprintf(stderr, " vector_cursor[%d]=", kCursorShards);
-    for (int32_t s = 0; s < kCursorShards; s++)
-        fprintf(
-            stderr, "%ld%s", static_cast<long>(atomic_load(g_dist.vector_cursor[s].v, __ATOMIC_RELAXED)),
-            s + 1 < kCursorShards ? "," : ""
-        );
-    fprintf(stderr, "\n");
     for (int32_t c = 0; c < g_dist.num_workers && c < RUNTIME_MAX_WORKER; c++) {
         DistCore &co = g_dist.cores[c];
         fprintf(

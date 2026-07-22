@@ -24,7 +24,7 @@ PTO_DEVICE_FUNC void wait_producer_ready(DistCore *self, const Tensor &t) {
     uint64_t wd = 0;
     while (!fatal_set()) {
         if (task_flag_ready(p, __ATOMIC_ACQUIRE)) break;
-        drain_block_won(self);
+        drain_block_won_if_enabled(self);
         if (drain_phase_b(self) == 0) {
             SPIN_WAIT_HINT();
             watchdog(wd);

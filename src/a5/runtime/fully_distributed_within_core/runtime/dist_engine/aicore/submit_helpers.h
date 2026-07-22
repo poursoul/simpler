@@ -58,6 +58,7 @@ PTO_DEVICE_FUNC void populate_won_slot_from_submit(
         b.scalar_count = ctx.scalar_count;                                                      \
         for (int32_t i = 0; i < ctx.tensor_count; i++)                                          \
             dist_submit_copy_arg_tensor(b.tensors[i], args, ctx, i);                            \
+        dist_populate_built_subtask_shared_refs(b, args, ctx);                                  \
         for (int32_t j = 0; j < ctx.scalar_count; j++)                                          \
             b.scalars[j] = args.scalar(j);                                                      \
         b.fanin_count = fc;                                                                     \

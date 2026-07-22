@@ -88,14 +88,27 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
     return false;
 }
 
+PTO_DEVICE_FUNC int32_t dist_submit_alloc_shard(int32_t task_id) { return task_id & kAllocCursorShardMask; }
+
 PTO_DEVICE_FUNC bool dist_submit_claim_alloc(DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
     if (ctx.self == nullptr || ctx.task_id < 0 || ctx.task_id >= kFlagCap) return false;
     const int32_t target_lane = ctx.task_id % kLaneCount;
     if (ctx.self->lane != target_lane) return false;
-    ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, g_dist.alloc_cursor[target_lane], kAllocCursorShardMask);
+    ctx.won = claim(g_dist.alloc_cursor[target_lane][dist_submit_alloc_shard(ctx.task_id)].v, ctx.task_id);
     return ctx.won;
 }
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool dist_submit_is_alloc_candidate(const DistSubmitCtx &ctx) {
+    if (ctx.self == nullptr || ctx.task_id < 0 || ctx.task_id >= kFlagCap) return false;
+    const int32_t target_lane = ctx.task_id % kLaneCount;
+    if (ctx.self->lane != target_lane) return false;
+    if (g_dist.num_blocks <= 0) return false;
+    const int32_t target_block = dist_submit_alloc_shard(ctx.task_id) % g_dist.num_blocks;
+    return ctx.self->block_id == target_block;
+}
+#endif
 
 PTO_DEVICE_FUNC bool dist_submit_claim(DistSubmitKind kind, const MixedKernels *mixed, DistSubmitCtx &ctx) {
     TRACE_SPAN_BEGIN(claim_trace);
@@ -521,6 +534,7 @@ DIST_API_ATTR PTO_DEVICE_FUNC TaskOutputTensors dist_alloc_tensors(PTO2Runtime *
 DIST_API_ATTR PTO_DEVICE_FUNC int32_t dist_alloc_outputs_impl(PTO2Runtime *, const L0TaskArgs &args) {
     DistSubmitCtx ctx;
     dist_submit_begin(nullptr, args, ctx);
+    if (!dist_submit_is_alloc_candidate(ctx)) return ctx.task_id;
     TRACE_SPAN_BEGIN(submit_trace);
     TRACE_LAP_RESET(ctx.self);
     drain_block_won_if_enabled(ctx.self);

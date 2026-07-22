@@ -694,7 +694,9 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
 #if defined(__CCE_AICORE__)
         dist_aicore_flush_region(&shared_cell.tensors[output_ordinal], sizeof(Tensor));
 #endif
-        atomic_exchange(shared_cell.last_writer[output_ordinal].v, static_cast<int64_t>(ctx.task_id), __ATOMIC_RELEASE);
+        atomic_fetch_max<int64_t>(
+            shared_cell.last_writer[output_ordinal].v, static_cast<int64_t>(ctx.task_id), __ATOMIC_ACQ_REL
+        );
         ctx.shared_result.add_output_ref(ctx.task_id, static_cast<int16_t>(output_ordinal));
 #endif
         output_offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);

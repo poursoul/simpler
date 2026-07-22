@@ -185,9 +185,7 @@ PTO_DEVICE_FUNC void complete_executed_task(__gm__ DistCore *self, int32_t task_
     }
     store_barrier();
     publish_task_flag(task_id);
-#if PTO_FDWIC_SHARED_MAP
-    advance_frontier_until(task_id, /*max_steps=*/8);
-#else
+#if !PTO_FDWIC_SHARED_MAP
     advance_frontier();
 #endif
     TRACE_SPAN_END(commit_trace, self, task_id, -1, TracePhase::Commit, 0, 0);

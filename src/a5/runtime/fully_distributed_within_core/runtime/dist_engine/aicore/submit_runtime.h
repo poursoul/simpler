@@ -25,10 +25,11 @@ PTO_DEVICE_FUNC bool dist_submit_self_is_lane(__gm__ DistCore *self, int32_t blo
     return false;
 }
 
-PTO_DEVICE_FUNC bool dist_submit_claim_cursor(__gm__ DistCore *self, int32_t task_id, __gm__ PaddedCursor *cursors) {
+PTO_DEVICE_FUNC bool
+dist_submit_claim_cursor(__gm__ DistCore *self, int32_t task_id, __gm__ PaddedCursor *cursors, int32_t shard_mask) {
     if (self == nullptr || task_id < 0 || task_id >= kFlagCap) return false;
     if (cursors == nullptr) return false;
-    return claim(cursors[task_id & kCursorShardMask].v, task_id);
+    return claim(cursors[task_id & shard_mask].v, task_id);
 }
 
 PTO_DEVICE_FUNC bool dist_submit_self_is_kernel_candidate(const MixedKernels &mixed, __gm__ DistCore *self) {
@@ -62,7 +63,8 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
         const int32_t anchor_lane = anchor_lane_for_mask(M);
         if (!dist_submit_self_is_lane(ctx.self, block, anchor_lane)) return false;
         __gm__ PaddedCursor *cursors = anchor_lane == LANE_AIC ? g_dist.cube_cursor : g_dist.vector_cursor;
-        ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, cursors);
+        const int32_t shard_mask = anchor_lane == LANE_AIC ? kCubeCursorShardMask : kVectorCursorShardMask;
+        ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, cursors, shard_mask);
         if (!ctx.won) return false;
         ctx.kernel_id = kernel_id_for_lane(mixed, anchor_lane);
         ctx.joint_init = true;
@@ -70,14 +72,14 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
     }
     if (lane_active(M, LANE_AIC)) {
         if (ctx.self->role != CoreType::AIC) return false;
-        ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, g_dist.cube_cursor);
+        ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, g_dist.cube_cursor, kCubeCursorShardMask);
         if (!ctx.won) return false;
         ctx.kernel_id = mixed.aic_kernel_id;
         return true;
     }
     if (lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) {
         if (ctx.self->role != CoreType::AIV) return false;
-        ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, g_dist.vector_cursor);
+        ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, g_dist.vector_cursor, kVectorCursorShardMask);
         if (!ctx.won) return false;
         const int32_t own_lane = lane_active(M, LANE_AIV0) ? LANE_AIV0 : LANE_AIV1;
         ctx.kernel_id = kernel_id_for_lane(mixed, own_lane);
@@ -89,7 +91,9 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
 PTO_DEVICE_FUNC bool dist_submit_claim_alloc(DistSubmitCtx &ctx) {
     ctx.kernel_id = INVALID_KERNEL_ID;
     if (ctx.self == nullptr || ctx.task_id < 0 || ctx.task_id >= kFlagCap) return false;
-    ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, g_dist.alloc_cursor);
+    const int32_t target_lane = ctx.task_id % kLaneCount;
+    if (ctx.self->lane != target_lane) return false;
+    ctx.won = dist_submit_claim_cursor(ctx.self, ctx.task_id, g_dist.alloc_cursor[target_lane], kAllocCursorShardMask);
     return ctx.won;
 }
 

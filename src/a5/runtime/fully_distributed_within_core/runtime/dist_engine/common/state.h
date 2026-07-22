@@ -263,9 +263,15 @@ static_assert(offsetof(DistCore, task_payloads) % 64 == 0, "DistCore task_payloa
 static_assert(PTO2_PACKED_OUTPUT_ALIGN >= kCacheLine);
 static_assert((PTO2_PACKED_OUTPUT_ALIGN % kCacheLine) == 0);
 
-constexpr int32_t kCursorShards = 8;
-constexpr int32_t kCursorShardMask = kCursorShards - 1;
-static_assert((kCursorShards & kCursorShardMask) == 0, "cursor shards must be a power of two");
+constexpr int32_t kCubeCursorShards = 8;
+constexpr int32_t kCubeCursorShardMask = kCubeCursorShards - 1;
+constexpr int32_t kVectorCursorShards = 16;
+constexpr int32_t kVectorCursorShardMask = kVectorCursorShards - 1;
+constexpr int32_t kAllocCursorShards = 8;
+constexpr int32_t kAllocCursorShardMask = kAllocCursorShards - 1;
+static_assert((kCubeCursorShards & kCubeCursorShardMask) == 0, "cube cursor shards must be a power of two");
+static_assert((kVectorCursorShards & kVectorCursorShardMask) == 0, "vector cursor shards must be a power of two");
+static_assert((kAllocCursorShards & kAllocCursorShardMask) == 0, "alloc cursor shards must be a power of two");
 
 struct PaddedCursor {
     volatile int64_t v;
@@ -323,9 +329,9 @@ static_assert(sizeof(SharedRegionMap) % 64 == 0, "SharedRegionMap must not share
 #endif
 
 struct DistGlobal {
-    PaddedCursor cube_cursor[kCursorShards];
-    PaddedCursor vector_cursor[kCursorShards];
-    PaddedCursor alloc_cursor[kCursorShards];
+    PaddedCursor cube_cursor[kCubeCursorShards];
+    PaddedCursor vector_cursor[kVectorCursorShards];
+    PaddedCursor alloc_cursor[kLaneCount][kAllocCursorShards];
 
     volatile int64_t frontier;
     uint8_t frontier_pad[kCacheLine - sizeof(int64_t)];

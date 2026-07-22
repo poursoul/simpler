@@ -38,10 +38,13 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
 #endif
 
-    for (int32_t s = 0; s < kCursorShards; s++) {
+    for (int32_t s = 0; s < kCubeCursorShards; s++)
         atomic_exchange(g_dist.cube_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
+    for (int32_t s = 0; s < kVectorCursorShards; s++)
         atomic_exchange(g_dist.vector_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
-        atomic_exchange(g_dist.alloc_cursor[s].v, int64_t{-1}, __ATOMIC_RELAXED);
+    for (int32_t s = 0; s < kAllocCursorShards; s++) {
+        for (int32_t lane = 0; lane < kLaneCount; lane++)
+            atomic_exchange(g_dist.alloc_cursor[lane][s].v, int64_t{-1}, __ATOMIC_RELAXED);
     }
 #if PTO_FDWIC_SHARED_MAP
     for (int32_t s = 0; s < kSharedHeapShards; s++) {

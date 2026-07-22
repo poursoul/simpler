@@ -390,6 +390,14 @@ PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
     return false;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool dist_submit_has_drain_work(__gm__ DistCore *self) {
+    if (self == nullptr) return false;
+    if (self->occupied_count != 0) return true;
+    return has_pending_won(self);
+}
+#endif
+
 PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {
     TRACE_LAP_RESET(self);
     if (!fatal_set()) {

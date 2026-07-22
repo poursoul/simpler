@@ -400,11 +400,11 @@ DIST_API_ATTR PTO_DEVICE_FUNC SubmitToken dist_presubmit_task_impl(PTO2Runtime *
     const ActiveMask M = mixed.to_active_mask();
     const uint8_t cmask = M.core_mask();
     if (ctx.self != nullptr && __builtin_popcount(cmask) == 1) {
-        const bool wrong_role = (lane_active(M, LANE_AIC) && ctx.self->role != CoreType::AIC) ||
-                                ((lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) &&
-                                 ctx.self->role != CoreType::AIV);
+        const bool wrong_role =
+            (lane_active(M, LANE_AIC) && ctx.self->role != CoreType::AIC) ||
+            ((lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) && ctx.self->role != CoreType::AIV);
         if (wrong_role) {
-            if (ctx.self->occupied_count != 0 || has_pending_won(ctx.self)) {
+            if (dist_submit_has_drain_work(ctx.self)) {
                 TRACE_LAP_RESET(ctx.self);
                 drain_block_won_if_enabled(ctx.self);
                 drain_phase_b(ctx.self);
@@ -414,10 +414,19 @@ DIST_API_ATTR PTO_DEVICE_FUNC SubmitToken dist_presubmit_task_impl(PTO2Runtime *
         }
     }
 #endif
+#if PTO_FDWIC_SHARED_MAP
+    if (dist_submit_has_drain_work(ctx.self)) {
+        TRACE_LAP_RESET(ctx.self);
+        drain_block_won_if_enabled(ctx.self);
+        drain_phase_b(ctx.self);
+        TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
+    }
+#else
     TRACE_LAP_RESET(ctx.self);
     drain_block_won_if_enabled(ctx.self);
     drain_phase_b(ctx.self);
     TRACE_LAP(ctx.self, ctx.task_id, -1, TracePhase::EfDrain);
+#endif
     const bool is_winner = dist_submit_claim(DistSubmitKind::Kernel, &mixed, ctx);
     return dist_submit_token_from_ctx(mixed, ctx);
 }

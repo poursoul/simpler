@@ -37,7 +37,13 @@ inline uint64_t dist_now_ns() {
 }
 #endif
 
-PTO_DEVICE_FUNC inline bool fatal_set() { return atomic_load(g_dist.fatal) != 0; }
+PTO_DEVICE_FUNC inline bool fatal_set() {
+#if PTO_FDWIC_SHARED_MAP
+    return false;
+#else
+    return atomic_load(g_dist.fatal) != 0;
+#endif
+}
 PTO_DEVICE_FUNC inline void set_fatal() { atomic_exchange(g_dist.fatal, 1); }
 
 PTO_DEVICE_FUNC inline void watchdog([[maybe_unused]] uint64_t &start_ns) {

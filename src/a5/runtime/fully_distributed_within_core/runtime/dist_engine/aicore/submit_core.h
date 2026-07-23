@@ -180,9 +180,7 @@ PTO_DEVICE_FUNC void advance_frontier() { advance_frontier_until(/*target_task_i
 
 PTO_DEVICE_FUNC void complete_executed_task(__gm__ DistCore *self, int32_t task_id) {
     TRACE_SPAN_BEGIN(commit_trace);
-    if (self != nullptr) {
-        store_task_vend(task_id, self->heap_next);
-    }
+    store_task_vend(task_id, self->heap_next);
     store_barrier();
     publish_task_flag(task_id);
 #if !PTO_FDWIC_SHARED_MAP
@@ -244,7 +242,7 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
 }
 
 PTO_DEVICE_FUNC int32_t drain_phase_b(__gm__ DistCore *self) {
-    if (self == nullptr || self->occupied_count == 0) return 0;
+    if (self->occupied_count == 0) return 0;
     int32_t freed = 0;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ RingSlot &s = self->slots[i];
@@ -334,7 +332,7 @@ PTO_DEVICE_FUNC void build_ring_slot_from_built_subtask(
 }
 
 PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
-    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
+    if (self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
     if (atomic_load(bw.any_pub) == 0) return false;
     bool drained = false;
@@ -375,7 +373,7 @@ PTO_DEVICE_FUNC bool drain_block_won_if_enabled(__gm__ DistCore *self) {
 }
 
 PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
-    if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
+    if (self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
     if (atomic_load(bw.any_pub) == 0) return false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
@@ -392,7 +390,6 @@ PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
 
 #if PTO_FDWIC_SHARED_MAP
 PTO_DEVICE_FUNC bool dist_submit_has_drain_work(__gm__ DistCore *self) {
-    if (self == nullptr) return false;
     if (self->occupied_count != 0) return true;
     return has_pending_won(self);
 }
@@ -452,14 +449,9 @@ dist_populate_built_subtask_shared_refs(__gm__ BuiltSubtask &, const L0TaskArgs 
 #endif
 
 PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx) {
-    ctx.self = self != nullptr ? self : g_self;
-    if (ctx.self == nullptr) {
-        ctx.task_id = kFlagCap;
-        ctx.payload = nullptr;
-    } else {
-        ctx.task_id = ctx.self->local_index++;
-        ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
-    }
+    ctx.self = self;
+    ctx.task_id = ctx.self->local_index++;
+    ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
 #if PTO_FDWIC_SHARED_MAP
     ctx.shared_result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
@@ -478,14 +470,9 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
 }
 
 PTO_DEVICE_FUNC void dist_submit_begin_presubmit(__gm__ DistCore *self, DistSubmitCtx &ctx) {
-    ctx.self = self != nullptr ? self : g_self;
-    if (ctx.self == nullptr) {
-        ctx.task_id = kFlagCap;
-        ctx.payload = nullptr;
-    } else {
-        ctx.task_id = ctx.self->local_index++;
-        ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
-    }
+    ctx.self = self;
+    ctx.task_id = ctx.self->local_index++;
+    ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
 #if PTO_FDWIC_SHARED_MAP
     ctx.shared_result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
@@ -506,9 +493,9 @@ PTO_DEVICE_FUNC void dist_submit_begin_presubmit(__gm__ DistCore *self, DistSubm
 PTO_DEVICE_FUNC void dist_submit_begin_from_token(
     __gm__ DistCore *self, const SubmitToken &tok, const L0TaskArgs &args, DistSubmitCtx &ctx
 ) {
-    ctx.self = self != nullptr ? self : g_self;
+    ctx.self = self;
     ctx.task_id = tok.task_id;
-    if (ctx.self == nullptr || ctx.task_id < 0) {
+    if (ctx.task_id < 0) {
         ctx.payload = nullptr;
     } else {
         ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
@@ -609,7 +596,7 @@ dist_submit_reserve_output_heap(DistSubmitCtx &ctx, uint64_t total, DistSubmitKi
     }
     const uint64_t global_vend =
         static_cast<uint64_t>(atomic_fetch_add<int64_t>(g_dist.shared_heap_vend.v, reserve)) + reserve;
-    if (ctx.self != nullptr) ctx.self->heap_next = global_vend;
+    ctx.self->heap_next = global_vend;
     task_base = static_cast<uint64_t>(shard) * shard_span + offset;
 #else
     task_base = PTO2_ALIGN_UP(ctx.self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
@@ -993,7 +980,6 @@ PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count
 
 #if !PTO_FDWIC_SHARED_MAP
 PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
-    if (self == nullptr) return;
     dist_tensor_map_advance_retire(self->map, task_id, g_dist.H);
 }
 

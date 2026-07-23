@@ -35,7 +35,9 @@ pipeline，使 shared 模式的 loser 热路径只剩 presubmit claim 和返回�
 - 每个 phase 的 shared 用例必须验证该阶段新增的 shared 功能，而不是通过
   private ABI、用例侧 `resolve`、或临时兼容 wrapper 绕过。
 - 每个 phase 合入前必须同时满足：
-  - shared 该阶段用例 sim 通过，sim 命令必须带 `--use-example-exec-time`。
+  - shared 该阶段用例 sim 功能验证通过。普通功能验证不能带
+    `--use-example-exec-time`，因为它会跳过 golden 比对；只有 PA sim 性能判断
+    才允许单独带该参数。
   - shared 该阶段用例上板通过，上板固定 `task-submit --device 6`。
   - default/private smoke 全量和 PA Case1 保持通过。
 - 如果某个 phase 还没有对应 shared 用例，不能声明该 phase 完成，只能声明
@@ -1475,7 +1477,7 @@ sim / 上板：
 
 ```bash
 python -m pytest examples/a5/fully_distributed_within_core/submit_dependency_smoke \
-  --platform a5sim --device 0-15 -p no:xdist -v --use-example-exec-time --enable-dep-gen \
+  --platform a5sim --device 0-15 -p no:xdist -v --manual include \
   --clone-protocol https --require-pto-isa --pto-session-timeout 90 \
   --pto-isa-commit ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
 ```
@@ -1484,10 +1486,49 @@ python -m pytest examples/a5/fully_distributed_within_core/submit_dependency_smo
 task-submit --timeout 90 --max-time 90 --device 6 \
   --run "source .venv/bin/activate && python -m pytest \
     examples/a5/fully_distributed_within_core/submit_dependency_smoke \
-    --platform a5 --device \$TASK_DEVICE -v --enable-dep-gen \
+    --platform a5 --device \$TASK_DEVICE -v --manual include \
     --clone-protocol ssh --require-pto-isa --pto-session-timeout 90 \
     --pto-isa-commit ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8"
 ```
+
+注意：
+
+- shared map 当前不支持用 `--enable-dep-gen` 作为验证手段，private map 也没有
+  支撑该参数。不要把 dep-gen 失败归因到 shared map 功能正确性。
+- `--enable-l2-swimlane` 只用于性能与泳道分析，不用于普通 golden 功能验证。
+- 上板固定使用单卡 `--device 6`，不是 `--device-num 6`。
+
+#### Phase 5 当前闭环记录
+
+截至 2026-07-23，当前代码已经完成 Phase 5 的 shared region 主功能闭环：
+
+- shared runtime clean build：`a5sim` / `a5` 通过，编译时使用
+  `CXXFLAGS='-DPTO_FDWIC_SHARED_MAP=1'`，并清理 a5 FDWIC build cache 后重建。
+- shared smoke sim 全量通过：
+  `simple_orch_smoke`、`shared_symbol_smoke`、`submit_dependency_smoke`，
+  使用 `--manual include`，不带 `--use-example-exec-time`，不带
+  `--enable-dep-gen`。
+- shared PA Case1 sim 通过 golden 验证，不带 `--use-example-exec-time`。
+- shared smoke 上板全量通过，固定 `task-submit --device 6`。
+- shared PA Case1 上板通过，`--enable-l2-swimlane` 生成
+  `outputs/TestPagedAttentionUnroll_Case1_20260723_150651/merged_swimlane.json`，
+  端到端 span 为 `2285.352us`。
+- `merged_swimlane.json` 已保留 FDWIC runtime 事件的 `flags` / `aux`，可以直接
+  区分 fanin/register/resolve 的来源。该次 PA 中 `register flags=0`、
+  `aux_sum=0`，说明 PA fresh-output 主路径没有 region register。
+- default/private clean build：`a5sim` / `a5` 通过，不带
+  `PTO_FDWIC_SHARED_MAP`。
+- default/private smoke sim/onboard 通过：
+  `simple_orch_smoke`、`submit_dependency_smoke`，使用 `--manual include`。
+- default/private PA Case1 sim/onboard 通过。
+
+仍需保留为后续阶段或限制说明的事项：
+
+- 当前 runtime 仍以 `kFlagCap` 为任务上限，不是完整 task ring generation
+  复用能力。
+- shared region intent 目前依赖 orchestration/codegen 显式选择
+  `*_with_region_intent` API；后续 codegen 需要系统接入，不能靠用例手写兜底。
+- mixed/joint task 的完整 shared map 支持属于 Phase 6，Phase 5 不声明完成。
 
 ### Phase 6: Joint task and follower launch integration
 

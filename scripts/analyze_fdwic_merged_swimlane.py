@@ -67,6 +67,14 @@ def event_func(event: TraceEvent) -> int:
     return int(event.get("args", {}).get("func_id", -1))
 
 
+def event_flags(event: TraceEvent) -> int:
+    return int(event.get("args", {}).get("flags", 0))
+
+
+def event_aux(event: TraceEvent) -> int:
+    return int(event.get("args", {}).get("aux", 0))
+
+
 def event_start(event: TraceEvent) -> float:
     return float(event.get("ts", 0.0))
 
@@ -198,6 +206,26 @@ def print_phase_breakdown(events: list[TraceEvent], phases: tuple[str, ...]) -> 
             )
 
 
+def print_phase_flags(events: list[TraceEvent], phases: tuple[str, ...]) -> None:
+    print("\nPhase flags:")
+    print(f"{'phase':>12s} {'flags':>7s} {'count':>7s} {'sum_us':>10s} {'avg_ns':>9s} {'aux_sum':>8s}")
+    rows: dict[tuple[str, int], list[float]] = defaultdict(list)
+    aux_sum: dict[tuple[str, int], int] = defaultdict(int)
+    for event in events:
+        phase = event_phase(event)
+        if phase not in phases:
+            continue
+        key = (phase, event_flags(event))
+        rows[key].append(float(event.get("dur", 0.0)))
+        aux_sum[key] += event_aux(event)
+    for (phase, flags), values in sorted(rows.items(), key=lambda item: (item[0][0], item[0][1])):
+        total = sum(values)
+        print(
+            f"{phase:>12s} {flags:7d} {len(values):7d} {total:10.3f} "
+            f"{total * 1000 / len(values):9.1f} {aux_sum[(phase, flags)]:8d}"
+        )
+
+
 def print_submit_exclusive(events: list[TraceEvent]) -> None:
     rows = submit_exclusive(events)
     values = [value for value, _event in rows]
@@ -313,6 +341,7 @@ def main() -> int:
     print(path)
     print(f"events {len(events)} global_span_us {span:.3f} start_us {start:.3f} end_us {end:.3f}")
     print_phase_totals(events, span)
+    print_phase_flags(events, ("fanin", "register", "resolve", "resolve_copy", "claim", "submit"))
     print_phase_breakdown(events, ("claim", "efdrain", "build", "materialize", "resolve", "resolve_copy"))
     print_submit_exclusive(events)
     print_gaps(events)

@@ -153,6 +153,8 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
         func_id = int(e["func_id"])
         task_id = int(e["task_id"])
         lane = int(e["lane"])
+        flags = int(e["flags"])
+        aux = int(e["aux"])
         if phase == "kernel" and func_id >= 0:
             name = f"{kernel_name(func_id)}#{task_id}"
             tid = lane + 3
@@ -176,7 +178,9 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
                     "func_id": func_id,
                     "core": int(e["core_id"]),
                     "block": int(e["block_id"]),
-                    "mc": int(e["flags"]) & 1,
+                    "flags": flags,
+                    "aux": aux,
+                    "mc": flags & 1,
                 },
             }
         )

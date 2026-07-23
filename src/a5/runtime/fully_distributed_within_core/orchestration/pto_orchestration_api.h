@@ -78,6 +78,24 @@ PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_aiv_task(int32_t kernel_id) {
 }
 
 #if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC inline SubmitToken
+rt_presubmit_task_with_region_intent(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
+    if (dist_is_fatal_query()) return SubmitToken{};
+    return dist_presubmit_task_with_region_intent_impl(nullptr, mixed_kernels, args);
+}
+
+PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_aic_task_with_region_intent(int32_t kernel_id, const L0TaskArgs &args) {
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    return rt_presubmit_task_with_region_intent(mk, args);
+}
+
+PTO_DEVICE_FUNC inline SubmitToken rt_presubmit_aiv_task_with_region_intent(int32_t kernel_id, const L0TaskArgs &args) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return rt_presubmit_task_with_region_intent(mk, args);
+}
+
 PTO_DEVICE_FUNC inline SharedTaskOutputs rt_submit_winner(const SubmitToken &tok, const L0TaskArgs &args) {
     if (dist_is_fatal_query()) return SharedTaskOutputs{};
     dist_submit_winner_impl(nullptr, tok, args);

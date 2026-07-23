@@ -262,6 +262,17 @@ static_assert(offsetof(DistCore, task_payloads) % 64 == 0, "DistCore task_payloa
 static_assert(PTO2_PACKED_OUTPUT_ALIGN >= kCacheLine);
 static_assert((PTO2_PACKED_OUTPUT_ALIGN % kCacheLine) == 0);
 
+#if PTO_FDWIC_SHARED_MAP
+struct PreparedDeps {
+    int32_t task_id;
+    int32_t fanin_count;
+    int32_t region_fanin_count;
+    int32_t fanin[kMaxFanin];
+    uint8_t pad[52];
+};
+static_assert(sizeof(PreparedDeps) == 128, "PreparedDeps must occupy two cachelines");
+#endif
+
 constexpr int32_t kCubeCursorShards = 8;
 constexpr int32_t kCubeCursorShardMask = kCubeCursorShards - 1;
 constexpr int32_t kVectorCursorShards = 16;
@@ -281,7 +292,12 @@ static_assert(sizeof(PaddedCursor) == kCacheLine, "PaddedCursor must occupy one 
 struct DistTaskCell {
     volatile int64_t flag;
     volatile uint64_t vend;
+#if PTO_FDWIC_SHARED_MAP
+    volatile int64_t deps_prepared;
+    uint8_t pad[kCacheLine - sizeof(int64_t) - sizeof(uint64_t) - sizeof(int64_t)];
+#else
     uint8_t pad[kCacheLine - sizeof(int64_t) - sizeof(uint64_t)];
+#endif
 };
 static_assert(sizeof(DistTaskCell) == kCacheLine);
 
@@ -367,6 +383,9 @@ struct DistGlobal {
     volatile int64_t started_count;
     uint8_t started_count_pad[kCacheLine - sizeof(int64_t)];
 
+#if PTO_FDWIC_SHARED_MAP
+    PreparedDeps prepared_deps[kDistRuntimeMaxWorker];
+#endif
     DistCore cores[kDistRuntimeMaxWorker];
 };
 static_assert(offsetof(DistGlobal, cube_cursor) % 64 == 0, "DistGlobal cube cursor must be cacheline-aligned");
@@ -375,6 +394,7 @@ static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be c
 #if PTO_FDWIC_SHARED_MAP
 static_assert(offsetof(DistGlobal, shared_outputs) % 64 == 0, "DistGlobal shared_outputs must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, shared_region) % 64 == 0, "DistGlobal shared_region must be cacheline-aligned");
+static_assert(offsetof(DistGlobal, prepared_deps) % 64 == 0, "DistGlobal prepared_deps must be cacheline-aligned");
 #endif
 static_assert(offsetof(DistGlobal, fatal) % 64 == 0, "DistGlobal fatal must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, blocks) % 64 == 0, "DistGlobal blocks must be cacheline-aligned");

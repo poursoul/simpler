@@ -52,6 +52,8 @@ struct PTO2Runtime;
 // direct AICore execution backend.
 PTO_DEVICE_FUNC SubmitToken dist_presubmit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed);
 #if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC SubmitToken
+dist_presubmit_task_with_region_intent_impl(PTO2Runtime *rt, const MixedKernels &mixed, const L0TaskArgs &args);
 PTO_DEVICE_FUNC
 void dist_submit_winner_impl(PTO2Runtime *rt, const SubmitToken &tok, const L0TaskArgs &args);
 #else

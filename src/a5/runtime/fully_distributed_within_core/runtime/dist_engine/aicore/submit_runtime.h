@@ -11,6 +11,11 @@
 
 namespace {
 
+#if PTO_FDWIC_SHARED_MAP
+constexpr uint8_t kSubmitTokenRegionsRegistered = 0x80;
+constexpr uint8_t kSubmitTokenDepsPrepared = 0x40;
+#endif
+
 PTO_DEVICE_FUNC int32_t anchor_lane_for_mask(const ActiveMask &M) {
     if (lane_active(M, LANE_AIC)) return LANE_AIC;
     if (lane_active(M, LANE_AIV0)) return LANE_AIV0;
@@ -323,6 +328,50 @@ PTO_DEVICE_FUNC int32_t dist_submit_register_shared_regions(const L0TaskArgs &ar
     return registered;
 }
 
+PTO_DEVICE_FUNC bool dist_submit_args_need_shared_region_intent(const L0TaskArgs &args) {
+    const int32_t n = args.tensor_count();
+    for (int32_t i = 0; i < n; i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag != TensorArgType::INOUT && tag != TensorArgType::OUTPUT_EXISTING) continue;
+        if (args.tensor(i).tensor_from_shared_output()) {
+            return true;
+        }
+        Tensor tensor;
+        dist_submit_arg_tensor_local(args, i, tensor);
+        if (dist_shared_region_register_relevant(tag, tensor)) return true;
+    }
+    return false;
+}
+
+PTO_DEVICE_FUNC void dist_submit_publish_shared_deps_prepared(int32_t task_id) {
+    if (task_id < 0 || task_id >= kFlagCap) return;
+    atomic_exchange(task_cell(task_id).deps_prepared, static_cast<int64_t>(task_id), __ATOMIC_RELEASE);
+}
+
+PTO_DEVICE_FUNC void dist_submit_wait_shared_deps_prepared(__gm__ DistCore *self, int32_t task_id) {
+    if (task_id < 0 || task_id >= kFlagCap) return;
+    while (!fatal_set() &&
+           atomic_load(task_cell(task_id).deps_prepared, __ATOMIC_ACQUIRE) != static_cast<int64_t>(task_id)) {
+        drain_block_won_if_enabled(self);
+        if (drain_phase_b(self) == 0) SPIN_WAIT_HINT();
+    }
+}
+
+PTO_DEVICE_FUNC int32_t dist_submit_prepare_shared_deps(const L0TaskArgs &args, const DistSubmitCtx &ctx) {
+    int32_t regions = 0;
+    int32_t fanin[kMaxFanin];
+    const int32_t fc = dist_submit_collect_shared_fanin(args, ctx, fanin, regions);
+    const int32_t registered = dist_submit_register_shared_regions(args, ctx);
+    __gm__ PreparedDeps &prepared = g_dist.prepared_deps[ctx.self->core_idx];
+    prepared.task_id = ctx.task_id;
+    prepared.fanin_count = fc;
+    prepared.region_fanin_count = regions;
+    for (int32_t i = 0; i < fc && i < kMaxFanin; i++)
+        prepared.fanin[i] = fanin[i];
+    dist_submit_publish_shared_deps_prepared(ctx.task_id);
+    return registered;
+}
+
 PTO_DEVICE_FUNC bool dist_submit_resolve_shared_arg_tensors(const L0TaskArgs &args, const DistSubmitCtx &ctx) {
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         if (args.tag(i) == TensorArgType::OUTPUT) continue;
@@ -421,6 +470,25 @@ DIST_API_ATTR PTO_DEVICE_FUNC SubmitToken dist_presubmit_task_impl(PTO2Runtime *
     return dist_submit_token_from_ctx(mixed, ctx);
 }
 
+#if PTO_FDWIC_SHARED_MAP
+DIST_API_ATTR PTO_DEVICE_FUNC SubmitToken
+dist_presubmit_task_with_region_intent_impl(PTO2Runtime *rt, const MixedKernels &mixed, const L0TaskArgs &args) {
+    SubmitToken tok = dist_presubmit_task_impl(rt, mixed);
+    const bool needs_intent = dist_submit_args_need_shared_region_intent(args);
+    if (!needs_intent) return tok;
+    if (!tok.won) {
+        dist_submit_wait_shared_deps_prepared(g_self, tok.task_id);
+        return tok;
+    }
+    DistSubmitCtx ctx;
+    dist_submit_begin_from_token(g_self, tok, args, ctx);
+    const int32_t region_register_count = dist_submit_prepare_shared_deps(args, ctx);
+    if (region_register_count >= 0) tok.active_mask |= kSubmitTokenRegionsRegistered;
+    tok.active_mask |= kSubmitTokenDepsPrepared;
+    return tok;
+}
+#endif
+
 DIST_API_ATTR PTO_DEVICE_FUNC
 #if PTO_FDWIC_SHARED_MAP
     void
@@ -438,14 +506,24 @@ DIST_API_ATTR PTO_DEVICE_FUNC
     if (!dist_submit_materialize_args(args, ctx, DistSubmitKind::Kernel)) return;
     TRACE_SPAN_END(materialize_trace, ctx.self, ctx.task_id, -1, TracePhase::Materialize, 0, 0);
     TRACE_SPAN_BEGIN(register_trace);
-    const int32_t region_register_count = dist_submit_register_shared_regions(args, ctx);
+    const bool regions_registered = (tok.active_mask & kSubmitTokenRegionsRegistered) != 0;
+    const int32_t region_register_count = regions_registered ? 0 : dist_submit_register_shared_regions(args, ctx);
     TRACE_SPAN_END(
-        register_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register, region_register_count > 0 ? 1u : 0u,
-        static_cast<uint32_t>(region_register_count)
+        register_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Register,
+        region_register_count > 0 ? 1u : (regions_registered ? 2u : 0u), static_cast<uint32_t>(region_register_count)
     );
     TRACE_SPAN_BEGIN(fanin_trace);
     int32_t region_fanin_count = 0;
-    ctx.fanin_count = dist_submit_collect_shared_fanin(args, ctx, ctx.fanin, region_fanin_count);
+    __gm__ PreparedDeps &prepared = g_dist.prepared_deps[ctx.self->core_idx];
+    const bool deps_prepared = (tok.active_mask & kSubmitTokenDepsPrepared) != 0;
+    if (deps_prepared && prepared.task_id == ctx.task_id) {
+        ctx.fanin_count = prepared.fanin_count;
+        region_fanin_count = prepared.region_fanin_count;
+        for (int32_t i = 0; i < ctx.fanin_count && i < kMaxFanin; i++)
+            ctx.fanin[i] = prepared.fanin[i];
+    } else {
+        ctx.fanin_count = dist_submit_collect_shared_fanin(args, ctx, ctx.fanin, region_fanin_count);
+    }
     TRACE_SPAN_END(
         fanin_trace, ctx.self, ctx.task_id, ctx.kernel_id, TracePhase::Fanin, region_fanin_count > 0 ? 3u : 1u,
         static_cast<uint32_t>(ctx.fanin_count)

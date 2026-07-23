@@ -65,25 +65,47 @@ output_view(OutputHandle source, const uint32_t view_shapes[], const uint32_t vi
     return source.view(view_shapes, view_offsets, ndims);
 }
 
+PTO_DEVICE_FUNC inline bool args_need_region_intent(const L0TaskArgs &args) {
+    const int32_t tensor_count = args.tensor_count();
+    for (int32_t i = 0; i < tensor_count; i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) return true;
+    }
+    return false;
+}
+
 PTO_DEVICE_FUNC inline SubmitOutputs
 submit_aic_task(int32_t func_id, const L0TaskArgs &args, uint32_t output_count = 0) {
-    SubmitToken tok = rt_presubmit_aic_task(func_id);
+    SubmitToken tok = args_need_region_intent(args) ? rt_presubmit_aic_task_with_region_intent(func_id, args) :
+                                                      rt_presubmit_aic_task(func_id);
     if (tok.won) return rt_submit_winner(tok, args);
     return rt_submit_loser(tok, output_count);
 }
 
 PTO_DEVICE_FUNC inline SubmitOutputs
 submit_aiv_task(int32_t func_id, const L0TaskArgs &args, uint32_t output_count = 0) {
-    SubmitToken tok = rt_presubmit_aiv_task(func_id);
+    SubmitToken tok = args_need_region_intent(args) ? rt_presubmit_aiv_task_with_region_intent(func_id, args) :
+                                                      rt_presubmit_aiv_task(func_id);
     if (tok.won) return rt_submit_winner(tok, args);
     return rt_submit_loser(tok, output_count);
 }
 
 PTO_DEVICE_FUNC inline SubmitOutputs
 submit_task(const MixedKernels &mixed, const L0TaskArgs &args, uint32_t output_count = 0) {
-    SubmitToken tok = rt_presubmit_task(mixed);
+    SubmitToken tok =
+        args_need_region_intent(args) ? rt_presubmit_task_with_region_intent(mixed, args) : rt_presubmit_task(mixed);
     if (tok.won) return rt_submit_winner(tok, args);
     return rt_submit_loser(tok, output_count);
+}
+
+PTO_DEVICE_FUNC inline void spin_before_region_register(uint64_t spins) {
+    volatile uint64_t sink = 0;
+    for (uint64_t i = 0; i < spins; i++) {
+        sink += i;
+    }
+    if (sink == UINT64_MAX) {
+        dcci(nullptr, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    }
 }
 #else
 using SubmitOutputs = TaskOutputTensors;
@@ -813,6 +835,63 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         mk.aic_kernel_id = FUNC_DCCI_ATOMIC_CLOBBER_AIC;
         mk.aiv0_kernel_id = FUNC_DCCI_ATOMIC_CLOBBER_AIV;
         submit_task(mk, probe_args);
+        return;
+    }
+
+    if (mode == 32) {
+        L0TaskArgs fill_args;
+        fill_args.add_input(input);
+        fill_args.add_inout(output);
+        fill_args.add_scalar(n);
+#if PTO_FDWIC_SHARED_MAP
+        SubmitToken fill_tok = rt_presubmit_aic_task_with_region_intent(FUNC_FILL_ALLOC_AIC, fill_args);
+        if (fill_tok.won) {
+            spin_before_region_register(static_cast<uint64_t>(12000000));
+            rt_submit_winner(fill_tok, fill_args);
+        } else {
+            rt_submit_loser(fill_tok, 0);
+        }
+#else
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+#endif
+
+        L0TaskArgs bump_args;
+        bump_args.add_inout(output);
+        bump_args.add_scalar(n);
+        submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_args);
+        return;
+    }
+
+    if (mode == 33) {
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+        L0TaskArgs alloc_args;
+        alloc_args.add_output(scratch_ci);
+        SubmitOutputs scratch_out;
+        OutputHandle scratch = alloc_output_handle(alloc_args, scratch_out);
+
+        L0TaskArgs fill_args;
+        fill_args.add_input(input);
+        fill_args.add_output(scratch);
+        fill_args.add_scalar(n);
+#if PTO_FDWIC_SHARED_MAP
+        SubmitToken fill_tok = rt_presubmit_aic_task_with_region_intent(FUNC_FILL_ALLOC_AIC, fill_args);
+        if (fill_tok.won) {
+            spin_before_region_register(static_cast<uint64_t>(12000000));
+            rt_submit_winner(fill_tok, fill_args);
+        } else {
+            rt_submit_loser(fill_tok, 0);
+        }
+#else
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_args);
+#endif
+
+        L0TaskArgs fanin_args;
+        fanin_args.add_input(scratch);
+        fanin_args.add_input(scratch);
+        fanin_args.add_input(scratch);
+        fanin_args.add_inout(output);
+        fanin_args.add_scalar(n);
+        submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         return;
     }
 

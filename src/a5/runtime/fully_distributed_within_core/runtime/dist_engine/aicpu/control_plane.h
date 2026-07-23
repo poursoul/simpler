@@ -68,6 +68,13 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
         }
 #endif
     }
+#if PTO_FDWIC_SHARED_MAP
+    for (int32_t i = 0; i < kDistRuntimeMaxWorker; i++) {
+        g_dist.prepared_deps[i].task_id = -1;
+        g_dist.prepared_deps[i].fanin_count = 0;
+        g_dist.prepared_deps[i].region_fanin_count = 0;
+    }
+#endif
     atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.replay_done, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.started_count, int64_t{0}, __ATOMIC_RELAXED);

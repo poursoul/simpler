@@ -152,6 +152,30 @@ PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
 
 PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w) { atomic_exchange(w.state.v, kWonStateFree); }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC void record_joint_launch_drained(int32_t block, int32_t lane) {
+    if (block < 0 || block >= kDistRuntimeMaxWorker || lane < 0 || lane >= kLaneCount) return;
+    atomic_fetch_add<int64_t>(g_dist.joint_launch_drained[block][lane].v, 1, __ATOMIC_ACQ_REL);
+}
+
+PTO_DEVICE_FUNC bool joint_launches_drained_for_lane(__gm__ DistCore *self) {
+    if (self->block_id < 0 || self->block_id >= kDistRuntimeMaxWorker || self->lane < 0 || self->lane >= kLaneCount)
+        return true;
+    const int64_t expected = atomic_load(g_dist.joint_launch_expected[self->block_id][self->lane].v, __ATOMIC_ACQUIRE);
+    const int64_t drained = atomic_load(g_dist.joint_launch_drained[self->block_id][self->lane].v, __ATOMIC_ACQUIRE);
+    return drained >= expected;
+}
+
+PTO_DEVICE_FUNC void publish_joint_followers_when_ready(__gm__ RingSlot &s) {
+    if (!s.is_multicore || s.won_block < 0 || s.won_slot < 0) return;
+    __gm__ WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
+    if (atomic_load(w.state.v) != kWonStateClaimed) return;
+    store_barrier();
+    publish_won_slot(w);
+    atomic_exchange(g_dist.blocks[s.won_block].any_pub, 1);
+}
+#endif
+
 PTO_DEVICE_FUNC int64_t load_frontier_for_advance() { return atomic_load(g_dist.frontier); }
 
 PTO_DEVICE_FUNC bool try_advance_frontier_to(int64_t &frontier, int64_t next) {
@@ -255,6 +279,9 @@ PTO_DEVICE_FUNC int32_t drain_phase_b(__gm__ DistCore *self) {
             }
         }
         if (!ready) continue;
+#if PTO_FDWIC_SHARED_MAP
+        publish_joint_followers_when_ready(s);
+#endif
         execute_slot(self, s);
         self->occupied_count--;
         freed++;
@@ -386,6 +413,9 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
         );
         self->occupied_count++;
         self->owned_total++;
+#if PTO_FDWIC_SHARED_MAP
+        record_joint_launch_drained(self->block_id, self->lane);
+#endif
         drained = true;
     }
     return drained;

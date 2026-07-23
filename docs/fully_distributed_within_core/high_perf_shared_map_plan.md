@@ -1545,35 +1545,49 @@ task-submit --timeout 90 --max-time 90 --device 6 \
 - follower swimlane 不出现 shared map lookup。
 - joint output descriptor 只发布一次。
 
-#### Phase 6 设计草案：winner-gated lane inbox
+#### Phase 6 当前实现：winner-gated `BlockWon` launch
 
-以下内容原本被误写入 `docs/fully_distributed_within_core.md`，现作为未验证的
-phase 6 草案保留在本 plan。它不是主设计文档的替代方案；只有在实现、sim、
-上板和泳道数据都闭环后，才能再讨论是否同步到主文档。
+当前实现没有新增独立 `lane_inbox` 结构，而是在已有 `BlockWon` / `WonSlot`
+handoff 上补齐 winner-gated launch 协议。这个选择的原因是：
 
-目标是把 joint task 的 follower 依赖解析从 follower 本地 fanin 轮询中移出：
+- `BlockWon` 已经提供 block 内 follower payload handoff、slot 反压和
+  `remaining` joint completion。
+- Phase 6 的核心问题不是必须更换容器，而是必须改变 publish 时机和 follower
+  退出条件。
+- 先在已有 handoff 上闭环，可以避免新增一套复用和完成协议，同时保留后续替换成
+  `lane_inbox` 的空间。
 
-- joint task 仍由 anchor/winner 负责 claim 和完整 fanin resolve。
+当前协议：
+
+- joint task 仍由 anchor/winner 负责 claim、shared args resolve 和完整 fanin
+  resolve。
 - anchor/winner 先把自己的子任务构建进私有环，槽内保留 `fanin[]`。
-- Phase B 中 anchor/winner 观察到 fanin 全部 ready 后，向同 block 的目标
-  follower lane 发布一条 launch。
-- follower 不参与该 joint task 的 claim，不查 shared map，不解析 fanin；
-  只 drain 自己 lane 的 inbox。
-- follower 收到 launch 后构建本核私有环槽，`fanin_count = 0`，表示依赖已经
-  由 winner 收敛完成。
+- shared build 下，winner 准备 follower `BuiltSubtask` 时已经把 shared
+  `FdwicOutputRef` resolve 成普通 `Tensor`，并且把 follower payload 的
+  `fanin_count` 置为 0。
+- winner 成功准备 follower payload 后，对对应 block/lane 的
+  `joint_launch_expected[block][lane]` 做原子递增。
+- Phase B 中 anchor/winner 观察到自身 fanin 全部 ready 后，才 publish
+  `WonSlot`，向同 block 的目标 follower lane 发 launch。
+- follower 不参与该 joint task 的 claim，不查 shared map，不解析 fanin；只 drain
+  自己 lane 的 `BlockWon` launch。
+- follower 成功 drain 到本地私有环后，对
+  `joint_launch_drained[block][lane]` 做原子递增。
+- replay 结束后，worker 不能只看 `pending_won == false` 就退出；shared build
+  下还必须满足本 lane 的 `joint_launch_drained >= joint_launch_expected`。
 - joint task 仍只有一个 task completion flag。各 co-owner 执行完自己的子任务后
-  递减同一个 `task_cell[N].remaining`，最后一个完成者发布 `flag(N)`。
+  递减同一个 `WonSlot.remaining`，最后一个完成者发布 `flag(N)`。
 
-建议状态模型：
+新增状态：
 
 ```text
-lane_inbox[block][lane]:
-    单 writer：该 block 的 anchor/winner
-    单 reader：对应 follower lane
-    entry：kernel/args/payload 引用，不携带 fanin 列表
-    push：release
-    pop：acquire
+DistGlobal:
+    joint_launch_expected[block][lane]  # 64B PaddedCursor
+    joint_launch_drained[block][lane]   # 64B PaddedCursor
 ```
+
+这些计数是 shared-only 状态，由 AICPU register 初始化为 0；每个 cell 独占
+cacheline，避免多个 lane 的退出轮询和 winner 发布互相污染。
 
 关键语义：
 
@@ -1585,6 +1599,11 @@ lane_inbox[block][lane]:
   `block.won[N]`；没有 launch 就继续执行本 lane 其它就绪工作。
 - anchor 超前时，launch 在 inbox 中累积；inbox 满时 anchor 在 claim/build
   前反压，先执行 Phase B / drain，不能无限超前。
+- 不允许用 `frontier >= final_task_id` 作为 follower 退出兜底。这个方案会让
+  PA 这类非 mixed 用例在收尾等待全局 task prefix，曾实测把 PA Case1 从约
+  2.3ms 劣化到约 7.2ms，属于错误设计。
+- PA 没有 joint launch，`joint_launch_expected == 0`，因此 Phase 6 退出协议
+  不应给 PA 增加额外等待。
 
 这个草案和 shared map 的关系：
 
@@ -1598,20 +1617,41 @@ lane_inbox[block][lane]:
 
 落地风险：
 
-- 当前 a5 代码仍可能使用 `BlockWon` / `WonSlot` 这类 block 内多方共享结构；
-  迁移到 `lane_inbox` 必须先审计现有 joint completion 和反压语义。
+- 当前实现继续使用 `BlockWon` / `WonSlot` 这类 block 内多方共享结构；后续若
+  迁移到独立 `lane_inbox`，必须保留 `expected/drained` 这类显式 launch
+  accounting，不能回到 “pending_won 瞬时为空即可退出”。
 - `remaining` 不应放在 inbox entry 中，否则多个 follower / anchor 的完成路径
   会重新引入 block-local 多方共享状态；应放在 per-task completion cell。
-- inbox entry 不能按 task id 简单取模覆盖；必须有容量反压和 release/acquire
-  可见性。
+- inbox entry / WonSlot 不能按 task id 简单取模覆盖；必须有容量反压和
+  release/acquire 可见性。
 - 不能用该草案规避 PA shared map 的真实性能问题。PA 的 `INOUT`/alias 路径必须
   由 shared map runtime 正向优化，不能在用例侧手动建立依赖。
+
+Phase 6 覆盖：
+
+- single producer -> joint consumer：
+  `A5SimBd36AicPairSlot1ToDualAivSymbol` /
+  `A5OnboardBd36AicPairSlot1ToDualAivSymbol`。
+- joint producer -> single consumer：
+  `A5SimBd36DualAivPairSlot1ToAicSymbol` /
+  `A5OnboardBd36DualAivPairSlot1ToAicSymbol`。
+- AIC+AIV mixed stress：
+  `A5SimBd36RepeatedMixedDelta29` 和
+  `A5SimBd36MixedWonReuseStress`。
+- full smoke：
+  `simple_orch_smoke`、`shared_symbol_smoke`、
+  `submit_dependency_smoke`。
+- PA Case1 上板泳道，确认 Phase 6 退出协议不污染非 mixed 热路径。
 
 sim / 上板目标：
 
 ```bash
-python -m pytest examples/a5/fully_distributed_within_core/simple_orch_smoke \
-  --platform a5sim --device 0-15 -p no:xdist -v --use-example-exec-time --clone-protocol https \
+python -m pytest \
+  examples/a5/fully_distributed_within_core/simple_orch_smoke \
+  examples/a5/fully_distributed_within_core/shared_symbol_smoke \
+  examples/a5/fully_distributed_within_core/submit_dependency_smoke \
+  --platform a5sim --device 0-15 -p no:xdist -v --manual include \
+  --clone-protocol https \
   --require-pto-isa --pto-session-timeout 90 \
   --pto-isa-commit ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
 ```
@@ -1620,10 +1660,15 @@ python -m pytest examples/a5/fully_distributed_within_core/simple_orch_smoke \
 task-submit --timeout 90 --max-time 90 --device 6 \
   --run "source .venv/bin/activate && python -m pytest \
     examples/a5/fully_distributed_within_core/simple_orch_smoke \
-    --platform a5 --device \$TASK_DEVICE -v --clone-protocol ssh \
+    examples/a5/fully_distributed_within_core/shared_symbol_smoke \
+    examples/a5/fully_distributed_within_core/submit_dependency_smoke \
+    --platform a5 --device \$TASK_DEVICE -p no:xdist -v --manual include \
+    --clone-protocol ssh \
     --require-pto-isa --pto-session-timeout 90 \
     --pto-isa-commit ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8"
 ```
+
+普通功能验证不能带 `--use-example-exec-time`，也不能使用 `--enable-dep-gen`。
 
 ### Phase 7: Full a5 shared-map qualification
 

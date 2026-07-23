@@ -358,6 +358,8 @@ struct DistGlobal {
     PaddedCursor shared_heap_vend;
     SharedOutputCell shared_outputs[kFlagCap];
     SharedRegionMap shared_region;
+    PaddedCursor joint_launch_expected[kDistRuntimeMaxWorker][kLaneCount];
+    PaddedCursor joint_launch_drained[kDistRuntimeMaxWorker][kLaneCount];
 #endif
 
     uint8_t *heap_base;
@@ -394,6 +396,14 @@ static_assert(offsetof(DistGlobal, tasks) % 64 == 0, "DistGlobal tasks must be c
 #if PTO_FDWIC_SHARED_MAP
 static_assert(offsetof(DistGlobal, shared_outputs) % 64 == 0, "DistGlobal shared_outputs must be cacheline-aligned");
 static_assert(offsetof(DistGlobal, shared_region) % 64 == 0, "DistGlobal shared_region must be cacheline-aligned");
+static_assert(
+    offsetof(DistGlobal, joint_launch_expected) % 64 == 0,
+    "DistGlobal joint_launch_expected must be cacheline-aligned"
+);
+static_assert(
+    offsetof(DistGlobal, joint_launch_drained) % 64 == 0,
+    "DistGlobal joint_launch_drained must be cacheline-aligned"
+);
 static_assert(offsetof(DistGlobal, prepared_deps) % 64 == 0, "DistGlobal prepared_deps must be cacheline-aligned");
 #endif
 static_assert(offsetof(DistGlobal, fatal) % 64 == 0, "DistGlobal fatal must be cacheline-aligned");

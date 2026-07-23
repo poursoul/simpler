@@ -73,6 +73,10 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
         g_dist.prepared_deps[i].task_id = -1;
         g_dist.prepared_deps[i].fanin_count = 0;
         g_dist.prepared_deps[i].region_fanin_count = 0;
+        for (int32_t lane = 0; lane < kLaneCount; lane++) {
+            atomic_exchange(g_dist.joint_launch_expected[i][lane].v, int64_t{0}, __ATOMIC_RELAXED);
+            atomic_exchange(g_dist.joint_launch_drained[i][lane].v, int64_t{0}, __ATOMIC_RELAXED);
+        }
     }
 #endif
     atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);

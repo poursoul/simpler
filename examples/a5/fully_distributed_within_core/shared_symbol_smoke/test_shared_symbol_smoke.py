@@ -130,6 +130,19 @@ class TestSharedSymbolSmoke(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 128, "mode": 5},
         },
+        {
+            "name": "A5SimBd36DualAivPairSlot1ToAicSymbol",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 6},
+        },
+        {
+            "name": "A5OnboardBd36DualAivPairSlot1ToAicSymbol",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 128, "mode": 6},
+        },
     ]
 
     def generate_args(self, params):
@@ -152,7 +165,7 @@ class TestSharedSymbolSmoke(SceneTestCase):
             args.output[:] = args.input * 4.0 + 22.0
         elif mode == 2:
             args.output[:] = args.input * 6.0 + 18.0
-        elif mode == 3:
+        elif mode in {3, 6}:
             args.output[:] = args.input * 8.0 + 30.0
         elif mode in {4, 5}:
             args.output[:] = args.input * 6.0 + 18.0

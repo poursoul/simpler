@@ -223,9 +223,17 @@ PTO_DEVICE_FUNC bool publish_joint_deposits(DistSubmitCtx &ctx, const MixedKerne
     dist_aicore_flush_region(w.lane, sizeof(w.lane));
 #endif
     store_won_remaining(w, ctx.joint_count);
+#if PTO_FDWIC_SHARED_MAP
+    for (int32_t lane = 0; lane < kLaneCount; lane++) {
+        if (lane == ctx.self->lane || !lane_active(M, lane)) continue;
+        atomic_fetch_add<int64_t>(g_dist.joint_launch_expected[ctx.joint_block][lane].v, 1, __ATOMIC_ACQ_REL);
+    }
+    return true;
+#else
     publish_won_slot(w);
     atomic_exchange(g_dist.blocks[ctx.joint_block].any_pub, 1);
     return true;
+#endif
 }
 
 PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block) {
@@ -399,7 +407,12 @@ PTO_DEVICE_FUNC void dist_submit_drain_to_completion(__gm__ DistCore *self) {
         const bool all_replayed = atomic_load(g_dist.replay_done) >= g_dist.num_workers;
         const bool ring_empty = self->occupied_count == 0;
         const bool pending = has_pending_won(self);
+#if PTO_FDWIC_SHARED_MAP
+        const bool launches_drained = joint_launches_drained_for_lane(self);
+        if (all_replayed && ring_empty && !pending && launches_drained) break;
+#else
         if (all_replayed && ring_empty && !pending) break;
+#endif
         if (freed == 0) SPIN_WAIT_HINT();
     }
 }

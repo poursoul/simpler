@@ -42,6 +42,19 @@ PTO_DEVICE_FUNC uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id
 }
 
 template <typename FaninArrPtr>
+PTO_DEVICE_FUNC void populate_built_subtask_fanin(__gm__ BuiltSubtask &b, FaninArrPtr fanin, int32_t fc) {
+#if PTO_FDWIC_SHARED_MAP
+    (void)fanin;
+    (void)fc;
+    b.fanin_count = 0;
+#else
+    b.fanin_count = fc;
+    for (int32_t k = 0; k < fc; k++)
+        b.fanin[k] = fanin[k];
+#endif
+}
+
+template <typename FaninArrPtr>
 PTO_DEVICE_FUNC bool populate_won_slot_from_submit(
     __gm__ WonSlot &w, int32_t task_id, const ActiveMask &M, const MixedKernels &mixed, int32_t own_lane,
     Runtime *runtime, const L0TaskArgs &args, const DistSubmitCtx &ctx, FaninArrPtr fanin, int32_t fc
@@ -61,9 +74,7 @@ PTO_DEVICE_FUNC bool populate_won_slot_from_submit(
         if (!dist_populate_built_subtask_shared_refs(b, args, ctx)) return false;               \
         for (int32_t j = 0; j < ctx.scalar_count; j++)                                          \
             b.scalars[j] = args.scalar(j);                                                      \
-        b.fanin_count = fc;                                                                     \
-        for (int32_t k = 0; k < fc; k++)                                                        \
-            b.fanin[k] = fanin[k];                                                              \
+        populate_built_subtask_fanin(b, fanin, fc);                                             \
         b.sub_block_id = ((L) == LANE_AIV1) ? 1 : 0;                                            \
         atomic_exchange(w.drained[(L)].v, kDrainedFree);                                        \
     } while (0)

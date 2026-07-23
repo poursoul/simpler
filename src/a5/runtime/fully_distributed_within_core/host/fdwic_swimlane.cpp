@@ -68,7 +68,10 @@ const char *phase_name(int32_t phase) {
     return "Unknown";
 }
 
-const char *core_type_name(uint32_t core_idx) { return (core_idx % 3 == 0) ? "aic" : "aiv"; }
+const char *core_type_name(const Runtime *runtime, uint32_t core_idx) {
+    if (runtime == nullptr || core_idx >= RUNTIME_MAX_WORKER) return "unknown";
+    return runtime->workers[core_idx].core_type == CoreType::AIC ? "aic" : "aiv";
+}
 
 std::string output_path(const Runtime *runtime) {
     std::string base = runtime->fdwic_swimlane_output_prefix_;
@@ -177,7 +180,19 @@ extern "C" int fdwic_swimlane_host_export(Runtime *runtime) {
     out << "    \"core_types\": [";
     for (uint32_t c = 0; c < header->num_cores; c++) {
         if (c > 0) out << ", ";
-        out << "\"" << core_type_name(c) << "\"";
+        out << "\"" << core_type_name(runtime, c) << "\"";
+    }
+    out << "],\n";
+    out << "    \"fdwic_record_counts\": [";
+    for (uint32_t c = 0; c < header->num_cores; c++) {
+        if (c > 0) out << ", ";
+        out << header->cores[c].count;
+    }
+    out << "],\n";
+    out << "    \"fdwic_record_dropped\": [";
+    for (uint32_t c = 0; c < header->num_cores; c++) {
+        if (c > 0) out << ", ";
+        out << header->cores[c].dropped;
     }
     out << "]\n";
     out << "  },\n";

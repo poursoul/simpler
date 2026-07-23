@@ -79,6 +79,10 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
     Onboard has no host wall/cpu split, so only a single device-time view is
     emitted.
     """
+    fdwic_pid_base = 100
+
+    def fdwic_pid(block_id):
+        return fdwic_pid_base + int(block_id)
 
     def lane_name(lane):
         return {0: "AIC", 1: "AIV0", 2: "AIV1"}.get(int(lane), "?")
@@ -118,8 +122,9 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
         core_by_block_lane.setdefault((block_id, lane), int(e["core_id"]))
 
     for block_id in blocks:
-        events.append({"ph": "M", "name": "process_name", "pid": block_id, "args": {"name": f"block{block_id}"}})
-        events.append({"ph": "M", "name": "process_sort_index", "pid": block_id, "args": {"sort_index": block_id}})
+        pid = fdwic_pid(block_id)
+        events.append({"ph": "M", "name": "process_name", "pid": pid, "args": {"name": f"fdwic.block{block_id}"}})
+        events.append({"ph": "M", "name": "process_sort_index", "pid": pid, "args": {"sort_index": pid}})
         for lane in (0, 1, 2):
             core_id = core_by_block_lane.get((block_id, lane))
             if core_id is None:
@@ -128,7 +133,7 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
                 {
                     "ph": "M",
                     "name": "thread_name",
-                    "pid": block_id,
+                    "pid": pid,
                     "tid": lane,
                     "args": {"name": f"{lane_name(lane)} (core{core_id})"},
                 }
@@ -137,7 +142,7 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
                 {
                     "ph": "M",
                     "name": "thread_name",
-                    "pid": block_id,
+                    "pid": pid,
                     "tid": lane + 3,
                     "args": {"name": f"{lane_name(lane)}·kernel (core{core_id})"},
                 }
@@ -161,7 +166,7 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
             {
                 "ph": "X",
                 "name": name,
-                "pid": int(e["block_id"]),
+                "pid": fdwic_pid(e["block_id"]),
                 "tid": tid,
                 "ts": round(float(e["start_time_us"]), 3),
                 "dur": round(float(e["duration_us"]), 3),
@@ -170,6 +175,7 @@ def _append_fdwic_dist_engine_events(events, fdwic_events, func_id_to_name=None)
                     "task_id": task_id,
                     "func_id": func_id,
                     "core": int(e["core_id"]),
+                    "block": int(e["block_id"]),
                     "mc": int(e["flags"]) & 1,
                 },
             }
@@ -2375,11 +2381,20 @@ def _resolve_output_path(args, input_path):
 def _print_verbose_data_info(data, verbose):
     """Print verbose summary of loaded performance data, including phase counts
     when present (l2_swimlane_level >= SCHED_PHASES)."""
+    metadata = data.get("metadata", {})
+    fdwic_dropped = metadata.get("fdwic_record_dropped") or []
+    dropped_total = sum(int(v) for v in fdwic_dropped)
+    if dropped_total:
+        print(f"Warning: FDWIC swimlane dropped {dropped_total} records; trace is incomplete.", file=sys.stderr)
     if not verbose:
         return
     print("\n=== Performance Data ===")
     print(f"  L2 perf level: {data['l2_swimlane_level']}")
     print(f"  Task Count: {len(data['tasks'])}")
+    if data.get("fdwic_events"):
+        print(f"  FDWIC Event Count: {len(data['fdwic_events'])}")
+    if fdwic_dropped:
+        print(f"  FDWIC Dropped Records: {dropped_total}")
     if data["tasks"]:
         start_times = [t["start_time_us"] for t in data["tasks"]]
         end_times = [t["end_time_us"] for t in data["tasks"]]
@@ -2407,7 +2422,7 @@ def _print_verbose_data_info(data, verbose):
         print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 
 
-def _load_func_names(args):
+def _load_func_names(args, input_path):
     """Load func_id→name mapping from --func-names JSON or -k kernel_config.py.
 
     Returns:
@@ -2437,6 +2452,21 @@ def _load_func_names(args):
             print()
         return func_names, None
 
+    name_maps = sorted(input_path.parent.glob("name_map_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if name_maps:
+        auto_path = name_maps[0]
+        if args.verbose:
+            print(f"Auto-loading func names from: {auto_path}")
+        func_names, orchestrator_name = load_func_names_json(auto_path)
+        if args.verbose:
+            print(f"  Loaded {len(func_names)} function name mappings:")
+            for func_id, name in sorted(func_names.items(), key=lambda x: int(x[0])):
+                print(f"    func_id={func_id}: {name}")
+            if orchestrator_name:
+                print(f"  Orchestrator: {orchestrator_name}")
+            print()
+        return func_names, orchestrator_name
+
     return {}, None
 
 
@@ -2453,7 +2483,7 @@ def main():
         data = read_perf_data(input_path)
         _print_verbose_data_info(data, args.verbose)
 
-        func_names, orchestrator_name = _load_func_names(args)
+        func_names, orchestrator_name = _load_func_names(args, input_path)
 
         output_path = _resolve_output_path(args, input_path)
 

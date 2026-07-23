@@ -40,6 +40,7 @@
 static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = nullptr;
 thread_local DistCore *g_self = nullptr;
+thread_local int32_t g_host_core_type = 0;
 thread_local bool g_fdwic_swimlane_enabled = false;
 thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
 thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
@@ -51,6 +52,7 @@ thread_local bool g_fdwic_block_won_enabled = false;
 static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = &g_dist_fallback;
 thread_local DistCore *g_self = nullptr;
+thread_local int32_t g_host_core_type = 0;
 thread_local bool g_fdwic_swimlane_enabled = false;
 thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
 thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;

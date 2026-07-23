@@ -286,6 +286,30 @@ PTO_DEVICE_FUNC inline bool lane_active(const ActiveMask &M, int32_t lane) {
     return M.subtask_active(static_cast<PTO2SubtaskSlot>(lane));
 }
 
+PTO_DEVICE_FUNC inline bool aic_lane_active(const ActiveMask &M) {
+    return (M.core_mask() & PTO2_SUBTASK_MASK_AIC) != 0;
+}
+
+PTO_DEVICE_FUNC inline bool aiv_lane_active(const ActiveMask &M) {
+    return (M.core_mask() & PTO2_SUBTASK_MASK_AIV) != 0;
+}
+
+PTO_DEVICE_FUNC inline bool dist_current_core_is_aic() {
+#if defined(__CCE_AICORE__)
+    return g_ccec_core_type == static_cast<int32_t>(CoreType::AIC);
+#else
+    return g_host_core_type == static_cast<int32_t>(CoreType::AIC);
+#endif
+}
+
+PTO_DEVICE_FUNC inline bool dist_current_core_is_aiv() {
+#if defined(__CCE_AICORE__)
+    return g_ccec_core_type == static_cast<int32_t>(CoreType::AIV);
+#else
+    return g_host_core_type == static_cast<int32_t>(CoreType::AIV);
+#endif
+}
+
 PTO_DEVICE_FUNC void build_ring_slot_from_built_subtask(
     __gm__ RingSlot &s, int32_t task_id, __gm__ const BuiltSubtask &b, int32_t won_block, int32_t won_slot
 ) {
@@ -393,6 +417,7 @@ PTO_DEVICE_FUNC bool dist_submit_has_drain_work(__gm__ DistCore *self) {
     if (self->occupied_count != 0) return true;
     return has_pending_won(self);
 }
+
 #endif
 
 PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {

@@ -13,8 +13,7 @@
 
 namespace {
 
-PTO_DEVICE_FUNC void dist_core_reset(__gm__ DistCore &self, CoreType r, int32_t block, int32_t lane_id) {
-    self.role = r;
+PTO_DEVICE_FUNC void dist_core_reset(__gm__ DistCore &self, int32_t block, int32_t lane_id) {
     self.block_id = block;
     self.lane = lane_id;
     self.sub_block_id = (lane_id == LANE_AIV1) ? 1 : 0;

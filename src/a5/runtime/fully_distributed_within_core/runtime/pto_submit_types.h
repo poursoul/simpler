@@ -41,9 +41,10 @@ enum class PTO2SubtaskSlot : uint8_t {
 /**
  * Subtask mask bits (for ActiveMask)
  */
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);         // 0x1
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);        // 0x2
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);        // 0x4
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);   // 0x1
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);  // 0x2
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);  // 0x4
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV = PTO2_SUBTASK_MASK_AIV0 | PTO2_SUBTASK_MASK_AIV1;
 inline constexpr uint8_t PTO2_SUBTASK_FLAG_SYNC_START = (1u << 3);  // 0x8: all blocks must launch atomically
 
 /**

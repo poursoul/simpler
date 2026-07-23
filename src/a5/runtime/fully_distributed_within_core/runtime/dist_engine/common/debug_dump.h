@@ -27,8 +27,8 @@ void dist_dump_state(int) {
     for (int32_t c = 0; c < g_dist.num_workers && c < RUNTIME_MAX_WORKER; c++) {
         DistCore &co = g_dist.cores[c];
         fprintf(
-            stderr, "core %d role=%d blk=%d lane=%d replayed=%d occ=%d owned=%d\n", c, static_cast<int>(co.role),
-            co.block_id, co.lane, co.local_index, co.occupied_count, co.owned_total
+            stderr, "core %d blk=%d lane=%d replayed=%d occ=%d owned=%d\n", c, co.block_id, co.lane, co.local_index,
+            co.occupied_count, co.owned_total
         );
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             RingSlot &s = co.slots[i];

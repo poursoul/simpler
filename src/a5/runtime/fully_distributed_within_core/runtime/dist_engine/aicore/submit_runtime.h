@@ -19,10 +19,7 @@ PTO_DEVICE_FUNC int32_t anchor_lane_for_mask(const ActiveMask &M) {
 }
 
 PTO_DEVICE_FUNC bool dist_submit_self_is_lane(__gm__ DistCore *self, int32_t block, int32_t lane) {
-    if (self->block_id != block || self->lane != lane) return false;
-    if (lane == LANE_AIC) return self->role == CoreType::AIC;
-    if (lane == LANE_AIV0 || lane == LANE_AIV1) return self->role == CoreType::AIV;
-    return false;
+    return self->block_id == block && self->lane == lane;
 }
 
 PTO_DEVICE_FUNC bool dist_submit_claim_cursor(int32_t task_id, __gm__ PaddedCursor *cursors, int32_t shard_mask) {
@@ -38,8 +35,8 @@ PTO_DEVICE_FUNC bool dist_submit_self_is_kernel_candidate(const MixedKernels &mi
     if (pc >= 2) {
         return dist_submit_self_is_lane(self, self->block_id, anchor_lane_for_mask(M));
     }
-    if (lane_active(M, LANE_AIC)) return self->role == CoreType::AIC;
-    if (lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) return self->role == CoreType::AIV;
+    if (aic_lane_active(M)) return dist_current_core_is_aic();
+    if (aiv_lane_active(M)) return dist_current_core_is_aiv();
     return false;
 }
 
@@ -68,15 +65,15 @@ PTO_DEVICE_FUNC bool dist_submit_claim_kernel(const MixedKernels &mixed, DistSub
         ctx.joint_init = true;
         return true;
     }
-    if (lane_active(M, LANE_AIC)) {
-        if (ctx.self->role != CoreType::AIC) return false;
+    if (aic_lane_active(M)) {
+        if (!dist_current_core_is_aic()) return false;
         ctx.won = dist_submit_claim_cursor(ctx.task_id, g_dist.cube_cursor, kCubeCursorShardMask);
         if (!ctx.won) return false;
         ctx.kernel_id = mixed.aic_kernel_id;
         return true;
     }
-    if (lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) {
-        if (ctx.self->role != CoreType::AIV) return false;
+    if (aiv_lane_active(M)) {
+        if (!dist_current_core_is_aiv()) return false;
         ctx.won = dist_submit_claim_cursor(ctx.task_id, g_dist.vector_cursor, kVectorCursorShardMask);
         if (!ctx.won) return false;
         const int32_t own_lane = lane_active(M, LANE_AIV0) ? LANE_AIV0 : LANE_AIV1;
@@ -394,10 +391,9 @@ DIST_API_ATTR PTO_DEVICE_FUNC SubmitToken dist_presubmit_task_impl(PTO2Runtime *
     const ActiveMask M = mixed.to_active_mask();
     const uint8_t cmask = M.core_mask();
     if (__builtin_popcount(cmask) == 1) {
-        const bool wrong_role =
-            (lane_active(M, LANE_AIC) && ctx.self->role != CoreType::AIC) ||
-            ((lane_active(M, LANE_AIV0) || lane_active(M, LANE_AIV1)) && ctx.self->role != CoreType::AIV);
-        if (wrong_role) {
+        const bool current_core_cannot_run_task =
+            (aic_lane_active(M) && !dist_current_core_is_aic()) || (aiv_lane_active(M) && !dist_current_core_is_aiv());
+        if (current_core_cannot_run_task) {
             if (dist_submit_has_drain_work(ctx.self)) {
                 TRACE_LAP_RESET(ctx.self);
                 drain_block_won_if_enabled(ctx.self);

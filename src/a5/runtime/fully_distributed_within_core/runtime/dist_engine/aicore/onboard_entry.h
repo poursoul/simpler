@@ -43,12 +43,15 @@ PTO_DEVICE_FUNC __gm__ DistCore *dist_aicore_attach_worker(__gm__ Runtime *runti
     dist_aicore_invalidate_region(&g_dist.shared_region.buckets[0], sizeof(g_dist.shared_region.buckets));
 #endif
 #endif
+#if !defined(__CCE_AICORE__)
+    g_host_core_type = core_type_int;
+#endif
     g_self = &g_dist.cores[core_idx];
 
     dist_aicore_invalidate_region(&g_dist.layout[core_idx], sizeof(CoreLayout));
     __gm__ const CoreLayout &layout_gm = g_dist.layout[core_idx];
     const CoreLayout lay = {layout_gm.block_id, layout_gm.lane};
-    dist_core_reset(*g_self, static_cast<CoreType>(core_type_int), lay.block_id, lay.lane);
+    dist_core_reset(*g_self, lay.block_id, lay.lane);
     g_self->core_idx = core_idx;
 
 #if defined(__CCE_AICORE__)

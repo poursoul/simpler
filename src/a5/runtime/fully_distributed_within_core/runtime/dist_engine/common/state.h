@@ -235,7 +235,6 @@ struct CoreLayout {
 };
 
 struct DistCore {
-    CoreType role;
     int32_t core_idx;
     int32_t block_id;
     int32_t lane;

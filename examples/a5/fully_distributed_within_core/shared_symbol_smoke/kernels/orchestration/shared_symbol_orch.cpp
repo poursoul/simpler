@@ -109,6 +109,10 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     } else if (effective_mode == 2) {
         producer_mk.aic_kernel_id = FUNC_PRODUCE_PAIR_AIC;
         consumer_mk.aiv0_kernel_id = FUNC_CONSUME_AIV;
+    } else if (effective_mode == 5) {
+        producer_mk.aic_kernel_id = FUNC_PRODUCE_PAIR_AIC;
+        consumer_mk.aiv0_kernel_id = FUNC_CONSUME_AIV;
+        consumer_mk.aiv1_kernel_id = FUNC_CONSUME_AIV;
     } else {
         producer_mk.aiv0_kernel_id = FUNC_PRODUCE_PAIR_AIV;
         consumer_mk.aic_kernel_id = FUNC_CONSUME_AIC;

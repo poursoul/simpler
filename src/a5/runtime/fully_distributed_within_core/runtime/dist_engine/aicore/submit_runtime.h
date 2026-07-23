@@ -204,19 +204,20 @@ PTO_DEVICE_FUNC bool dist_submit_wait_heap_capacity(DistSubmitCtx &ctx, DistSubm
 }
 #endif
 
-PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
-    if (!ctx.joint) return;
+PTO_DEVICE_FUNC bool publish_joint_deposits(DistSubmitCtx &ctx, const MixedKernels &mixed, const L0TaskArgs &args) {
+    if (!ctx.joint) return true;
     __gm__ WonSlot &w = g_dist.blocks[ctx.joint_block].slots[ctx.joint_slot];
     const ActiveMask M = mixed.to_active_mask();
-    populate_won_slot_from_submit(
-        w, ctx.task_id, M, mixed, ctx.self->lane,
+    if (!populate_won_slot_from_submit(
+            w, ctx.task_id, M, mixed, ctx.self->lane,
 #if defined(__CCE_AICORE__)
-        nullptr,
+            nullptr,
 #else
-        g_dist.runtime,
+            g_dist.runtime,
 #endif
-        args, ctx, ctx.fanin, ctx.fanin_count
-    );
+            args, ctx, ctx.fanin, ctx.fanin_count
+        ))
+        return false;
 #if defined(__CCE_AICORE__)
     dist_aicore_flush_region(&w.meta, sizeof(w.meta));
     dist_aicore_flush_region(w.lane, sizeof(w.lane));
@@ -224,6 +225,7 @@ PTO_DEVICE_FUNC void publish_joint_deposits(DistSubmitCtx &ctx, const MixedKerne
     store_won_remaining(w, ctx.joint_count);
     publish_won_slot(w);
     atomic_exchange(g_dist.blocks[ctx.joint_block].any_pub, 1);
+    return true;
 }
 
 PTO_DEVICE_FUNC int32_t wait_alloc_won_slot(__gm__ DistCore *self, int32_t block) {
@@ -260,7 +262,11 @@ dist_submit_build_winner_task(DistSubmitCtx &ctx, const MixedKernels &mixed, con
     __gm__ RingSlot *slot = dist_submit_alloc_slot(ctx.self);
     if (slot == nullptr) return;
 
-    if (ctx.joint) publish_joint_deposits(ctx, mixed, args);
+    if (ctx.joint && !publish_joint_deposits(ctx, mixed, args)) {
+        slot->occupied = false;
+        ctx.self->occupied_count--;
+        return;
+    }
     if (!dist_submit_build_winner_slot(ctx, args, slot)) return;
 }
 

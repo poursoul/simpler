@@ -457,20 +457,21 @@ struct DistSubmitCtx {
 };
 
 #if PTO_FDWIC_SHARED_MAP
-PTO_DEVICE_FUNC void
+PTO_DEVICE_FUNC bool
 dist_populate_built_subtask_shared_refs(__gm__ BuiltSubtask &b, const L0TaskArgs &args, const DistSubmitCtx &ctx) {
     b.shared_ref_mask = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         if (!args.tensor(i).tensor_from_shared_output()) continue;
         const FdwicOutputRef ref = args.tensor(i).shared_output_ref();
-        if (dist_try_resolve_shared_output_ref(ref, ctx.self, b.tensors[i])) continue;
-        b.shared_ref_mask |= 1u << static_cast<uint32_t>(i);
-        dist_shared_ref_copy(b.shared_refs[i], ref);
+        if (!dist_resolve_shared_output_ref(ref, ctx.self, b.tensors[i])) return false;
     }
+    return true;
 }
 #else
-PTO_DEVICE_FUNC void
-dist_populate_built_subtask_shared_refs(__gm__ BuiltSubtask &, const L0TaskArgs &, const DistSubmitCtx &) {}
+PTO_DEVICE_FUNC bool
+dist_populate_built_subtask_shared_refs(__gm__ BuiltSubtask &, const L0TaskArgs &, const DistSubmitCtx &) {
+    return true;
+}
 #endif
 
 PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx) {

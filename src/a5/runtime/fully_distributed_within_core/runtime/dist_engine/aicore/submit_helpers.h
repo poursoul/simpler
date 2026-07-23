@@ -42,7 +42,7 @@ PTO_DEVICE_FUNC uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id
 }
 
 template <typename FaninArrPtr>
-PTO_DEVICE_FUNC void populate_won_slot_from_submit(
+PTO_DEVICE_FUNC bool populate_won_slot_from_submit(
     __gm__ WonSlot &w, int32_t task_id, const ActiveMask &M, const MixedKernels &mixed, int32_t own_lane,
     Runtime *runtime, const L0TaskArgs &args, const DistSubmitCtx &ctx, FaninArrPtr fanin, int32_t fc
 ) {
@@ -58,7 +58,7 @@ PTO_DEVICE_FUNC void populate_won_slot_from_submit(
         b.scalar_count = ctx.scalar_count;                                                      \
         for (int32_t i = 0; i < ctx.tensor_count; i++)                                          \
             dist_submit_copy_arg_tensor(b.tensors[i], args, ctx, i);                            \
-        dist_populate_built_subtask_shared_refs(b, args, ctx);                                  \
+        if (!dist_populate_built_subtask_shared_refs(b, args, ctx)) return false;               \
         for (int32_t j = 0; j < ctx.scalar_count; j++)                                          \
             b.scalars[j] = args.scalar(j);                                                      \
         b.fanin_count = fc;                                                                     \
@@ -74,6 +74,7 @@ PTO_DEVICE_FUNC void populate_won_slot_from_submit(
     POPULATE_WON_LANE_FROM_SUBMIT(LANE_AIV0);
     POPULATE_WON_LANE_FROM_SUBMIT(LANE_AIV1);
 #undef POPULATE_WON_LANE_FROM_SUBMIT
+    return true;
 }
 
 PTO_DEVICE_FUNC int32_t alloc_won_slot(int32_t block) {

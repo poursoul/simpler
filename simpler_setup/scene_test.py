@@ -22,6 +22,7 @@ A scene test class declares three things:
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import hashlib
 import inspect
@@ -65,6 +66,39 @@ def _aicore_extra_cache_key(cache_key, sources: list[Path]) -> str:
         if source.is_file():
             h.update(source.read_bytes())
     return h.hexdigest()[:16]
+
+
+def _chip_callable_cache_path(spec, platform: str, runtime: str, cache_key, pto_isa_root: str) -> Path:
+    h = hashlib.sha256()
+    h.update(repr(cache_key).encode("utf-8"))
+    h.update(platform.encode("utf-8"))
+    h.update(runtime.encode("utf-8"))
+    h.update(os.environ.get("CXXFLAGS", "").encode("utf-8"))
+    h.update(str(Path(pto_isa_root).resolve()).encode("utf-8"))
+
+    orch = spec["orchestration"]
+    h.update(repr(orch.get("signature", [])).encode("utf-8"))
+    h.update(str(orch.get("function_name", "")).encode("utf-8"))
+    h.update(str(orch.get("config_name", "")).encode("utf-8"))
+    orch_source = Path(orch["source"]).resolve()
+    h.update(str(orch_source).encode("utf-8"))
+    h.update(orch_source.read_bytes())
+
+    for incore in spec["incores"]:
+        h.update(str(incore["func_id"]).encode("utf-8"))
+        h.update(str(incore["core_type"]).encode("utf-8"))
+        h.update(repr(incore.get("signature", [])).encode("utf-8"))
+        source = Path(incore["source"]).resolve()
+        h.update(str(source).encode("utf-8"))
+        h.update(source.read_bytes())
+
+    cache_dir = _project_root() / "build" / "cache" / "scene-callables"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{h.hexdigest()}.bin"
+
+
+def _chip_callable_to_bytes(chip_callable) -> bytes:
+    return ctypes.string_at(int(chip_callable.buffer_ptr()), int(chip_callable.buffer_size()))
 
 
 def _write_aicore_incore_wrapper(cache_key: str, incores: list[dict]) -> Path | None:
@@ -1095,6 +1129,17 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     incores = spec["incores"]
 
     pto_isa_root = ensure_pto_isa_root()
+    persistent_cache_path = _chip_callable_cache_path(spec, platform, runtime, cache_key, pto_isa_root)
+    if persistent_cache_path.is_file():
+        aicore_override = maybe_build_aicore_override(
+            cache_key, platform, runtime, orch["source"], incores, pto_isa_root=pto_isa_root
+        )
+        if aicore_override is not None:
+            _aicore_override_cache[cache_key] = aicore_override
+        chip_callable = ChipCallable.from_bytes(persistent_cache_path.read_bytes())
+        _compile_cache[cache_key] = chip_callable
+        return chip_callable
+
     kc = KernelCompiler(platform=platform)
     is_sim = platform.endswith("sim")
 
@@ -1122,6 +1167,9 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     )
     if aicore_override is not None:
         _aicore_override_cache[cache_key] = aicore_override
+    tmp_path = persistent_cache_path.with_suffix(".tmp")
+    tmp_path.write_bytes(_chip_callable_to_bytes(chip_callable))
+    tmp_path.replace(persistent_cache_path)
     _compile_cache[cache_key] = chip_callable
     return chip_callable
 
@@ -1826,7 +1874,7 @@ class SceneTestCase:
         os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(
             commit=args.pto_isa_commit,
             clone_protocol=args.clone_protocol,
-            update_if_exists=True,
+            update_if_exists=False,
             verbose=True,
         )
 

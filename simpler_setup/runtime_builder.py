@@ -402,7 +402,16 @@ class RuntimeBuilder:
 
         current_commit = _get_git_head(PROJECT_ROOT)
         fingerprint_paths = [*(Path(p) for p in include_dirs), *(Path(p) for p in source_dirs), *extra_sources]
-        current_state = _SOURCE_STATE_VERSION + ":" + current_commit + ":" + _source_fingerprint(fingerprint_paths)
+        current_cxxflags = os.environ.get("CXXFLAGS", "")
+        current_state = (
+            _SOURCE_STATE_VERSION
+            + ":"
+            + current_commit
+            + ":"
+            + current_cxxflags
+            + ":"
+            + _source_fingerprint(fingerprint_paths)
+        )
         lock_path = cache_dir / ".aicore-extra.lock"
         with open(lock_path, "w") as lock_fd:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)

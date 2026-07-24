@@ -689,6 +689,32 @@ class TestSubmitDependencySmoke(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 36},
             "params": {"n": 4096, "mode": 33},
         },
+        {
+            "name": "A5SimBd36LongInoutViewChain",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 34},
+        },
+        {
+            "name": "A5OnboardBd36LongInoutViewChain",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 34},
+        },
+        {
+            "name": "A5SimBd36MixedFreshAndInoutDeps",
+            "platforms": ["a5sim"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 35},
+        },
+        {
+            "name": "A5OnboardBd36MixedFreshAndInoutDeps",
+            "manual": True,
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "params": {"n": 4096, "mode": 35},
+        },
     ]
 
     def generate_args(self, params):
@@ -839,6 +865,23 @@ class TestSubmitDependencySmoke(SceneTestCase):
             return
         if mode == 33:
             args.output[:] = (args.input + 7.0) * 3.0 + 8.0
+            return
+        if mode == 34:
+            n = int(params["n"])
+            start = n // 4
+            end = start + n // 2
+            args.output[:] = args.input + 23.0
+            args.output[start:end] += 16.0
+            return
+        if mode == 35:
+            n = int(params["n"])
+            args.output[:] = args.input + 7.0
+            inout_start = n // 4
+            inout_end = inout_start + n // 4
+            fanin_start = n // 2
+            fanin_end = fanin_start + n // 4
+            args.output[inout_start:inout_end] += 8.0
+            args.output[fanin_start:fanin_end] = args.input[fanin_start:fanin_end] * 6.0 + 23.0
             return
         args.output[:] = args.input * 6.0 + 23.0
 

@@ -23,7 +23,6 @@
 #define FUNC_INSPECT_ALLOC_AIC 7
 #define FUNC_DCCI_ATOMIC_CLOBBER_AIC 8
 #define FUNC_DCCI_ATOMIC_CLOBBER_AIV 9
-
 #if !defined(__CCE_AICORE__) && !defined(dcci)
 #define dcci(...) \
     do {          \
@@ -891,6 +890,89 @@ aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
         fanin_args.add_input(scratch);
         fanin_args.add_inout(output);
         fanin_args.add_scalar(n);
+        submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
+        return;
+    }
+
+    if (mode == 34) {
+        L0TaskArgs fill_full_args;
+        fill_full_args.add_input(input);
+        fill_full_args.add_inout(output);
+        fill_full_args.add_scalar(n);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_full_args);
+
+        for (uint64_t i = 0; i < 16; i++) {
+            L0TaskArgs bump_full_args;
+            bump_full_args.add_inout(output);
+            bump_full_args.add_scalar(n);
+            submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_full_args);
+        }
+
+        const uint32_t sub_n = static_cast<uint32_t>(n / 2);
+        const uint32_t sub_shape[1] = {sub_n};
+        const uint32_t sub_offset[1] = {static_cast<uint32_t>(n / 4)};
+        Tensor sub_output = Tensor::view(output, sub_shape, sub_offset);
+        for (uint64_t i = 0; i < 16; i++) {
+            L0TaskArgs bump_sub_args;
+            bump_sub_args.add_inout(sub_output);
+            bump_sub_args.add_scalar(sub_n);
+            submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_sub_args);
+        }
+        return;
+    }
+
+    if (mode == 35) {
+        TensorCreateInfo scratch_ci(shape, 1, DataType::FLOAT32);
+
+        L0TaskArgs seed_args;
+        seed_args.add_input(input);
+        seed_args.add_output(scratch_ci);
+        seed_args.add_scalar(n);
+        SubmitOutputs seed_out = submit_aic_task(FUNC_FILL_ALLOC_AIC, seed_args, 1);
+        OutputHandle seed = output_handle(seed_out, 0);
+
+        L0TaskArgs left_args;
+        left_args.add_input(input);
+        left_args.add_output(scratch_ci);
+        left_args.add_scalar(n);
+        SubmitOutputs left_out = submit_aic_task(FUNC_MAKE_LEFT_AIC, left_args, 1);
+        OutputHandle left = output_handle(left_out, 0);
+
+        L0TaskArgs right_args;
+        right_args.add_input(input);
+        right_args.add_output(scratch_ci);
+        right_args.add_scalar(n);
+        SubmitOutputs right_out = submit_aiv_task(FUNC_MAKE_RIGHT_AIV, right_args, 1);
+        OutputHandle right = output_handle(right_out, 0);
+
+        L0TaskArgs fill_full_args;
+        fill_full_args.add_input(input);
+        fill_full_args.add_inout(output);
+        fill_full_args.add_scalar(n);
+        submit_aic_task(FUNC_FILL_ALLOC_AIC, fill_full_args);
+
+        const uint32_t quarter_n = static_cast<uint32_t>(n / 4);
+        const uint32_t quarter_shape[1] = {quarter_n};
+        const uint32_t inout_offset[1] = {static_cast<uint32_t>(n / 4)};
+        Tensor inout_view = Tensor::view(output, quarter_shape, inout_offset);
+        for (uint64_t i = 0; i < 8; i++) {
+            L0TaskArgs bump_sub_args;
+            bump_sub_args.add_inout(inout_view);
+            bump_sub_args.add_scalar(quarter_n);
+            submit_aiv_task(FUNC_BUMP_INOUT_AIV, bump_sub_args);
+        }
+
+        const uint32_t fanin_offset[1] = {static_cast<uint32_t>(n / 2)};
+        Tensor fanin_output = Tensor::view(output, quarter_shape, fanin_offset);
+        ViewHandle seed_view = output_view(seed, quarter_shape, fanin_offset, 1);
+        ViewHandle left_view = output_view(left, quarter_shape, fanin_offset, 1);
+        ViewHandle right_view = output_view(right, quarter_shape, fanin_offset, 1);
+        L0TaskArgs fanin_args;
+        fanin_args.add_input(seed_view);
+        fanin_args.add_input(left_view);
+        fanin_args.add_input(right_view);
+        fanin_args.add_inout(fanin_output);
+        fanin_args.add_scalar(quarter_n);
         submit_aiv_task(FUNC_FANIN_AIV, fanin_args);
         return;
     }

@@ -86,3 +86,23 @@ have caused it.
 This is the converse of the `running-onboard.md` anti-pattern (don't read
 "ci passed" as proof a fix worked): equally, don't wave away "ci failed"
 as someone else's problem.
+
+## 6. Write detailed commit messages for non-trivial changes
+
+Commit messages are part of the engineering record. For any non-trivial
+runtime, performance, tracing, design, test, or behavior change, do not use a
+one-line commit message. The subject may be short, but the body must preserve
+enough context for the next developer to understand why the change exists.
+
+Include:
+
+- **Context:** what work or investigation required the change.
+- **Root cause or design reason:** what bug, constraint, or measured behavior
+  drove the implementation.
+- **Changes:** the important code, test, or documentation changes.
+- **Validation:** commands run, artifacts inspected, or checks performed.
+
+If a commit amends or corrects earlier work, say so directly and explain what
+was wrong with the previous shape. If hooks are bypassed with `--no-verify`,
+record the hook failure or reason in the final response so the user can tell
+whether it was a code issue or an environment issue.

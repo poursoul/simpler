@@ -11,6 +11,7 @@
 
 #include "spin_hint.h"
 
+#include "aicpu/platform_regs.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
 
@@ -22,4 +23,5 @@
 #include "dist_engine/common/sim_control.h"    // NOLINT(build/include_subdir)
 
 #include "dist_engine/aicpu/log.h"            // NOLINT(build/include_subdir)
+#include "dist_engine/aicpu/config_parse.h"   // NOLINT(build/include_subdir)
 #include "dist_engine/aicpu/control_plane.h"  // NOLINT(build/include_subdir)

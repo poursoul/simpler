@@ -12,6 +12,7 @@
 #pragma once
 
 #include "dist_engine/common/target.h"
+#include "dist_engine/common/submit_pmu_types.h"
 #include "dist_engine/common/swimlane_types.h"
 
 // g_dist / g_self storage. The AICPU build owns the BSS DistGlobal and
@@ -30,32 +31,174 @@
 [[block_local]] static int32_t g_ccec_ordinal;
 [[block_local]] static bool g_ccec_valid_worker;
 [[block_local]] static bool g_fdwic_joint_submit_seen;
-[[block_local]] static bool g_fdwic_swimlane_enabled;
+#if DIST_TRACE_ENABLED
+[[block_local]] static uint32_t g_fdwic_swimlane_level;
 [[block_local]] static __gm__ FdwicSwimlaneHeader *g_fdwic_swimlane_header;
 [[block_local]] static __gm__ FdwicSwimlaneCoreState *g_fdwic_swimlane_core;
 [[block_local]] static __gm__ FdwicSwimlaneRecord *g_fdwic_swimlane_records;
 [[block_local]] static uint32_t g_fdwic_swimlane_records_per_core;
+[[block_local]] static FdwicAtomicPollBurst g_fdwic_atomic_poll_burst;
+[[block_local]] static uint32_t g_fdwic_atomic_calls;
+[[block_local]] static uint32_t g_fdwic_poll_calls;
+[[block_local]] static uint32_t g_fdwic_poll_batch_records;
+[[block_local]] static bool g_fdwic_atomic_counter_overflow;
+#endif
+#if PTO_FDWIC_PERF_CLOCK
+[[block_local]] static __gm__ FdwicSwimlaneCoreState *g_fdwic_perf_clock_core;
+[[block_local]] static uint64_t g_fdwic_perf_clock_first_submit;
+[[block_local]] static uint64_t g_fdwic_perf_clock_last_submit;
+[[block_local]] static uint32_t g_fdwic_perf_clock_expected_submits;
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+[[block_local]] static uint64_t g_fdwic_perf_clock_kernel_ticks;
+[[block_local]] static uint32_t g_fdwic_perf_clock_kernel_calls;
+[[block_local]] static uint32_t g_fdwic_perf_clock_kernel_status;
+#endif
+#endif
+#if PTO_FDWIC_SUBMIT_PMU
+[[block_local]] static __gm__ FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core;
+[[block_local]] static __gm__ FdwicSubmitPmuPhaseCoreData *g_fdwic_submit_pmu_phase_core;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_reg_base;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_start_tick;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_end_tick;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_scalar_elapsed_ticks;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_scalar_segment_begin_tick;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_return_ready_atomic_begin_tick;
+[[block_local]] static uint64_t g_fdwic_submit_pmu_total_cycles;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_scalar_busy;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_icache_requests;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_icache_misses;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_expected_submits;
+[[block_local]] static uint32_t g_fdwic_submit_pmu_status;
+[[block_local]] static bool g_fdwic_submit_pmu_started;
+[[block_local]] static bool g_fdwic_submit_pmu_stopped;
+[[block_local]] static bool g_fdwic_submit_pmu_gate_running;
+[[block_local]] static bool g_fdwic_submit_pmu_gate_error;
+[[block_local]] static bool g_fdwic_submit_pmu_return_ready_atomic_active;
+[[block_local]] static bool g_fdwic_submit_pmu_return_ready_atomic_phase_armed;
+[[block_local]] static bool g_fdwic_submit_pmu_return_ready_atomic_seen;
+[[block_local]] static bool g_fdwic_submit_pmu_return_ready_atomic_time_error;
+[[block_local]] static FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase;
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+// 每个局部 phase 独占的排除计数；none 不分配 phase sidecar，也不需要该状态。
+[[block_local]] static uint32_t g_fdwic_submit_pmu_excluded_kernel_calls;
+#endif
+#endif
 #define g_dist (*g_dist_ptr)
 #elif defined(__CPU_SIM)
 static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = nullptr;
 thread_local DistCore *g_self = nullptr;
 thread_local bool g_fdwic_joint_submit_seen = false;
-thread_local bool g_fdwic_swimlane_enabled = false;
+#if DIST_TRACE_ENABLED
+thread_local uint32_t g_fdwic_swimlane_level = 0;
 thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
 thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
 thread_local FdwicSwimlaneRecord *g_fdwic_swimlane_records = nullptr;
 thread_local uint32_t g_fdwic_swimlane_records_per_core = 0;
+thread_local FdwicAtomicPollBurst g_fdwic_atomic_poll_burst = {};
+thread_local uint32_t g_fdwic_atomic_calls = 0;
+thread_local uint32_t g_fdwic_poll_calls = 0;
+thread_local uint32_t g_fdwic_poll_batch_records = 0;
+thread_local bool g_fdwic_atomic_counter_overflow = false;
+#endif
+#if PTO_FDWIC_PERF_CLOCK
+thread_local FdwicSwimlaneCoreState *g_fdwic_perf_clock_core = nullptr;
+thread_local uint64_t g_fdwic_perf_clock_first_submit = 0;
+thread_local uint64_t g_fdwic_perf_clock_last_submit = 0;
+thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+thread_local uint64_t g_fdwic_perf_clock_kernel_ticks = 0;
+thread_local uint32_t g_fdwic_perf_clock_kernel_calls = 0;
+thread_local uint32_t g_fdwic_perf_clock_kernel_status = 0;
+#endif
+#endif
+#if PTO_FDWIC_SUBMIT_PMU
+thread_local FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core = nullptr;
+thread_local FdwicSubmitPmuPhaseCoreData *g_fdwic_submit_pmu_phase_core = nullptr;
+thread_local uint64_t g_fdwic_submit_pmu_reg_base = 0;
+thread_local uint64_t g_fdwic_submit_pmu_start_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_end_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_scalar_elapsed_ticks = 0;
+thread_local uint64_t g_fdwic_submit_pmu_scalar_segment_begin_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks = 0;
+thread_local uint64_t g_fdwic_submit_pmu_return_ready_atomic_begin_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_total_cycles = 0;
+thread_local uint32_t g_fdwic_submit_pmu_scalar_busy = 0;
+thread_local uint32_t g_fdwic_submit_pmu_icache_requests = 0;
+thread_local uint32_t g_fdwic_submit_pmu_icache_misses = 0;
+thread_local uint32_t g_fdwic_submit_pmu_expected_submits = 0;
+thread_local uint32_t g_fdwic_submit_pmu_status = 0;
+thread_local bool g_fdwic_submit_pmu_started = false;
+thread_local bool g_fdwic_submit_pmu_stopped = false;
+thread_local bool g_fdwic_submit_pmu_gate_running = false;
+thread_local bool g_fdwic_submit_pmu_gate_error = false;
+thread_local bool g_fdwic_submit_pmu_return_ready_atomic_active = false;
+thread_local bool g_fdwic_submit_pmu_return_ready_atomic_phase_armed = false;
+thread_local bool g_fdwic_submit_pmu_return_ready_atomic_seen = false;
+thread_local bool g_fdwic_submit_pmu_return_ready_atomic_time_error = false;
+thread_local FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase = {};
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+thread_local uint32_t g_fdwic_submit_pmu_excluded_kernel_calls = 0;
+#endif
+#endif
 #define g_dist (*g_dist_ptr)
 #else
 static DistGlobal g_dist_fallback;
 static DistGlobal *g_dist_ptr = &g_dist_fallback;
 thread_local DistCore *g_self = nullptr;
 thread_local bool g_fdwic_joint_submit_seen = false;
-thread_local bool g_fdwic_swimlane_enabled = false;
+#if DIST_TRACE_ENABLED
+thread_local uint32_t g_fdwic_swimlane_level = 0;
 thread_local FdwicSwimlaneHeader *g_fdwic_swimlane_header = nullptr;
 thread_local FdwicSwimlaneCoreState *g_fdwic_swimlane_core = nullptr;
 thread_local FdwicSwimlaneRecord *g_fdwic_swimlane_records = nullptr;
 thread_local uint32_t g_fdwic_swimlane_records_per_core = 0;
+thread_local FdwicAtomicPollBurst g_fdwic_atomic_poll_burst = {};
+thread_local uint32_t g_fdwic_atomic_calls = 0;
+thread_local uint32_t g_fdwic_poll_calls = 0;
+thread_local uint32_t g_fdwic_poll_batch_records = 0;
+thread_local bool g_fdwic_atomic_counter_overflow = false;
+#endif
+#if PTO_FDWIC_PERF_CLOCK
+thread_local FdwicSwimlaneCoreState *g_fdwic_perf_clock_core = nullptr;
+thread_local uint64_t g_fdwic_perf_clock_first_submit = 0;
+thread_local uint64_t g_fdwic_perf_clock_last_submit = 0;
+thread_local uint32_t g_fdwic_perf_clock_expected_submits = 0;
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+thread_local uint64_t g_fdwic_perf_clock_kernel_ticks = 0;
+thread_local uint32_t g_fdwic_perf_clock_kernel_calls = 0;
+thread_local uint32_t g_fdwic_perf_clock_kernel_status = 0;
+#endif
+#endif
+#if PTO_FDWIC_SUBMIT_PMU
+thread_local FdwicSubmitPmuCoreData *g_fdwic_submit_pmu_core = nullptr;
+thread_local FdwicSubmitPmuPhaseCoreData *g_fdwic_submit_pmu_phase_core = nullptr;
+thread_local uint64_t g_fdwic_submit_pmu_reg_base = 0;
+thread_local uint64_t g_fdwic_submit_pmu_start_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_end_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_scalar_elapsed_ticks = 0;
+thread_local uint64_t g_fdwic_submit_pmu_scalar_segment_begin_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_scalar_segment_excluded_atomic_ticks = 0;
+thread_local uint64_t g_fdwic_submit_pmu_return_ready_atomic_begin_tick = 0;
+thread_local uint64_t g_fdwic_submit_pmu_total_cycles = 0;
+thread_local uint32_t g_fdwic_submit_pmu_scalar_busy = 0;
+thread_local uint32_t g_fdwic_submit_pmu_icache_requests = 0;
+thread_local uint32_t g_fdwic_submit_pmu_icache_misses = 0;
+thread_local uint32_t g_fdwic_submit_pmu_expected_submits = 0;
+thread_local uint32_t g_fdwic_submit_pmu_status = 0;
+thread_local bool g_fdwic_submit_pmu_started = false;
+thread_local bool g_fdwic_submit_pmu_stopped = false;
+thread_local bool g_fdwic_submit_pmu_gate_running = false;
+thread_local bool g_fdwic_submit_pmu_gate_error = false;
+thread_local bool g_fdwic_submit_pmu_return_ready_atomic_active = false;
+thread_local bool g_fdwic_submit_pmu_return_ready_atomic_phase_armed = false;
+thread_local bool g_fdwic_submit_pmu_return_ready_atomic_seen = false;
+thread_local bool g_fdwic_submit_pmu_return_ready_atomic_time_error = false;
+thread_local FdwicSubmitPmuPhaseAccumulator g_fdwic_submit_pmu_phase = {};
+#if PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+thread_local uint32_t g_fdwic_submit_pmu_excluded_kernel_calls = 0;
+#endif
+#endif
 #define g_dist (*g_dist_ptr)
 #endif

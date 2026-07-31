@@ -11,115 +11,90 @@
 
 #pragma once
 
+#include "dist_engine/aicore/private_tensor_map.h"
+#if PTO_FDWIC_SHARED_MAP
+#include "dist_engine/aicore/shared_tensor_map.h"
+#endif
+
 namespace {
 
-PTO_DEVICE_FUNC void dist_tensor_map_reset(__gm__ DistTensorMap &self) {
-    self.free_head = -1;
-    self.high_water = 0;
-    self.alive_floor = 0;
-    self.cleaned_upto = 0;
-    for (int32_t i = 0; i < kMapBuckets; i++)
-        self.buckets[i] = -1;
-    for (int32_t i = 0; i < kTaskWindow; i++)
-        self.task_heads[i] = -1;
+/*
+ * Submit uses this facade instead of reading DistCore::map directly. Both
+ * modes share hash/range/slot semantics, while ownership and publication
+ * discipline remain compile-time choices:
+ *
+ * - private resets and retires one map per worker; every worker publishes its
+ *   task outputs into its own copy;
+ * - shared is reset once by AICPU; only the exact-turn Submit winner reads or
+ *   publishes the global map. CPU-sim scalar data access has no Claim/turn
+ *   proof and remains explicitly unsupported under the shared identity.
+ *
+ * Keeping the split here prevents loser paths and worker reset from
+ * accidentally touching the shared single copy.
+ */
+PTO_DEVICE_FUNC void dist_tensor_map_reset_worker(__gm__ DistCore &worker) {
+#if PTO_FDWIC_SHARED_MAP
+    (void)worker;
+#else
+    dist_private_tensor_map_reset(worker.map);
+#endif
 }
 
-PTO_DEVICE_FUNC uint32_t dist_tensor_map_hash(uint64_t addr) {
-    addr *= 0x9E3779B97F4A7C15ULL;
-    return static_cast<uint32_t>(addr >> (64 - kMapBucketShift));
+PTO_DEVICE_FUNC void dist_tensor_map_prepare_task(__gm__ DistCore &worker, int32_t task_id, int32_t history) {
+#if PTO_FDWIC_SHARED_MAP
+    (void)worker;
+    (void)task_id;
+    (void)history;
+#else
+    dist_private_tensor_map_advance_retire(worker.map, task_id, history);
+#endif
 }
+
+#if PTO_FDWIC_SHARED_MAP
+template <typename TensorRef>
+PTO_DEVICE_FUNC bool dist_tensor_map_lookup_for_submit_winner(
+    __gm__ DistCore &worker, const TensorRef &tensor, int32_t consumer_task_id, int32_t &producer
+) {
+    (void)worker;
+    bool protocol_ok = false;
+    producer =
+        dist_shared_tensor_map_lookup_tensor(g_dist.shared_tensor_map, tensor, consumer_task_id, g_dist.H, protocol_ok);
+    return protocol_ok;
+}
+#endif
 
 template <typename TensorRef>
-PTO_DEVICE_FUNC void dist_tensor_map_byte_range(const TensorRef &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
-    const uint64_t esz = get_element_size(t.dtype);
-    addr = t.buffer.addr;
-    lo = t.start_offset * esz;
-    uint64_t ext;
-    if (t.is_contiguous) {
-        ext = 1;
-        for (uint32_t i = 0; i < t.ndims; i++)
-            ext *= t.shapes[i];
-    } else {
-        ext = t.extent_elem_cache;
-    }
-    hi = (t.start_offset + ext) * esz;
-}
-
-PTO_DEVICE_FUNC int32_t dist_tensor_map_alloc_slot(__gm__ DistTensorMap &self) {
-    if (self.free_head >= 0) {
-        const int32_t s = self.free_head;
-        self.free_head = self.entries[s].next_in_bucket;
-        return s;
-    }
-    if (self.high_water < kMapCap) return self.high_water++;
+PTO_DEVICE_FUNC int32_t
+dist_tensor_map_lookup_for_task(__gm__ DistCore &worker, const TensorRef &tensor, int32_t consumer_task_id) {
+#if PTO_FDWIC_SHARED_MAP
+    (void)worker;
+    (void)tensor;
+    (void)consumer_task_id;
+    set_fatal_code(PTO2_ERROR_TENSORMAP_PROTOCOL);
     return -1;
+#else
+    (void)consumer_task_id;
+    return dist_private_tensor_map_lookup(worker.map, tensor);
+#endif
 }
 
-PTO_DEVICE_FUNC void dist_tensor_map_free_entry(__gm__ DistTensorMap &self, int32_t idx) {
-    __gm__ MapEntry &e = self.entries[idx];
-    if (e.prev_in_bucket < 0) self.buckets[e.bucket] = e.next_in_bucket;
-    else self.entries[e.prev_in_bucket].next_in_bucket = e.next_in_bucket;
-    if (e.next_in_bucket >= 0) self.entries[e.next_in_bucket].prev_in_bucket = e.prev_in_bucket;
-    e.bucket = -1;
-    e.next_in_bucket = self.free_head;
-    self.free_head = idx;
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC int64_t dist_tensor_map_next_publish_task() {
+    return DistSharedTensorMapAicoreOps::Load(&g_dist.shared_tensor_map.committed_tasks.v);
 }
 
-PTO_DEVICE_FUNC void dist_tensor_map_advance_retire(__gm__ DistTensorMap &self, int32_t N, int32_t H) {
-    const int32_t new_floor = N - H;
-    if (new_floor <= self.cleaned_upto) {
-        if (new_floor > self.alive_floor) self.alive_floor = new_floor;
-        return;
-    }
-    for (int32_t id = self.cleaned_upto; id < new_floor; id++) {
-        int32_t cur = self.task_heads[id & kTaskWindowMask];
-        while (cur >= 0) {
-            const int32_t nxt = self.entries[cur].next_in_task;
-            debug_assert(self.entries[cur].producer == id);
-            dist_tensor_map_free_entry(self, cur);
-            cur = nxt;
-        }
-        self.task_heads[id & kTaskWindowMask] = -1;
-    }
-    self.cleaned_upto = new_floor;
-    self.alive_floor = new_floor;
+PTO_DEVICE_FUNC DistSharedTensorMapTaskPublishResult
+dist_tensor_map_publish_shared_task(const SharedTensorMapValue *entries, uint32_t count, int32_t producer_task_id) {
+    return dist_shared_tensor_map_publish_task(g_dist.shared_tensor_map, entries, count, producer_task_id, g_dist.H);
 }
-
+#else
 template <typename TensorRef>
-PTO_DEVICE_FUNC void dist_tensor_map_insert(__gm__ DistTensorMap &self, const TensorRef &t, int32_t producer) {
-    uint64_t addr, lo, hi;
-    dist_tensor_map_byte_range(t, addr, lo, hi);
-    const int32_t s = dist_tensor_map_alloc_slot(self);
-    if (s < 0) return;
-    const uint32_t b = dist_tensor_map_hash(addr);
-    __gm__ MapEntry &e = self.entries[s];
-    e.buf_addr = addr;
-    e.lo = lo;
-    e.hi = hi;
-    e.producer = producer;
-    e.bucket = static_cast<int32_t>(b);
-    e.prev_in_bucket = -1;
-    e.next_in_bucket = self.buckets[b];
-    if (self.buckets[b] >= 0) self.entries[self.buckets[b]].prev_in_bucket = s;
-    self.buckets[b] = s;
-    const int32_t slot = producer & kTaskWindowMask;
-    e.next_in_task = self.task_heads[slot];
-    self.task_heads[slot] = s;
+PTO_DEVICE_FUNC bool dist_tensor_map_insert_for_task(
+    __gm__ DistCore &worker, const TensorRef &tensor, int32_t producer_task_id, bool task_won
+) {
+    (void)task_won;
+    return dist_private_tensor_map_insert(worker.map, tensor, producer_task_id);
 }
-
-template <typename TensorRef>
-PTO_DEVICE_FUNC int32_t dist_tensor_map_lookup(__gm__ const DistTensorMap &self, const TensorRef &t) {
-    uint64_t addr, lo, hi;
-    dist_tensor_map_byte_range(t, addr, lo, hi);
-    int32_t best = -1;
-    for (int32_t cur = self.buckets[dist_tensor_map_hash(addr)]; cur >= 0; cur = self.entries[cur].next_in_bucket) {
-        __gm__ const MapEntry &e = self.entries[cur];
-        if (e.producer < self.alive_floor) continue;
-        if (e.buf_addr == addr && lo < e.hi && e.lo < hi) {
-            if (e.producer > best) best = e.producer;
-        }
-    }
-    return best;
-}
+#endif
 
 }  // namespace

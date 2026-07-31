@@ -21,7 +21,51 @@
 #define PTO2_PROFILING 1
 #endif
 
-#if defined(PTO2_PROFILING) && PTO2_PROFILING
+#ifndef PTO_FDWIC_PERF_CLOCK
+#define PTO_FDWIC_PERF_CLOCK 0
+#endif
+
+// perf-clock-kernel 是独立的低容量诊断 ELF：保留首末 Submit 时钟，
+// 并额外累计落在同一逐核窗口内的 linked-kernel 时间与调用次数。
+#ifndef PTO_FDWIC_PERF_CLOCK_KERNEL
+#define PTO_FDWIC_PERF_CLOCK_KERNEL 0
+#endif
+
+#ifndef PTO_FDWIC_SUBMIT_PMU
+#define PTO_FDWIC_SUBMIT_PMU 0
+#endif
+
+// 每个 submit-PMU 诊断 ELF 只允许编译一个局部阶段。0 表示整窗 none；
+// 其余编号由 submit_pmu_types.h 的 FdwicSubmitPmuPhase 定义。
+#ifndef PTO_FDWIC_SUBMIT_PMU_PHASE_ID
+#define PTO_FDWIC_SUBMIT_PMU_PHASE_ID 0
+#endif
+
+#ifndef PTO_FDWIC_TRACE_ENABLED
+#define PTO_FDWIC_TRACE_ENABLED PTO2_PROFILING
+#endif
+
+#if PTO_FDWIC_PERF_CLOCK && PTO_FDWIC_TRACE_ENABLED
+#error "PTO_FDWIC_PERF_CLOCK requires PTO_FDWIC_TRACE_ENABLED=0"
+#endif
+
+#if PTO_FDWIC_PERF_CLOCK_KERNEL && !PTO_FDWIC_PERF_CLOCK
+#error "PTO_FDWIC_PERF_CLOCK_KERNEL requires PTO_FDWIC_PERF_CLOCK=1"
+#endif
+
+#if PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_TRACE_ENABLED
+#error "PTO_FDWIC_SUBMIT_PMU requires PTO_FDWIC_TRACE_ENABLED=0"
+#endif
+
+#if PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_PERF_CLOCK
+#error "PTO_FDWIC_SUBMIT_PMU and PTO_FDWIC_PERF_CLOCK are mutually exclusive"
+#endif
+
+#if !PTO_FDWIC_SUBMIT_PMU && PTO_FDWIC_SUBMIT_PMU_PHASE_ID != 0
+#error "PTO_FDWIC_SUBMIT_PMU_PHASE_ID requires PTO_FDWIC_SUBMIT_PMU=1"
+#endif
+
+#if PTO_FDWIC_TRACE_ENABLED
 #define DIST_TRACE_ENABLED 1
 #else
 #define DIST_TRACE_ENABLED 0

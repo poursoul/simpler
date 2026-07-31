@@ -13,26 +13,37 @@
 // configuration reads and signal-handler installation; AICore images never
 // include this file.
 
-void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
+#include "dist_engine/aicpu/shared_tensor_map_init.h"
+
+int32_t dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime) {
+    if (runtime != nullptr) runtime->dist.shared_addr = 0;
     if (rt == nullptr || rt->dist_global == nullptr || rt->gm_heap == nullptr || rt->gm_heap_size == 0) {
         DIST_ERRF("[dist_engine] missing host-allocated runtime state\n");
-        if (runtime != nullptr) runtime->dist.shared_addr = 0;
-        return;
+        return runtime_status_from_error_codes(PTO2_ERROR_INVALID_ARGS, PTO2_ERROR_NONE);
     }
+    if (runtime == nullptr || num_workers <= 0 || num_workers > RUNTIME_MAX_WORKER) {
+        DIST_ERRF("[dist_engine] invalid runtime/worker configuration: runtime=%p workers=%d\n", runtime, num_workers);
+        return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+    }
+    int32_t configured_history = kHDefault;
+    if (const char *e = getenv("PTO_DIST_H")) {
+        if (!dist_parse_history_window(e, kTaskWindow - 2, configured_history)) {
+            DIST_ERRF(
+                "[dist_engine] invalid PTO_DIST_H='%s'; expected ASCII decimal digits in [0, %d]\n", e, kTaskWindow - 2
+            );
+            return runtime_status_from_error_codes(PTO2_ERROR_DIST_CONFIG_INVALID, PTO2_ERROR_NONE);
+        }
+    }
+
     g_dist_ptr = reinterpret_cast<DistGlobal *>(rt->dist_global);
     g_dist.heap_base = static_cast<uint8_t *>(rt->gm_heap);
     g_dist.heap_size = rt->gm_heap_size;
-    // Dependency-span bound H (R = F - H). Env override for graphs with longer
-    // heap spans; default kHDefault.
-    g_dist.H = kHDefault;
-    if (const char *e = getenv("PTO_DIST_H")) {
-        const long h = std::strtol(e, nullptr, 10);
-        if (h >= 0) g_dist.H = static_cast<int32_t>(h);
-    }
-    // The producer map recycles a task's entry-head slot kTaskWindow tasks later;
-    // cleanup retires a task once it leaves the H span, so H must stay below the
-    // window (with margin) or a slot could be reused before its task is cleaned.
-    always_assert(g_dist.H < kTaskWindow - 1);
+    atomic_exchange(g_dist.error_code, int32_t{PTO2_ERROR_NONE}, __ATOMIC_RELAXED);
+    atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
+    // Dependency-span bound H (R = F - H). Validation happens before touching
+    // the shared arena, so an invalid run cannot leave partially initialized
+    // control state for a later invocation.
+    g_dist.H = configured_history;
 #if DIST_SIM_HOST_CLOCK
     // Overhead-isolation gate (skip incore kernel calls, keep all bookkeeping).
     g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
@@ -46,9 +57,23 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     atomic_exchange(g_dist.frontier, int64_t{-1}, __ATOMIC_RELAXED);
     for (int32_t i = 0; i < kFlagCap; i++)
         reset_task_cell(i);
-    atomic_exchange(g_dist.fatal, int32_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.replay_done, int64_t{0}, __ATOMIC_RELAXED);
     atomic_exchange(g_dist.started_count, int64_t{0}, __ATOMIC_RELAXED);
+    for (int32_t group = 0; group < kFinalBarrierGroups; group++) {
+        atomic_exchange(g_dist.final_barrier.leaf_arrivals[group].v, int64_t{0}, __ATOMIC_RELAXED);
+        g_dist.final_barrier.leaf_arrivals[group].expected = 0;
+        atomic_exchange(g_dist.final_barrier.leaf_releases[group].v, int64_t{0}, __ATOMIC_RELAXED);
+    }
+    atomic_exchange(g_dist.final_barrier.root_arrival.v, int64_t{0}, __ATOMIC_RELAXED);
+    g_dist.final_barrier.root_arrival.expected = 0;
+    atomic_exchange(g_dist.final_barrier.root_release.v, int64_t{0}, __ATOMIC_RELAXED);
+#if PTO_FDWIC_SHARED_MAP
+    // The upper backend-ready gate still rejects normal shared execution before
+    // the first Submit. Keep one-time initialization on the real AICPU setup
+    // path so enabling the backend needs no second reset path; worker reset must
+    // never clear this global single copy concurrently.
+    dist_shared_tensor_map_reset(g_dist.shared_tensor_map);
+#endif
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
     g_dist.runtime = runtime;
@@ -80,6 +105,17 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
             atomic_exchange(g_dist.blocks[b].slots[s].state.v, int64_t{0}, __ATOMIC_RELAXED);
         }
     }
+    int32_t active_final_groups = 0;
+    for (int32_t i = 0; i < num_workers && i < RUNTIME_MAX_WORKER; i++) {
+        const int32_t block_id = g_dist.layout[i].block_id;
+        if (block_id < 0) continue;
+        const int32_t group = block_id % kFinalBarrierGroups;
+        ++g_dist.final_barrier.leaf_arrivals[group].expected;
+    }
+    for (int32_t group = 0; group < kFinalBarrierGroups; group++) {
+        if (g_dist.final_barrier.leaf_arrivals[group].expected != 0) ++active_final_groups;
+    }
+    g_dist.final_barrier.root_arrival.expected = active_final_groups;
 
 #if DIST_SIM_HOST_CLOCK
     fprintf(
@@ -107,5 +143,18 @@ void dist_engine_register(PTO2Runtime *rt, const L2TaskArgs *orch_args, int num_
     // Publish all of the above before AICPU wakes workers through their
     // per-core handshake flags.
     store_barrier();
-    return;
+    return 0;
+}
+
+int32_t dist_engine_runtime_status(PTO2Runtime *rt) {
+    if (rt == nullptr || rt->dist_global == nullptr) {
+        return runtime_status_from_error_codes(PTO2_ERROR_INVALID_ARGS, PTO2_ERROR_NONE);
+    }
+    DistGlobal *state = reinterpret_cast<DistGlobal *>(rt->dist_global);
+    cache_invalidate_range(const_cast<const int32_t *>(&state->fatal), kCacheLine);
+    const int32_t fatal = __atomic_load_n(&state->fatal, __ATOMIC_ACQUIRE);
+    if (fatal == 0) return 0;
+    int32_t code = __atomic_load_n(&state->error_code, __ATOMIC_ACQUIRE);
+    if (code == PTO2_ERROR_NONE) code = PTO2_ERROR_EXPLICIT_ORCH_FATAL;
+    return runtime_status_from_error_codes(code, PTO2_ERROR_NONE);
 }

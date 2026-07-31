@@ -38,6 +38,7 @@
 #include "common/core_type.h"
 #include "dist_engine/common/swimlane_types.h"
 #include "common/platform_config.h"
+#include "fdwic_build_identity.h"
 #include "pto2_dispatch_payload.h"
 #include "pto_types.h"
 #include "task_args.h"
@@ -58,6 +59,7 @@
 constexpr uint32_t AICPU_READY_NONE = 0;
 constexpr uint32_t AICPU_READY_HANDSHAKE = 1;
 constexpr uint32_t AICPU_READY_DIST_RUN = 2;
+constexpr uint32_t AICPU_READY_DIST_ABORT = 3;
 
 /**
  * Handshake Structure - Shared between Host, AICPU, and AICore
@@ -70,6 +72,7 @@ constexpr uint32_t AICPU_READY_DIST_RUN = 2;
  * 2. Acknowledgment: AICore sets aicore_done=core_id+1
  * 3. Dist Run: AICPU sets aicpu_ready=AICPU_READY_DIST_RUN after publishing
  *    shared runtime state
+ *    (or AICPU_READY_DIST_ABORT when a cold-path diagnostic setup failed)
  * 4. Task Completion: AICore writes FIN to COND; AICPU observes completion
  * 5. Shutdown: AICPU sets control=1, AICore exits
  *
@@ -201,6 +204,15 @@ struct Task {
  */
 class Runtime {
 public:
+    // Stable three-image ABI/control prefix. The identity must remain first;
+    // workers, worker_count and the AICPU launch fields through
+    // aicpu_launch_count must keep the same order and layout in every
+    // private/shared image. AICore must finish the common handshake even when
+    // the identity mismatches, otherwise AICPU cannot issue DIST_ABORT/EXIT.
+    // Mode-dependent state therefore belongs after this common prefix (the
+    // shared TensorMap itself lives behind dist.shared_addr).
+    FdwicBuildIdentity fdwic_build_identity;
+
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
@@ -254,7 +266,9 @@ public:
         volatile uint64_t shared_addr;
         volatile int32_t num_workers;  // number of AICore workers participating
         volatile uint64_t swimlane_base;
-        volatile uint32_t swimlane_enabled;
+        // Existing L2 swimlane perf level (0..4). FDWIC keeps phase spans at
+        // levels 1..3 and adds source-level atomic spans at level 4.
+        volatile uint32_t swimlane_level;
         volatile uint32_t swimlane_records_per_core;
         Tensor ccec_orch_tensors[CHIP_MAX_TENSOR_ARGS];
         uint64_t ccec_orch_scalars[CHIP_MAX_SCALAR_ARGS];
@@ -265,6 +279,7 @@ public:
     } dist;
 
     void *fdwic_swimlane_host_shadow_;
+    uint64_t fdwic_swimlane_dev_allocation_;
     uint64_t fdwic_swimlane_dev_base_;
     uint64_t fdwic_swimlane_bytes_;
     uint32_t fdwic_swimlane_num_cores_;

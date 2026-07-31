@@ -26,6 +26,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -56,9 +57,17 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 }
 
 extern "C" __attribute__((weak)) int
-fdwic_swimlane_host_init(Runtime *runtime, int num_cores, int enabled, const char *output_prefix);
+fdwic_swimlane_host_init(Runtime *runtime, int num_cores, int level, const char *output_prefix);
 extern "C" __attribute__((weak)) int fdwic_swimlane_host_export(Runtime *runtime);
 extern "C" __attribute__((weak)) void fdwic_swimlane_host_finalize(Runtime *runtime);
+extern "C" __attribute__((weak)) int
+fdwic_perf_clock_host_init(Runtime *runtime, int num_cores, const char *output_prefix);
+extern "C" __attribute__((weak)) int fdwic_perf_clock_host_export(Runtime *runtime);
+extern "C" __attribute__((weak)) void fdwic_perf_clock_host_finalize(Runtime *runtime);
+extern "C" __attribute__((weak)) int
+fdwic_submit_pmu_host_init(Runtime *runtime, int num_cores, const char *output_prefix);
+extern "C" __attribute__((weak)) int fdwic_submit_pmu_host_export(Runtime *runtime);
+extern "C" __attribute__((weak)) void fdwic_submit_pmu_host_finalize(Runtime *runtime);
 
 // =============================================================================
 // DeviceRunner Implementation
@@ -158,11 +167,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // failure cascade into a single fast, self-explanatory error; the runner is
     // then recovered at finalize.
     if (device_unusable_) {
-        LOG_ERROR(
-            "DeviceRunner marked unusable by a prior AICore failure; refusing to run. "
-            "A soft reset does not clear the poison on a5; finalize() will force-reset "
-            "the card so the next Worker on it inits clean."
-        );
+        LOG_ERROR("DeviceRunner marked unusable by a prior AICore failure; refusing to run. "
+                  "A soft reset does not clear the poison on a5; finalize() will force-reset "
+                  "the card so the next Worker on it inits clean.");
         return -1;
     }
     if (validate_launch_aicpu_num(launch_aicpu_num) != 0) return -1;
@@ -270,8 +277,85 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         enable_l2_swimlane_ = original_enable_l2_swimlane;
     });
     bool fdwic_swimlane_active = false;
+    auto fdwic_swimlane_cleanup = RAIIScopeGuard([&runtime, &fdwic_swimlane_active]() {
+        if (fdwic_swimlane_active && fdwic_swimlane_host_finalize != nullptr) {
+            fdwic_swimlane_host_finalize(&runtime);
+            fdwic_swimlane_active = false;
+        }
+    });
+    bool fdwic_perf_clock_active = false;
+    auto fdwic_perf_clock_cleanup = RAIIScopeGuard([&runtime, &fdwic_perf_clock_active]() {
+        if (fdwic_perf_clock_active && fdwic_perf_clock_host_finalize != nullptr) {
+            fdwic_perf_clock_host_finalize(&runtime);
+            fdwic_perf_clock_active = false;
+        }
+    });
+    bool fdwic_submit_pmu_active = false;
+    auto fdwic_submit_pmu_cleanup = RAIIScopeGuard([&runtime, &fdwic_submit_pmu_active]() {
+        if (fdwic_submit_pmu_active && fdwic_submit_pmu_host_finalize != nullptr) {
+            fdwic_submit_pmu_host_finalize(&runtime);
+            fdwic_submit_pmu_active = false;
+        }
+    });
+    const char *fdwic_profile = std::getenv("PTO_FDWIC_PROFILE");
+    const bool fdwic_perf_clock_requested =
+        fdwic_profile != nullptr &&
+        (std::strcmp(fdwic_profile, "perf-clock") == 0 || std::strcmp(fdwic_profile, "perf-clock-kernel") == 0);
+    const bool fdwic_submit_pmu_requested =
+        fdwic_profile != nullptr && std::strncmp(fdwic_profile, "submit-pmu-", 11) == 0;
+    if (fdwic_perf_clock_requested) {
+        if (enable_profiling_flag != PROFILING_FLAG_NONE) {
+            LOG_ERROR("fdwic perf-clock cannot be combined with another runtime diagnostic");
+            return -1;
+        }
+        if (fdwic_perf_clock_host_init == nullptr || fdwic_perf_clock_host_export == nullptr ||
+            fdwic_perf_clock_host_finalize == nullptr) {
+            LOG_ERROR("fdwic perf-clock was requested but the selected runtime does not provide its host hooks");
+            return -1;
+        }
+        rc = fdwic_perf_clock_host_init(&runtime, num_aicore, output_prefix_.c_str());
+        if (rc <= 0) {
+            LOG_ERROR("fdwic perf-clock init failed: %d", rc);
+            return rc < 0 ? rc : -1;
+        }
+        fdwic_perf_clock_active = true;
+        // perf-clock is an independent header-only evidence path. Generic
+        // L2/PMU pointers and the umbrella launch flag must remain empty.
+        kernel_args_.args.enable_profiling_flag = PROFILING_FLAG_NONE;
+        kernel_args_.args.l2_swimlane_data_base = 0;
+        kernel_args_.args.l2_swimlane_aicore_rotation_table = 0;
+        kernel_args_.args.aicore_pmu_ring_addrs = 0;
+        kernel_args_.args.pmu_data_base = 0;
+    }
+    if (fdwic_submit_pmu_requested) {
+        if (enable_profiling_flag != PROFILING_FLAG_NONE) {
+            LOG_ERROR("fdwic submit-PMU profile cannot be combined with another runtime diagnostic");
+            return -1;
+        }
+        if (fdwic_submit_pmu_host_init == nullptr || fdwic_submit_pmu_host_export == nullptr ||
+            fdwic_submit_pmu_host_finalize == nullptr) {
+            LOG_ERROR("fdwic submit-PMU profile was requested but the selected runtime does not provide its host hooks"
+            );
+            return -1;
+        }
+        rc = fdwic_submit_pmu_host_init(&runtime, num_aicore, output_prefix_.c_str());
+        if (rc <= 0) {
+            LOG_ERROR("fdwic submit-PMU profile init failed: %d", rc);
+            return rc < 0 ? rc : -1;
+        }
+        fdwic_submit_pmu_active = true;
+        // 该 profile 只复用 KernelArgs::regs 解析本核 MMIO 地址。所有通用
+        // collector 位与地址必须为空，避免把逐 task ring 混入整窗证据。
+        kernel_args_.args.enable_profiling_flag = PROFILING_FLAG_NONE;
+        kernel_args_.args.l2_swimlane_data_base = 0;
+        kernel_args_.args.l2_swimlane_aicore_rotation_table = 0;
+        kernel_args_.args.aicore_pmu_ring_addrs = 0;
+        kernel_args_.args.pmu_data_base = 0;
+    }
     if (enable_l2_swimlane_ && fdwic_swimlane_host_init != nullptr) {
-        rc = fdwic_swimlane_host_init(&runtime, num_aicore, 1, output_prefix_.c_str());
+        rc = fdwic_swimlane_host_init(
+            &runtime, num_aicore, static_cast<int>(l2_swimlane_level_), output_prefix_.c_str()
+        );
         if (rc < 0) {
             LOG_ERROR("fdwic swimlane init failed: %d", rc);
             return rc;
@@ -279,6 +363,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         if (rc > 0) {
             fdwic_swimlane_active = true;
             enable_l2_swimlane_ = false;
+            // The FDWIC runtime owns its trace buffer and does not use the
+            // platform-generic L2 collector. Keep the launch bit and generic
+            // pointers consistent with that routing decision; these fields
+            // may otherwise retain a prior run's collector addresses.
+            CLEAR_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+            kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
+            kernel_args_.args.l2_swimlane_data_base = 0;
+            kernel_args_.args.l2_swimlane_aicore_rotation_table = 0;
         }
     }
     if (enable_l2_swimlane_) {
@@ -325,12 +417,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Cleanup guard for early returns: stops all started collectors so
     // their mgmt + poll threads exit cleanly. stop() is idempotent and a
     // no-op on collectors that never started.
-    auto perf_cleanup = RAIIScopeGuard([this, &runtime, &fdwic_swimlane_active]() {
+    auto perf_cleanup = RAIIScopeGuard([this]() {
         finalize_collectors();
-        if (fdwic_swimlane_active && fdwic_swimlane_host_finalize != nullptr) {
-            fdwic_swimlane_host_finalize(&runtime);
-            fdwic_swimlane_active = false;
-        }
     });
 
     LOG_INFO_V0("=== Initialize runtime args ===");
@@ -351,12 +439,10 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         dep_gen_collector_.start(thread_factory);
     }
 
-    // workers[i].core_type is written by the AICore kernel during its
-    // AICPU<->AICore handshake (aicore_executor.cpp), launched further below,
-    // so the values read here reflect the most recent prior run's handshake
-    // still resident in device memory (unset on the first run of a freshly-
-    // loaded runtime). Publish the table to the L2 swimlane collector so the
-    // AICORE_TIMING (level=1) host emit path can label lanes ("aic"/"aiv").
+    // prepare_runtime_for_launch 已按本轮 block_dim 写入 host launch-plan：
+    // 前 block_dim 个 worker 为 AIC，其余为 AIV。设备握手随后会在 device
+    // Runtime 中确认实际角色，但不会回写这里的 host Runtime。将当前计划表
+    // 交给 L2 collector，用于 AICORE_TIMING (level=1) host 输出的 lane 标签。
     if (enable_l2_swimlane_ && l2_swimlane_collector_.is_initialized()) {
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {
@@ -433,7 +519,22 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         // still exports exactly once below.
         teardown_shared_collectors_after_run();
         if (fdwic_swimlane_active && fdwic_swimlane_host_export != nullptr) {
-            fdwic_swimlane_host_export(&runtime);
+            const int export_rc = fdwic_swimlane_host_export(&runtime);
+            if (export_rc != 0) {
+                LOG_ERROR("fdwic swimlane export failed after runtime error: %d", export_rc);
+            }
+        }
+        if (fdwic_perf_clock_active) {
+            const int export_rc = fdwic_perf_clock_host_export(&runtime);
+            if (export_rc != 0) {
+                LOG_ERROR("fdwic perf-clock export failed after runtime error: %d", export_rc);
+            }
+        }
+        if (fdwic_submit_pmu_active) {
+            const int export_rc = fdwic_submit_pmu_host_export(&runtime);
+            if (export_rc != 0) {
+                LOG_ERROR("fdwic submit-PMU export rejected after runtime error: %d", export_rc);
+            }
         }
         return rc;
     }
@@ -441,8 +542,26 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     read_device_wall_ns();
 
     teardown_shared_collectors_after_run();
+    int fdwic_swimlane_export_rc = 0;
     if (fdwic_swimlane_active && fdwic_swimlane_host_export != nullptr) {
-        fdwic_swimlane_host_export(&runtime);
+        fdwic_swimlane_export_rc = fdwic_swimlane_host_export(&runtime);
+        if (fdwic_swimlane_export_rc != 0) {
+            LOG_ERROR("fdwic swimlane export failed: %d", fdwic_swimlane_export_rc);
+        }
+    }
+    int fdwic_perf_clock_export_rc = 0;
+    if (fdwic_perf_clock_active) {
+        fdwic_perf_clock_export_rc = fdwic_perf_clock_host_export(&runtime);
+        if (fdwic_perf_clock_export_rc != 0) {
+            LOG_ERROR("fdwic perf-clock export failed: %d", fdwic_perf_clock_export_rc);
+        }
+    }
+    int fdwic_submit_pmu_export_rc = 0;
+    if (fdwic_submit_pmu_active) {
+        fdwic_submit_pmu_export_rc = fdwic_submit_pmu_host_export(&runtime);
+        if (fdwic_submit_pmu_export_rc != 0) {
+            LOG_ERROR("fdwic submit-PMU export failed: %d", fdwic_submit_pmu_export_rc);
+        }
     }
 
     // a5-specific dep_gen teardown: stop + reconcile + replay emit.
@@ -461,7 +580,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Print handshake results (reads from device memory, must be before free)
     print_handshake_results();
 
-    return 0;
+    if (fdwic_swimlane_export_rc != 0) return fdwic_swimlane_export_rc;
+    if (fdwic_perf_clock_export_rc != 0) return fdwic_perf_clock_export_rc;
+    return fdwic_submit_pmu_export_rc;
 }
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {

@@ -35,46 +35,76 @@ namespace {
 PTO_DEVICE_FUNC void publish_task_flag(int32_t task_id) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-    atomic_exchange(cell.flag, int64_t{1}, __ATOMIC_RELEASE);
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::CompletionFlagExchange, cell.flag, int64_t{1}, /*result_used=*/false, __ATOMIC_RELEASE
+    );
 }
 
-PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder) {
+PTO_DEVICE_FUNC bool task_flag_ready(int32_t task_id, int memorder, FdwicAtomicSite site) {
     if (task_id < 0 || task_id >= kFlagCap) return false;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-    return atomic_load(cell.flag, memorder) != 0;
+    return fdwic_trace_atomic_load(task_id, site, cell.flag, /*result_used=*/true, memorder) != 0;
 }
 
 PTO_DEVICE_FUNC void store_task_vend(int32_t task_id, uint64_t vend) {
     if (task_id < 0 || task_id >= kFlagCap) return;
     __gm__ DistTaskCell &cell = task_cell(task_id);
-    atomic_exchange(cell.vend, vend, __ATOMIC_RELAXED);
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::CompletionVendExchange, cell.vend, vend, /*result_used=*/false, __ATOMIC_RELAXED
+    );
 }
 
-PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count) {
-    atomic_exchange(w.remaining.v, static_cast<int64_t>(count), __ATOMIC_RELAXED);
+PTO_DEVICE_FUNC void store_won_remaining(__gm__ WonSlot &w, int32_t count, int32_t task_id) {
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::WonRemainingExchange, w.remaining.v, static_cast<int64_t>(count),
+        /*result_used=*/false, __ATOMIC_RELAXED
+    );
 }
 
-PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane) {
-    atomic_exchange(w.drained[lane].v, kDrainedClaimed);
+PTO_DEVICE_FUNC void reset_won_lane(__gm__ WonSlot &w, int32_t lane, int32_t task_id) {
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::WonLaneResetExchange, w.drained[lane].v, kDrainedClaimed,
+        /*result_used=*/false
+    );
     w.lane[lane].present = false;
 }
 
 PTO_DEVICE_FUNC bool claim_won_lane(__gm__ WonSlot &w, int32_t lane) {
-    return atomic_exchange(w.drained[lane].v, kDrainedClaimed) == kDrainedFree;
+    return fdwic_trace_atomic_exchange(
+               -1, FdwicAtomicSite::WonLaneClaimExchange, w.drained[lane].v, kDrainedClaimed,
+               /*result_used=*/true
+           ) == kDrainedFree;
 }
 
-PTO_DEVICE_FUNC void publish_won_slot(__gm__ WonSlot &w) { atomic_exchange(w.state.v, kWonStatePublished); }
-
-PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w) {
-    return atomic_fetch_sub<int64_t>(w.remaining.v, 1) == 1;
+PTO_DEVICE_FUNC void publish_won_slot(__gm__ WonSlot &w, int32_t task_id) {
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::WonStatePublishExchange, w.state.v, kWonStatePublished,
+        /*result_used=*/false
+    );
 }
 
-PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w) { atomic_exchange(w.state.v, kWonStateFree); }
+PTO_DEVICE_FUNC bool decrement_won_remaining_is_last(__gm__ WonSlot &w, int32_t task_id) {
+    return fdwic_trace_atomic_fetch_sub<int64_t>(
+               task_id, FdwicAtomicSite::WonRemainingFetchSub, w.remaining.v, 1, /*result_used=*/true
+           ) == 1;
+}
 
-PTO_DEVICE_FUNC int64_t load_frontier_for_advance() { return atomic_load(g_dist.frontier); }
+PTO_DEVICE_FUNC void clear_won_slot_state(__gm__ WonSlot &w, int32_t task_id) {
+    (void)fdwic_trace_atomic_exchange(
+        task_id, FdwicAtomicSite::WonStateClearExchange, w.state.v, kWonStateFree, /*result_used=*/false
+    );
+}
+
+PTO_DEVICE_FUNC int64_t load_frontier_for_advance() {
+    // The first load reads global scan state, not a particular task cell.
+    return fdwic_trace_atomic_load(-1, FdwicAtomicSite::FrontierInitialLoad, g_dist.frontier);
+}
 
 PTO_DEVICE_FUNC bool try_advance_frontier_to(int64_t &frontier, int64_t next) {
-    const int64_t old = atomic_fetch_max<int64_t>(g_dist.frontier, next);
+    // Pair this update with the immediately preceding next-task flag load.
+    const int64_t old = fdwic_trace_atomic_fetch_max<int64_t>(
+        static_cast<int32_t>(next), FdwicAtomicSite::FrontierMax, g_dist.frontier, next, /*result_used=*/true
+    );
     frontier = old > next ? old : next;
     return next > old;
 }
@@ -87,7 +117,7 @@ PTO_DEVICE_FUNC void advance_frontier() {
     while (true) {
         const int64_t next = f + 1;
         if (next >= kFlagCap) break;
-        if (!task_flag_ready(static_cast<int32_t>(next), __ATOMIC_ACQUIRE)) break;
+        if (!task_flag_ready(static_cast<int32_t>(next), __ATOMIC_ACQUIRE, FdwicAtomicSite::FrontierFlagLoad)) break;
         try_advance_frontier_to(f, next);
     }
 }
@@ -129,17 +159,25 @@ PTO_DEVICE_FUNC void execute_slot([[maybe_unused]] __gm__ DistCore *self, __gm__
         );
     }
 #else
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+    const uint64_t perf_clock_kernel_begin = fdwic_perf_clock_kernel_begin();
+#endif
     TRACE_SPAN_BEGIN(kernel_trace);
+    const uint32_t submit_pmu_kernel_token = fdwic_submit_pmu_linked_kernel_pause();
     dist_aicore_call_slot_kernel(s);
+    fdwic_submit_pmu_linked_kernel_resume(submit_pmu_kernel_token);
     TRACE_SPAN_END(
         kernel_trace, self, s.task_id, s.func_id, TracePhase::Kernel, static_cast<uint32_t>(s.is_multicore ? 1 : 0), 0
     );
+#if PTO_FDWIC_PERF_CLOCK_KERNEL
+    fdwic_perf_clock_kernel_end(perf_clock_kernel_begin);
+#endif
 #endif
     store_barrier();
     if (s.is_multicore) {
         __gm__ WonSlot &w = g_dist.blocks[s.won_block].slots[s.won_slot];
-        if (decrement_won_remaining_is_last(w)) {
-            clear_won_slot_state(w);
+        if (decrement_won_remaining_is_last(w, s.task_id)) {
+            clear_won_slot_state(w, s.task_id);
             complete_executed_task(self, s.task_id);
         }
     } else {
@@ -158,7 +196,7 @@ PTO_DEVICE_FUNC int32_t drain_phase_b(__gm__ DistCore *self) {
         if (!s.occupied || !s.built) continue;
         bool ready = true;
         for (int32_t f = 0; f < s.fanin_count; f++) {
-            if (!task_flag_ready(s.fanin[f], __ATOMIC_ACQUIRE)) {
+            if (!task_flag_ready(s.fanin[f], __ATOMIC_ACQUIRE, FdwicAtomicSite::FaninFlagLoad)) {
                 ready = false;
                 break;
             }
@@ -240,11 +278,11 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
     if (!g_fdwic_joint_submit_seen) return false;
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    if (atomic_load(bw.any_pub) == 0) return false;
+    if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonAnyLoad, bw.any_pub) == 0) return false;
     bool drained = false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
-        if (atomic_load(w.state.v) != kWonStatePublished) continue;
+        if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonStateLoad, w.state.v) != kWonStatePublished) continue;
 #if defined(__CCE_AICORE__)
         dist_aicore_invalidate_region(&w.lane[self->lane].present, sizeof(w.lane[self->lane].present));
 #endif
@@ -252,7 +290,10 @@ PTO_DEVICE_FUNC bool drain_block_won(__gm__ DistCore *self) {
         if (!claim_won_lane(w, self->lane)) continue;
         int32_t si = alloc_ring_slot(self);
         if (si < 0) {
-            atomic_exchange(w.drained[self->lane].v, kDrainedFree);
+            (void)fdwic_trace_atomic_exchange(
+                -1, FdwicAtomicSite::WonLaneReleaseExchange, w.drained[self->lane].v, kDrainedFree,
+                /*result_used=*/false
+            );
             return drained;
         }
 #if defined(__CCE_AICORE__)
@@ -280,26 +321,18 @@ PTO_DEVICE_FUNC bool has_pending_won(__gm__ DistCore *self) {
     if (!g_fdwic_joint_submit_seen) return false;
     if (self == nullptr || self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     __gm__ BlockWon &bw = g_dist.blocks[self->block_id];
-    if (atomic_load(bw.any_pub) == 0) return false;
+    if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonAnyLoad, bw.any_pub) == 0) return false;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         __gm__ WonSlot &w = bw.slots[i];
-        if (atomic_load(w.state.v) != kWonStatePublished) continue;
+        if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonStateLoad, w.state.v) != kWonStatePublished) continue;
 #if defined(__CCE_AICORE__)
         dist_aicore_invalidate_region(&w.lane[self->lane].present, sizeof(w.lane[self->lane].present));
 #endif
         if (!w.lane[self->lane].present) continue;
-        if (atomic_load(w.drained[self->lane].v) == kDrainedFree) return true;
+        if (fdwic_trace_atomic_load(-1, FdwicAtomicSite::WonDrainedLoad, w.drained[self->lane].v) == kDrainedFree)
+            return true;
     }
     return false;
-}
-
-PTO_DEVICE_FUNC void dist_submit_execute_first(__gm__ DistCore *self) {
-    TRACE_LAP_RESET(self);
-    if (!fatal_set()) {
-        drain_block_won(self);
-        drain_phase_b(self);
-    }
-    TRACE_LAP(self, self->local_index, -1, TracePhase::EfDrain);
 }
 
 enum class DistSubmitKind : int32_t {
@@ -325,9 +358,10 @@ struct DistSubmitCtx {
     int32_t joint_block;
     int32_t joint_slot;
     int32_t joint_count;
+    bool claim_attempted;
 };
 
-PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx) {
+PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, DistSubmitCtx &ctx) {
     ctx.self = self != nullptr ? self : g_self;
     if (ctx.self == nullptr) {
         ctx.task_id = kFlagCap;
@@ -337,8 +371,10 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
         ctx.payload = &ctx.self->task_payloads[ctx.task_id & kTaskPayloadMask];
     }
     ctx.result.set_task_id(PTO2TaskId::make(0, static_cast<uint32_t>(ctx.task_id)));
-    ctx.tensor_count = args.tensor_count();
-    ctx.scalar_count = args.scalar_count();
+    // The compete-first Begin deliberately has no L0TaskArgs.  Finish fills
+    // these two counts after the synchronous caller-side argument callback.
+    ctx.tensor_count = 0;
+    ctx.scalar_count = 0;
     ctx.register_mask = 0;
     ctx.output_bytes = 0;
     ctx.fanin_count = 0;
@@ -349,11 +385,21 @@ PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &
     ctx.joint_block = -1;
     ctx.joint_slot = -1;
     ctx.joint_count = 0;
+    ctx.claim_attempted = false;
+}
+
+PTO_DEVICE_FUNC void dist_submit_begin(__gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx) {
+    dist_submit_begin(self, ctx);
+    ctx.tensor_count = args.tensor_count();
+    ctx.scalar_count = args.scalar_count();
 }
 
 PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSubmitKind kind) {
     if (ctx.task_id < kFlagCap) return true;
-    set_fatal();
+    // Begin uses post-increment. Clamp the cold failure path to the sentinel so
+    // invalid orchestration cannot wrap local_index by issuing more Submits.
+    if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
+    fdwic_trace_set_fatal(ctx.task_id);
     if (kind == DistSubmitKind::Alloc) {
         DIST_ERRF("[dist_engine] alloc task id %d exceeds kFlagCap %d\n", ctx.task_id, kFlagCap);
     } else {
@@ -365,6 +411,15 @@ PTO_DEVICE_FUNC bool dist_submit_check_task_cap(const DistSubmitCtx &ctx, DistSu
     return false;
 }
 
+PTO_DEVICE_FUNC bool dist_submit_tensor_uses_manual_dependency(const L0TaskArgs &args, int32_t index) {
+#if defined(__CCE_AICORE__)
+    return args.tensor(index).tensor_from_gm() ? args.tensor(index).gm_ref().manual_dep :
+                                                 args.tensor(index).ref().manual_dep;
+#else
+    return args.tensor(index).ref().manual_dep;
+#endif
+}
+
 PTO_DEVICE_FUNC uint32_t
 calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout, uint32_t &register_mask) {
     layout.total_output_size = 0;
@@ -372,7 +427,10 @@ calculate_output_layout(const L0TaskArgs &args, DistOutputLayout &layout, uint32
     uint32_t output_mask = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         const TensorArgType tag = args.tag(i);
-        if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) register_mask |= 1u << i;
+        if ((tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) &&
+            !dist_submit_tensor_uses_manual_dependency(args, i)) {
+            register_mask |= 1u << i;
+        }
         if (tag != TensorArgType::OUTPUT) continue;
         output_mask |= 1u << i;
         layout.buffer_sizes[i] = TensorCreateInfo::buffer_size_bytes(args.tensor(i).create_info());
@@ -393,7 +451,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
     uint64_t task_base = PTO2_ALIGN_UP(ctx.self->heap_next, PTO2_PACKED_OUTPUT_ALIGN);
     if (total > 0 && g_dist.heap_base != nullptr) {
         if (total > ring) {
-            set_fatal();
+            fdwic_trace_set_fatal(ctx.task_id);
             if (kind == DistSubmitKind::Alloc) {
                 DIST_ERRF(
                     "[dist_engine] alloc task %d outputs %llu B exceed heap ring %zu B\n", ctx.task_id,
@@ -417,7 +475,7 @@ PTO_DEVICE_FUNC bool dist_submit_materialize_args(const L0TaskArgs &args, DistSu
         if ((output_mask & 1u) == 0) continue;
         const auto &ci = args.tensor(i).create_info();
         if (g_dist.heap_base == nullptr) {
-            set_fatal();
+            fdwic_trace_set_fatal(ctx.task_id);
             if (kind == DistSubmitKind::Alloc) {
                 DIST_ERRF("[dist_engine] GM output heap not allocated at alloc %d\n", ctx.task_id);
             } else {
@@ -497,7 +555,7 @@ PTO_DEVICE_FUNC void build_ring_slot_from_submit(
 
 PTO_DEVICE_FUNC void dist_submit_prepare_map(__gm__ DistCore *self, int32_t task_id) {
     if (self == nullptr) return;
-    dist_tensor_map_advance_retire(self->map, task_id, g_dist.H);
+    dist_tensor_map_prepare_task(*self, task_id, g_dist.H);
 }
 
 PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count, int32_t producer) {
@@ -507,7 +565,12 @@ PTO_DEVICE_FUNC void dist_submit_add_fanin(int32_t fanin[], int32_t &fanin_count
     if (fanin_count < kMaxFanin) fanin[fanin_count++] = producer;
 }
 
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool
+dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[], int32_t &fanin_count) {
+#else
 PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const DistSubmitCtx &ctx, int32_t fanin[]) {
+#endif
     int32_t fc = 0;
     for (int32_t i = 0; i < ctx.tensor_count; i++) {
         const TensorArgType tag = args.tag(i);
@@ -519,7 +582,15 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
                 dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
             }
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-            const int32_t p = dist_tensor_map_lookup(ctx.self->map, args.tensor(i).gm_ref());
+            if (args.tensor(i).gm_ref().manual_dep) continue;
+#if PTO_FDWIC_SHARED_MAP
+            int32_t p = -1;
+            if (!dist_tensor_map_lookup_for_submit_winner(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id, p)) {
+                return false;
+            }
+#else
+            const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id);
+#endif
             dist_submit_add_fanin(fanin, fc, p);
         } else {
             const Tensor &t = args.tensor(i).ref();
@@ -528,7 +599,13 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
                 dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
             }
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-            const int32_t p = dist_tensor_map_lookup(ctx.self->map, t);
+            if (t.manual_dep) continue;
+#if PTO_FDWIC_SHARED_MAP
+            int32_t p = -1;
+            if (!dist_tensor_map_lookup_for_submit_winner(*ctx.self, t, ctx.task_id, p)) return false;
+#else
+            const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, t, ctx.task_id);
+#endif
             dist_submit_add_fanin(fanin, fc, p);
         }
 #else
@@ -537,47 +614,151 @@ PTO_DEVICE_FUNC int32_t dist_submit_collect_fanin(const L0TaskArgs &args, const 
         if (owner_raw != UINT64_MAX) dist_submit_add_fanin(fanin, fc, static_cast<int32_t>(owner_raw & 0xFFFFFFFFu));
         if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
         if (t.manual_dep) continue;
-        const int32_t p = dist_tensor_map_lookup(ctx.self->map, t);
+#if PTO_FDWIC_SHARED_MAP
+        int32_t p = -1;
+        if (!dist_tensor_map_lookup_for_submit_winner(*ctx.self, t, ctx.task_id, p)) return false;
+#else
+        const int32_t p = dist_tensor_map_lookup_for_task(*ctx.self, t, ctx.task_id);
+#endif
         dist_submit_add_fanin(fanin, fc, p);
 #endif
     }
+#if PTO_FDWIC_SHARED_MAP
+    fanin_count = fc;
+    return true;
+#else
     return fc;
+#endif
 }
 
-PTO_DEVICE_FUNC void dist_submit_insert_existing_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
+#if !PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool dist_submit_insert_existing_tensor(DistSubmitCtx &ctx, const L0TaskArgs &args, int32_t i) {
 #if defined(__CCE_AICORE__)
     if (args.tensor(i).tensor_from_gm()) {
-        dist_tensor_map_insert(ctx.self->map, args.tensor(i).gm_ref(), ctx.task_id);
+        return dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).gm_ref(), ctx.task_id, ctx.won);
     } else {
-        dist_tensor_map_insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
+        return dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).ref(), ctx.task_id, ctx.won);
     }
 #else
-    dist_tensor_map_insert(ctx.self->map, args.tensor(i).ref(), ctx.task_id);
+    return dist_tensor_map_insert_for_task(*ctx.self, args.tensor(i).ref(), ctx.task_id, ctx.won);
 #endif
 }
 
-PTO_DEVICE_FUNC void dist_submit_register_outputs(DistSubmitCtx &ctx, const L0TaskArgs &args, bool include_existing) {
-    if (!include_existing) return;
-    uint32_t register_mask = ctx.register_mask;
-    for (int32_t i = 0; register_mask != 0; i++, register_mask >>= 1) {
-        if ((register_mask & 1u) != 0) dist_submit_insert_existing_tensor(ctx, args, i);
+PTO_DEVICE_FUNC void dist_submit_latch_tensor_map_failure(DistSubmitCtx &ctx) {
+    // Reuse the existing task-cap gate as this worker's failure latch without
+    // adding state or GM reads to normal Submit. Register has already aborted
+    // the current task; later Begin calls start at kFlagCap and cannot Claim or
+    // Build.
+    if (ctx.self != nullptr) ctx.self->local_index = kFlagCap;
+    set_fatal_code(PTO2_ERROR_TENSORMAP_CAPACITY);
+}
+#endif
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC int32_t dist_submit_shared_tensor_map_error_code(DistSharedTensorMapTaskPublishResult result) {
+    switch (result) {
+    case DistSharedTensorMapTaskPublishResult::Committed:
+        return PTO2_ERROR_NONE;
+    case DistSharedTensorMapTaskPublishResult::CapacityBlocked:
+        return PTO2_ERROR_TENSORMAP_CAPACITY;
+    case DistSharedTensorMapTaskPublishResult::PartialPublish:
+        return PTO2_ERROR_TENSORMAP_PARTIAL_PUBLISH;
+    case DistSharedTensorMapTaskPublishResult::ProtocolError:
+    default:
+        return PTO2_ERROR_TENSORMAP_PROTOCOL;
     }
 }
 
-PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
-    __gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind
-) {
-    TRACE_LAP_RESET(self);
-    if (!dist_submit_check_task_cap(ctx, kind)) return false;
-    TRACE_SPAN_BEGIN(materialize_trace);
-    if (!dist_submit_materialize_args(args, ctx, kind)) return false;
-    TRACE_SPAN_END(materialize_trace, self, ctx.task_id, -1, TracePhase::Materialize, 0, static_cast<uint32_t>(kind));
-#if !defined(__CCE_AICORE__)
-    if (fatal_set()) return false;
+PTO_DEVICE_FUNC bool
+dist_submit_handle_shared_tensor_map_result(DistSubmitCtx &ctx, DistSharedTensorMapTaskPublishResult result) {
+    if (result == DistSharedTensorMapTaskPublishResult::Committed) {
+        return true;
+    }
+    if (ctx.self != nullptr) {
+        ctx.self->local_index = kFlagCap;
+    }
+    set_fatal_code(dist_submit_shared_tensor_map_error_code(result));
+    return false;
+}
 #endif
-    TRACE_SPAN_BEGIN(prepare_map_trace);
+
+PTO_DEVICE_FUNC bool dist_submit_register_outputs(DistSubmitCtx &ctx, const L0TaskArgs &args, bool include_existing) {
+#if PTO_FDWIC_SHARED_MAP
+    if (!include_existing || !ctx.won) return true;
+    SharedTensorMapValue entries[MAX_TENSOR_ARGS];
+    uint32_t count = 0;
+    uint32_t register_mask = ctx.register_mask;
+    for (int32_t i = 0; register_mask != 0; i++, register_mask >>= 1) {
+        if ((register_mask & 1u) == 0) continue;
+#if defined(__CCE_AICORE__)
+        entries[count++] = args.tensor(i).tensor_from_gm() ?
+                               dist_shared_tensor_map_make_value(args.tensor(i).gm_ref(), ctx.task_id) :
+                               dist_shared_tensor_map_make_value(args.tensor(i).ref(), ctx.task_id);
+#else
+        entries[count++] = dist_shared_tensor_map_make_value(args.tensor(i).ref(), ctx.task_id);
+#endif
+    }
+    return dist_submit_handle_shared_tensor_map_result(
+        ctx, dist_tensor_map_publish_shared_task(entries, count, ctx.task_id)
+    );
+#else
+    if (!include_existing) return true;
+    uint32_t register_mask = ctx.register_mask;
+    for (int32_t i = 0; register_mask != 0; i++, register_mask >>= 1) {
+        if ((register_mask & 1u) == 0) continue;
+        if (!dist_submit_insert_existing_tensor(ctx, args, i)) {
+            dist_submit_latch_tensor_map_failure(ctx);
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
+#if PTO_FDWIC_SHARED_MAP
+PTO_DEVICE_FUNC bool dist_submit_commit_empty_shared_tensor_map_task(DistSubmitCtx &ctx) {
+    if (!ctx.won) return true;
+    return dist_submit_handle_shared_tensor_map_result(
+        ctx, dist_tensor_map_publish_shared_task(nullptr, 0, ctx.task_id)
+    );
+}
+#endif
+
+PTO_DEVICE_FUNC bool dist_submit_materialize_and_prepare_map(
+    __gm__ DistCore *self, const L0TaskArgs &args, DistSubmitCtx &ctx, DistSubmitKind kind, uint64_t materialize_begin,
+    uint64_t &prepare_map_end
+) {
+    if (!dist_submit_check_task_cap(ctx, kind)) return false;
+    if (!dist_submit_materialize_args(args, ctx, kind)) return false;
+    // Match the business boundary immediately before the swimlane
+    // materialize_end timestamp. Failure paths do not forge an end marker and
+    // are rejected by phase-shape and balance validation.
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::Materialize>();
+    TRACE_TIMESTAMP(materialize_end);
+    TRACE_SPAN_RECORD(
+        materialize_begin, materialize_end, self, ctx.task_id, -1, TracePhase::Materialize, 0,
+        static_cast<uint32_t>(kind)
+    );
+#if !defined(__CCE_AICORE__)
+    if (fdwic_trace_is_fatal(ctx.task_id)) return false;
+#endif
+    // Share the business-call boundary with swimlane PrepareMap. The PMU
+    // variant accumulates only dist_submit_prepare_map(), excluding trace
+    // publication from the preceding phase.
+    fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::PrepareMap>();
     dist_submit_prepare_map(self, ctx.task_id);
-    TRACE_SPAN_END(prepare_map_trace, self, ctx.task_id, -1, TracePhase::PrepareMap, 0, static_cast<uint32_t>(kind));
+    fdwic_submit_pmu_phase_end<FdwicSubmitPmuPhase::PrepareMap>();
+    TRACE_TIMESTAMP(prepare_map_finish);
+    // A compete-first Kernel winner starts swimlane Fanin at the PrepareMap end
+    // boundary. The legacy path has not claimed yet, so ctx.won remains false.
+    if (kind == DistSubmitKind::Kernel && ctx.won) {
+        fdwic_submit_pmu_phase_begin<FdwicSubmitPmuPhase::Fanin>();
+    }
+    TRACE_SPAN_RECORD(
+        materialize_end, prepare_map_finish, self, ctx.task_id, -1, TracePhase::PrepareMap, 0,
+        static_cast<uint32_t>(kind)
+    );
+    prepare_map_end = prepare_map_finish;
     return true;
 }
 

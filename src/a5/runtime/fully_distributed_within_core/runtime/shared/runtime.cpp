@@ -28,6 +28,8 @@ Runtime::Runtime() {
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
     // because the CApi functions don't exist when compiled for device.
 
+    fdwic_build_identity = fdwic_make_build_identity(static_cast<uint32_t>(sizeof(Runtime)));
+
     // Initialize handshake buffers
     memset(workers, 0, sizeof(workers));
     worker_count = 0;
@@ -40,13 +42,14 @@ Runtime::Runtime() {
     dist.shared_addr = 0;
     dist.num_workers = 0;
     dist.swimlane_base = 0;
-    dist.swimlane_enabled = 0;
+    dist.swimlane_level = 0;
     dist.swimlane_records_per_core = 0;
     dist.orch_args.reset();
     dist.ccec_orch_tensor_count = 0;
     dist.ccec_orch_scalar_count = 0;
     dist.done_count = 0;
     fdwic_swimlane_host_shadow_ = nullptr;
+    fdwic_swimlane_dev_allocation_ = 0;
     fdwic_swimlane_dev_base_ = 0;
     fdwic_swimlane_bytes_ = 0;
     fdwic_swimlane_num_cores_ = 0;

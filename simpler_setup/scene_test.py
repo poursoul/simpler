@@ -25,20 +25,215 @@ from __future__ import annotations
 import gc
 import hashlib
 import inspect
+import json
 import logging
 import os
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
+from .fdwic_build_config import fdwic_tensormap_ring_cap_definition
 from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from .pto_isa import ensure_pto_isa_root
 
+if TYPE_CHECKING:
+    from .tools.fdwic_submit_pmu_report import SubmitPmuBuildIdentity
+
 logger = logging.getLogger(__name__)
 
-_compile_cache: dict[tuple[str, str, str], object] = {}
-_aicore_override_cache: dict[tuple[str, str, str], Path] = {}
+_compile_cache: dict[tuple[Any, ...], object] = {}
+_aicore_override_cache: dict[tuple[Any, ...], Path] = {}
+_fdwic_build_identity_cache: dict[tuple[Any, ...], SubmitPmuBuildIdentity] = {}
+
+_FDWIC_TENSORMAP_MODE_ENV = "PTO_FDWIC_TENSORMAP_MODE"
+_FDWIC_TENSORMAP_PRIVATE = "private"
+_FDWIC_TENSORMAP_SHARED = "shared"
+_FDWIC_TENSORMAP_MODES = frozenset({_FDWIC_TENSORMAP_PRIVATE, _FDWIC_TENSORMAP_SHARED})
+_FDWIC_PROFILE_ENV = "PTO_FDWIC_PROFILE"
+_FDWIC_PROFILE_NONE = "none"
+_FDWIC_PROFILE_PERF_CLOCK = "perf-clock"
+_FDWIC_PROFILE_PERF_CLOCK_KERNEL = "perf-clock-kernel"
+_FDWIC_PROFILE_SUBMIT_PMU_NONE = "submit-pmu-none"
+_FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD = "submit-pmu-arg-build"
+_FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET = "submit-pmu-empty-bracket"
+_FDWIC_PROFILE_SUBMIT_PMU_MATERIALIZE = "submit-pmu-materialize"
+_FDWIC_PROFILE_SUBMIT_PMU_CLAIM = "submit-pmu-claim"
+_FDWIC_PROFILE_SUBMIT_PMU_REGISTER = "submit-pmu-register"
+_FDWIC_PROFILE_SUBMIT_PMU_SUBMIT_TRANSITION = "submit-pmu-submit-transition"
+_FDWIC_PROFILE_SUBMIT_PMU_EFDRAIN_CONTROL = "submit-pmu-efdrain-control"
+_FDWIC_PROFILE_SUBMIT_PMU_PREPARE_MAP = "submit-pmu-prepare-map"
+_FDWIC_PROFILE_SUBMIT_PMU_FANIN = "submit-pmu-fanin"
+_FDWIC_PROFILE_SUBMIT_PMU_WINNER_BUILD_CONTROL = "submit-pmu-winner-build-control"
+_FDWIC_PROFILE_SUBMIT_PMU_ALLOC_COMPLETE_CONTROL = "submit-pmu-alloc-complete-control"
+_FDWIC_PROFILE_SUBMIT_PMU_LOSER_REPLAY = "submit-pmu-loser-replay"
+_FDWIC_PERF_CLOCK_ARTIFACTS = {
+    _FDWIC_PROFILE_PERF_CLOCK: ("fdwic_perf_clock_summary.json", "fdwic-perf-clock-v1"),
+    _FDWIC_PROFILE_PERF_CLOCK_KERNEL: (
+        "fdwic_perf_clock_kernel_summary.json",
+        "fdwic-perf-clock-kernel-v1",
+    ),
+}
+_FDWIC_SUBMIT_PMU_PHASE_PROFILES = frozenset(
+    {
+        _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD,
+        _FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET,
+        _FDWIC_PROFILE_SUBMIT_PMU_MATERIALIZE,
+        _FDWIC_PROFILE_SUBMIT_PMU_CLAIM,
+        _FDWIC_PROFILE_SUBMIT_PMU_REGISTER,
+        _FDWIC_PROFILE_SUBMIT_PMU_SUBMIT_TRANSITION,
+        _FDWIC_PROFILE_SUBMIT_PMU_EFDRAIN_CONTROL,
+        _FDWIC_PROFILE_SUBMIT_PMU_PREPARE_MAP,
+        _FDWIC_PROFILE_SUBMIT_PMU_FANIN,
+        _FDWIC_PROFILE_SUBMIT_PMU_WINNER_BUILD_CONTROL,
+        _FDWIC_PROFILE_SUBMIT_PMU_ALLOC_COMPLETE_CONTROL,
+        _FDWIC_PROFILE_SUBMIT_PMU_LOSER_REPLAY,
+    }
+)
+_FDWIC_SUBMIT_PMU_PROFILES = frozenset({_FDWIC_PROFILE_SUBMIT_PMU_NONE, *_FDWIC_SUBMIT_PMU_PHASE_PROFILES})
+_FDWIC_PERF_CLOCK_PROFILES = frozenset(_FDWIC_PERF_CLOCK_ARTIFACTS)
+_FDWIC_ISOLATED_PROFILES = frozenset({*_FDWIC_PERF_CLOCK_PROFILES, *_FDWIC_SUBMIT_PMU_PROFILES})
+_FDWIC_PROFILES = frozenset({_FDWIC_PROFILE_NONE, *_FDWIC_ISOLATED_PROFILES})
+
+
+def _fdwic_tensormap_mode() -> str:
+    mode = os.environ.get(_FDWIC_TENSORMAP_MODE_ENV, _FDWIC_TENSORMAP_PRIVATE) or _FDWIC_TENSORMAP_PRIVATE
+    if mode not in _FDWIC_TENSORMAP_MODES:
+        raise ValueError(f"Unsupported {_FDWIC_TENSORMAP_MODE_ENV}={mode!r}")
+    return mode
+
+
+def _validate_fdwic_tensormap_test_classes(mode: str, classes) -> None:
+    """Keep standalone shared selection on the same L2 FDWIC scope as pytest."""
+    if mode != _FDWIC_TENSORMAP_SHARED:
+        return
+    incompatible = sorted(
+        cls.__name__
+        for cls in classes
+        if getattr(cls, "_st_level", None) != 2 or getattr(cls, "_st_runtime", None) != "fully_distributed_within_core"
+    )
+    if incompatible:
+        raise ValueError(
+            "--fdwic-tensormap shared only accepts level-2 "
+            "fully_distributed_within_core tests; incompatible class(es): " + ", ".join(incompatible)
+        )
+
+
+def _fdwic_tensormap_compile_definitions(platform: str, runtime: str) -> list[str] | None:
+    """Return the explicit FDWIC mode macro for a mode-aware translation unit."""
+    mode = _fdwic_tensormap_mode()
+    is_fdwic = platform in {"a5", "a5sim"} and runtime == "fully_distributed_within_core"
+    if mode == _FDWIC_TENSORMAP_SHARED and not is_fdwic:
+        raise ValueError(
+            f"{_FDWIC_TENSORMAP_MODE_ENV}=shared is only supported by "
+            "the a5/a5sim fully_distributed_within_core runtime"
+        )
+    if not is_fdwic:
+        return None
+    return [
+        f"PTO_FDWIC_SHARED_MAP={1 if mode == _FDWIC_TENSORMAP_SHARED else 0}",
+        fdwic_tensormap_ring_cap_definition(),
+    ]
+
+
+def _fdwic_profile() -> str:
+    profile = os.environ.get(_FDWIC_PROFILE_ENV, _FDWIC_PROFILE_NONE) or _FDWIC_PROFILE_NONE
+    if profile not in _FDWIC_PROFILES:
+        raise ValueError(f"Unsupported {_FDWIC_PROFILE_ENV}={profile!r}")
+    return profile
+
+
+def _fdwic_compile_definitions(profile: str) -> list[str] | None:
+    """Return the ABI-preserving compile gates for one private FDWIC image."""
+    if profile == _FDWIC_PROFILE_PERF_CLOCK:
+        return ["PTO_FDWIC_PERF_CLOCK=1", "PTO_FDWIC_TRACE_ENABLED=0"]
+    if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        return [
+            "PTO_FDWIC_PERF_CLOCK=1",
+            "PTO_FDWIC_PERF_CLOCK_KERNEL=1",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
+        return ["PTO_FDWIC_SUBMIT_PMU=1", "PTO_FDWIC_TRACE_ENABLED=0"]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_ARG_BUILD:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=1",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_EMPTY_BRACKET:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=2",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_MATERIALIZE:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=3",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_CLAIM:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=4",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_REGISTER:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=5",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_SUBMIT_TRANSITION:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=6",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_EFDRAIN_CONTROL:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=7",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_PREPARE_MAP:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=8",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_FANIN:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=9",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_WINNER_BUILD_CONTROL:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=10",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_ALLOC_COMPLETE_CONTROL:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=11",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_LOSER_REPLAY:
+        return [
+            "PTO_FDWIC_SUBMIT_PMU=1",
+            "PTO_FDWIC_SUBMIT_PMU_PHASE_ID=12",
+            "PTO_FDWIC_TRACE_ENABLED=0",
+        ]
+    return None
+
+
+def _profiled_cache_key(cache_key) -> tuple[Any, ...]:
+    base = cache_key if isinstance(cache_key, tuple) else (cache_key,)
+    return (*base, _fdwic_tensormap_mode(), _fdwic_profile())
 
 
 def clear_compile_cache() -> None:
@@ -54,6 +249,7 @@ def clear_compile_cache() -> None:
     """
     _compile_cache.clear()
     _aicore_override_cache.clear()
+    _fdwic_build_identity_cache.clear()
     gc.collect()
 
 
@@ -117,7 +313,179 @@ def _write_aicore_incore_wrapper(cache_key: str, incores: list[dict]) -> Path | 
 
 
 def get_aicore_path_override(cache_key) -> Path | None:
-    return _aicore_override_cache.get(cache_key)
+    return _aicore_override_cache.get(_profiled_cache_key(cache_key))
+
+
+def _fdwic_elf_symbol_rows(binary: Path) -> list[tuple[str, str, str]]:
+    """Return ``(kind, section, name)`` rows from one final FDWIC ELF."""
+    try:
+        result = subprocess.run(
+            ["readelf", "-Ws", "-W", str(binary)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("readelf is required to validate the FDWIC ELF") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"readelf failed for FDWIC ELF {binary}: {result.stderr.strip()}")
+
+    symbol_rows = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 8 or not fields[0].endswith(":"):
+            continue
+        symbol_rows.append((fields[3], fields[6], fields[7]))
+    return symbol_rows
+
+
+def _assert_fdwic_perf_clock_elf(binary: Path, profile: str = _FDWIC_PROFILE_PERF_CLOCK) -> None:
+    """Prove the final CCEC image excludes FDWIC trace/atomic and platform PMU code."""
+    if profile not in _FDWIC_PERF_CLOCK_PROFILES:
+        raise ValueError(f"Unsupported perf-clock ELF profile {profile!r}")
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+
+    required = ["dist_perf_clock_expect_submits"]
+    if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        required.append("dist_perf_clock_kernel_profile_marker")
+    forbidden = [
+        "fdwic_atomic_poll_boundary_slow",
+        "fdwic_swimlane_detail_record_atomic",
+        "g_fdwic_swimlane_",
+        "g_fdwic_atomic_",
+        "g_fdwic_poll_",
+        "set_aicore_profiling_flag",
+        "get_aicore_profiling_flag",
+        "set_l2_swimlane_aicore_head_slot",
+        "get_l2_swimlane_aicore_head",
+        "set_aicore_pmu_ring",
+        "get_aicore_pmu_ring",
+        "set_aicore_pmu_reg_base",
+        "get_aicore_pmu_reg_base",
+        "dist_submit_pmu_expect_submits",
+        "fdwic_submit_pmu_read_counters",
+        "set_fdwic_submit_pmu_reg_base",
+        "get_fdwic_submit_pmu_reg_base",
+        "g_fdwic_submit_pmu_",
+    ]
+    if profile == _FDWIC_PROFILE_PERF_CLOCK:
+        forbidden.extend(("dist_perf_clock_kernel_profile_marker", "g_fdwic_perf_clock_kernel_"))
+    missing = [
+        symbol
+        for symbol in required
+        if not any(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+    ]
+    present = [symbol for symbol in forbidden if any(symbol in name for _kind, _ndx, name in symbol_rows)]
+    if missing or present:
+        details = []
+        if missing:
+            details.append(f"missing defined perf-clock marker(s): {', '.join(missing)}")
+        if present:
+            details.append(f"profiling symbol(s) still present: {', '.join(present)}")
+        raise RuntimeError(f"Invalid perf-clock AICore image {binary}: {'; '.join(details)}")
+
+
+def _assert_fdwic_submit_pmu_elf(binary: Path, profile: str) -> None:
+    """Prove one submit-PMU image contains exactly its selected observer."""
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+
+    phase_readers = (
+        "fdwic_submit_pmu_phase_read_shadow_counters",
+        "fdwic_submit_pmu_phase_read_scalar_shadow",
+        "fdwic_submit_pmu_phase_read_total_shadow",
+    )
+    required = ["dist_submit_pmu_expect_submits", "fdwic_submit_pmu_read_counters"]
+    if profile in _FDWIC_SUBMIT_PMU_PHASE_PROFILES:
+        required.extend(phase_readers)
+    forbidden = (
+        "dist_perf_clock_expect_submits",
+        "g_fdwic_perf_clock_",
+        "fdwic_atomic_poll_boundary_slow",
+        "fdwic_swimlane_detail_record_atomic",
+        "g_fdwic_swimlane_",
+        "g_fdwic_atomic_",
+        "g_fdwic_poll_",
+        "set_aicore_profiling_flag",
+        "get_aicore_profiling_flag",
+        "set_l2_swimlane_aicore_head_slot",
+        "get_l2_swimlane_aicore_head",
+        "set_aicore_pmu_ring",
+        "get_aicore_pmu_ring",
+        "set_aicore_pmu_reg_base",
+        "get_aicore_pmu_reg_base",
+        "pmu_aicore_record_task",
+    )
+    if profile == _FDWIC_PROFILE_SUBMIT_PMU_NONE:
+        forbidden = (*forbidden, *phase_readers)
+    missing = [
+        symbol
+        for symbol in required
+        if not any(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+    ]
+    present = [symbol for symbol in forbidden if any(symbol in name for _kind, _ndx, name in symbol_rows)]
+    if missing or present:
+        details = []
+        if missing:
+            details.append(f"missing defined submit-pmu marker(s): {', '.join(missing)}")
+        if present:
+            details.append(f"unrelated profiling symbol(s) still present: {', '.join(present)}")
+        raise RuntimeError(f"Invalid {profile} AICore image {binary}: {'; '.join(details)}")
+
+
+def _assert_fdwic_submit_pmu_host_elf(binary: Path, profile: str) -> None:
+    """Reject a stale host runtime before it can launch a profiled device case."""
+    if profile not in _FDWIC_SUBMIT_PMU_PROFILES:
+        raise ValueError(f"Unsupported submit-PMU host profile {profile!r}")
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+    required = (
+        "fdwic_submit_pmu_host_init",
+        "fdwic_submit_pmu_host_export",
+        "fdwic_submit_pmu_host_finalize",
+    )
+    missing = [
+        symbol
+        for symbol in required
+        if not any(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+    ]
+    try:
+        image = Path(binary).read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read submit-PMU host runtime {binary}: {exc}") from exc
+    profile_marker = profile.encode("utf-8") + b"\0"
+    if missing or profile_marker not in image:
+        details = []
+        if missing:
+            details.append(f"missing defined host hook(s): {', '.join(missing)}")
+        if profile_marker not in image:
+            details.append(f"missing exact profile marker {profile!r}; rebuild the a5 FDWIC host runtime")
+        raise RuntimeError(f"Invalid {profile} host runtime {binary}: {'; '.join(details)}")
+
+
+def _assert_fdwic_swimlane_elf(binary: Path) -> None:
+    """Prove the normal real-A5 FDWIC image carries the merged phase/atomic observer."""
+    symbol_rows = _fdwic_elf_symbol_rows(binary)
+    required = ("fdwic_atomic_poll_boundary_slow", "fdwic_swimlane_detail_record_atomic")
+    forbidden = (
+        "dist_perf_clock_expect_submits",
+        "dist_submit_pmu_expect_submits",
+        "fdwic_submit_pmu_read_counters",
+        "set_fdwic_submit_pmu_reg_base",
+        "get_fdwic_submit_pmu_reg_base",
+        "g_fdwic_submit_pmu_",
+    )
+    missing = [
+        symbol
+        for symbol in required
+        if not any(kind == "FUNC" and ndx != "UND" and symbol in name for kind, ndx, name in symbol_rows)
+    ]
+    present = [symbol for symbol in forbidden if any(symbol in name for _kind, _ndx, name in symbol_rows)]
+    if missing or present:
+        details = []
+        if missing:
+            details.append(f"missing defined swimlane observer(s): {', '.join(missing)}")
+        if present:
+            details.append(f"isolated-profile symbol(s) leaked into normal image: {', '.join(present)}")
+        raise RuntimeError(f"Invalid FDWIC swimlane AICore image {binary}: {'; '.join(details)}")
 
 
 def maybe_build_aicore_override(
@@ -128,6 +496,9 @@ def maybe_build_aicore_override(
     incores: list[dict],
     pto_isa_root: str | None = None,
 ) -> Path | None:
+    profile = _fdwic_profile()
+    if profile in _FDWIC_ISOLATED_PROFILES and (platform != "a5" or runtime != "fully_distributed_within_core"):
+        raise ValueError(f"{profile} is only supported by the real a5 fully_distributed_within_core runtime")
     if platform not in {"a5", "a5sim"} or runtime != "fully_distributed_within_core":
         return None
 
@@ -141,8 +512,44 @@ def maybe_build_aicore_override(
         if wrapper_path is not None:
             source_paths.append(wrapper_path)
     key = _aicore_extra_cache_key(cache_key, source_paths)
-    builder = RuntimeBuilder(platform)
-    return builder.build_aicore_with_extra_sources(runtime, source_paths, key, pto_isa_root=pto_isa_root)
+    # Keep PTO2_PROFILING at its normal value because it also owns the public
+    # Arg layout. Each isolated evidence profile independently removes the dist
+    # swimlane/atomic path without changing orchestration/incore ABI.
+    compile_definitions = _fdwic_compile_definitions(profile)
+    tensormap_mode = _fdwic_tensormap_mode()
+    builder = RuntimeBuilder(platform, fdwic_tensormap_mode=tensormap_mode)
+    binary = builder.build_aicore_with_extra_sources(
+        runtime,
+        source_paths,
+        key,
+        pto_isa_root=pto_isa_root,
+        compile_definitions=compile_definitions,
+    )
+    if profile in _FDWIC_PERF_CLOCK_PROFILES:
+        _assert_fdwic_perf_clock_elf(binary, profile)
+    elif profile in _FDWIC_SUBMIT_PMU_PROFILES:
+        _assert_fdwic_submit_pmu_elf(binary, profile)
+        from .tools.fdwic_submit_pmu_report import capture_build_identity  # noqa: PLC0415
+
+        baseline_binaries = builder.get_binaries(runtime)
+        host_runtime = baseline_binaries.host_path
+        aicpu_runtime = baseline_binaries.aicpu_path
+        _assert_fdwic_submit_pmu_host_elf(host_runtime, profile)
+        output_key_dir = Path(binary).resolve().parent
+        aicore_build_dir = builder._CACHE_DIR / output_key_dir.relative_to(builder._LIB_DIR) / "aicore"
+        _fdwic_build_identity_cache[cache_key] = capture_build_identity(
+            profile=profile,
+            profiled_cache_key=cache_key,
+            aicore_extra_cache_key=key,
+            compile_definitions=builder.effective_compile_definitions(runtime, compile_definitions),
+            aicore_kernel=binary,
+            aicore_build_dir=aicore_build_dir,
+            host_runtime=host_runtime,
+            aicpu_runtime=aicpu_runtime,
+        )
+    elif platform == "a5" and runtime == "fully_distributed_within_core":
+        _assert_fdwic_swimlane_elf(binary)
+    return binary
 
 
 # ---------------------------------------------------------------------------
@@ -819,6 +1226,8 @@ def _run_swimlane_converter(
     input_path: Path | None = None,
     func_names_path: Path | None = None,
     enable_overhead: bool = False,
+    *,
+    strict_fdwic_v4: bool = False,
 ) -> None:
     """Invoke the bundled swimlane converter as a subprocess.
 
@@ -846,8 +1255,23 @@ def _run_swimlane_converter(
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
             logger.info(result.stdout)
+        if strict_fdwic_v4:
+            if input_path is None:
+                raise RuntimeError("strict FDWIC schema-v4 conversion requires an explicit raw input path")
+            required_outputs = (
+                input_path.parent / "merged_swimlane.json",
+                input_path.parent / "swimlane_exclusive_analysis.json",
+            )
+            missing_outputs = [str(path) for path in required_outputs if not path.is_file() or path.stat().st_size == 0]
+            if missing_outputs:
+                raise RuntimeError(
+                    "FDWIC schema-v4 conversion did not publish required artifact(s): " + ", ".join(missing_outputs)
+                )
         logger.info("Swimlane JSON generation completed")
     except subprocess.CalledProcessError as e:
+        if strict_fdwic_v4:
+            details = e.stderr.strip() or e.stdout.strip() or str(e)
+            raise RuntimeError(f"FDWIC schema-v4 conversion/closure validation failed: {details}") from e
         logger.warning(f"Failed to generate swimlane JSON: {e}")
         if e.stdout:
             logger.debug(f"stdout: {e.stdout}")
@@ -864,6 +1288,8 @@ def _convert_case_swimlane(
     output_prefix: Path,
     callable_spec: dict | None = None,
     enable_overhead: bool = False,
+    *,
+    strict_fdwic_v4: bool = False,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
     just wrote into ``<output_prefix>/l2_swimlane_records.json``. No diff/rename
@@ -874,6 +1300,8 @@ def _convert_case_swimlane(
     logger = logging.getLogger(__name__)
     perf_file = output_prefix / "l2_swimlane_records.json"
     if not perf_file.exists():
+        if strict_fdwic_v4:
+            raise RuntimeError(f"[{case_label}] required FDWIC schema-v4 raw artifact was not produced: {perf_file}")
         logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
         return
 
@@ -884,7 +1312,12 @@ def _convert_case_swimlane(
         safe_label = _sanitize_for_filename(case_label)
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
-    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path, enable_overhead=enable_overhead)
+    _run_swimlane_converter(
+        input_path=perf_file,
+        func_names_path=func_names_path,
+        enable_overhead=enable_overhead,
+        strict_fdwic_v4=strict_fdwic_v4,
+    )
 
 
 def _run_deps_viewer(
@@ -970,6 +1403,197 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         sys.path.remove(str(tools_dir))
 
 
+def _render_case_fdwic_submit_pmu(case_label: str, output_prefix: Path, build_identity: SubmitPmuBuildIdentity) -> Path:
+    """Strictly validate the real-PA Submit-PMU raw and publish its HTML."""
+    from .tools.fdwic_submit_pmu_report import (  # noqa: PLC0415
+        DEFAULT_INPUT_NAME,
+        DEFAULT_OUTPUT_NAME,
+        write_report_with_provenance,
+    )
+
+    raw = output_prefix / DEFAULT_INPUT_NAME
+    if not raw.is_file() or raw.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] submit-PMU did not publish a non-empty {raw}")
+    report = output_prefix / DEFAULT_OUTPUT_NAME
+    published_report, provenance = write_report_with_provenance(raw, build_identity, report)
+    if published_report != report:
+        raise RuntimeError(f"[{case_label}] submit-PMU published an unexpected report path {published_report}")
+    if not report.is_file() or report.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] submit-PMU did not publish a non-empty {report}")
+    if not provenance.is_file() or provenance.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] submit-PMU did not publish a non-empty {provenance}")
+    return report
+
+
+def _validate_case_fdwic_perf_clock(  # noqa: PLR0912 -- fail-closed artifact contract is intentionally explicit
+    case_label: str, output_prefix: Path, profile: str
+) -> Path:
+    """Validate the exact artifact contract of one successful perf-clock case."""
+    try:
+        output_name, schema = _FDWIC_PERF_CLOCK_ARTIFACTS[profile]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported perf-clock artifact profile {profile!r}") from exc
+
+    artifact = output_prefix / output_name
+    if not artifact.is_file() or artifact.stat().st_size == 0:
+        raise RuntimeError(f"[{case_label}] {profile} did not publish a non-empty {artifact}")
+    try:
+        payload = json.loads(artifact.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"[{case_label}] {artifact} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"[{case_label}] {artifact} root must be a JSON object")
+
+    expected_scalars = {
+        "schema": schema,
+        "mode": profile,
+        "num_cores": 96,
+        "aic_cores": 32,
+        "aiv_cores": 64,
+    }
+    mismatches = [
+        f"{name}={payload.get(name)!r}, expected {expected!r}"
+        for name, expected in expected_scalars.items()
+        if payload.get(name) != expected
+    ]
+    if mismatches:
+        raise RuntimeError(f"[{case_label}] invalid {profile} artifact contract: {'; '.join(mismatches)}")
+
+    expected_submits = payload.get("expected_submits_per_core")
+    cores = payload.get("cores")
+    if type(expected_submits) is not int or expected_submits <= 0:
+        raise RuntimeError(f"[{case_label}] {profile} expected_submits_per_core must be a positive integer")
+    if not isinstance(cores, list) or len(cores) != 96 or not all(isinstance(core, dict) for core in cores):
+        raise RuntimeError(f"[{case_label}] {profile} cores must contain exactly 96 objects")
+
+    core_ids = [core.get("core_id") for core in cores]
+    core_types = [core.get("core_type") for core in cores]
+    if set(core_ids) != set(range(96)) or len(core_ids) != len(set(core_ids)):
+        raise RuntimeError(f"[{case_label}] {profile} core_id topology is not exactly 0..95")
+    if core_types.count("aic") != 32 or core_types.count("aiv") != 64:
+        raise RuntimeError(f"[{case_label}] {profile} core_type topology is not 32 AIC + 64 AIV")
+
+    for core in cores:
+        if core.get("submit_count") != expected_submits:
+            raise RuntimeError(
+                f"[{case_label}] {profile} core {core.get('core_id')} submit_count does not match "
+                "expected_submits_per_core"
+            )
+        start = core.get("first_submit_start")
+        end = core.get("last_submit_end")
+        elapsed = core.get("elapsed_ticks")
+        ordered_window = (
+            type(start) is int
+            and type(end) is int
+            and type(elapsed) is int
+            and start > 0
+            and end - start == elapsed
+            and (end > start if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL else end >= start)
+        )
+        if not ordered_window:
+            raise RuntimeError(f"[{case_label}] {profile} core {core.get('core_id')} elapsed tick closure failed")
+
+    global_start = min(core["first_submit_start"] for core in cores)
+    global_end = max(core["last_submit_end"] for core in cores)
+    if (
+        payload.get("global_first_submit_start") != global_start
+        or payload.get("global_last_submit_end") != global_end
+        or payload.get("global_submit_span_ticks") != global_end - global_start
+    ):
+        raise RuntimeError(f"[{case_label}] {profile} global Submit tick closure failed")
+
+    kernel_ticks: list[int] = []
+    kernel_calls: list[int] = []
+    residual_ticks: list[int] = []
+    if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        kernel_ticks = [core.get("kernel_elapsed_ticks") for core in cores]
+        kernel_calls = [core.get("kernel_calls") for core in cores]
+        residual_ticks = [core.get("non_kernel_residual_ticks") for core in cores]
+        if not all(type(value) is int and value >= 0 for value in (*kernel_ticks, *kernel_calls, *residual_ticks)):
+            raise RuntimeError(f"[{case_label}] {profile} per-core Kernel aggregates must be non-negative integers")
+
+    groups = payload.get("groups")
+    if not isinstance(groups, dict):
+        raise RuntimeError(f"[{case_label}] {profile} groups must be a JSON object")
+    for core_type in ("aic", "aiv"):
+        group = groups.get(core_type)
+        typed_cores = [core for core in cores if core["core_type"] == core_type]
+        elapsed_values = [core["elapsed_ticks"] for core in typed_cores]
+        if not isinstance(group, dict):
+            raise RuntimeError(f"[{case_label}] {profile} groups.{core_type} must be a JSON object")
+        expected_group = (
+            {
+                "min_ticks": min(elapsed_values),
+                "max_ticks": max(elapsed_values),
+            }
+            if profile == _FDWIC_PROFILE_PERF_CLOCK
+            else {
+                "cores": len(typed_cores),
+                "elapsed_min_ticks": min(elapsed_values),
+                "elapsed_max_ticks": max(elapsed_values),
+                "elapsed_sum_ticks": sum(elapsed_values),
+                "kernel_min_ticks": min(core["kernel_elapsed_ticks"] for core in typed_cores),
+                "kernel_max_ticks": max(core["kernel_elapsed_ticks"] for core in typed_cores),
+                "kernel_sum_ticks": sum(core["kernel_elapsed_ticks"] for core in typed_cores),
+                "kernel_calls_min": min(core["kernel_calls"] for core in typed_cores),
+                "kernel_calls_max": max(core["kernel_calls"] for core in typed_cores),
+                "kernel_calls_sum": sum(core["kernel_calls"] for core in typed_cores),
+                "residual_min_ticks": min(core["non_kernel_residual_ticks"] for core in typed_cores),
+                "residual_max_ticks": max(core["non_kernel_residual_ticks"] for core in typed_cores),
+                "residual_sum_ticks": sum(core["non_kernel_residual_ticks"] for core in typed_cores),
+            }
+        )
+        group_mismatches = [
+            f"{name}={group.get(name)!r}, recomputed {expected}"
+            for name, expected in expected_group.items()
+            if type(group.get(name)) is not int or group.get(name) != expected
+        ]
+        if group_mismatches:
+            raise RuntimeError(
+                f"[{case_label}] invalid {profile} groups.{core_type} integer aggregates: {'; '.join(group_mismatches)}"
+            )
+
+    if profile == _FDWIC_PROFILE_PERF_CLOCK_KERNEL:
+        if any(
+            kernel + residual != core["elapsed_ticks"]
+            for core, kernel, residual in zip(cores, kernel_ticks, residual_ticks, strict=True)
+        ):
+            raise RuntimeError(f"[{case_label}] {profile} per-core Kernel/residual tick closure failed")
+        if any((calls == 0) != (ticks == 0) for calls, ticks in zip(kernel_calls, kernel_ticks, strict=True)):
+            raise RuntimeError(f"[{case_label}] {profile} per-core Kernel call/tick presence closure failed")
+        exact_aggregates = {
+            "kernel_calls": sum(kernel_calls),
+            "kernel_elapsed_ticks_sum": sum(kernel_ticks),
+            "non_kernel_residual_ticks_sum": sum(residual_ticks),
+        }
+        aggregate_mismatches = [
+            f"{name}={payload.get(name)!r}, recomputed {expected}"
+            for name, expected in exact_aggregates.items()
+            if payload.get(name) != expected
+        ]
+        if aggregate_mismatches:
+            raise RuntimeError(
+                f"[{case_label}] invalid {profile} integer aggregates: {'; '.join(aggregate_mismatches)}"
+            )
+        min_calls = payload.get("min_kernel_calls_in_window")
+        max_calls = payload.get("max_kernel_calls_in_window")
+        batches, remainder = divmod(expected_submits, 5)
+        aic_calls = sum(core["kernel_calls"] for core in cores if core["core_type"] == "aic")
+        aiv_calls = sum(core["kernel_calls"] for core in cores if core["core_type"] == "aiv")
+        if (
+            remainder != 0
+            or type(min_calls) is not int
+            or type(max_calls) is not int
+            or min_calls != batches
+            or max_calls != 4 * batches
+            or not batches <= aic_calls <= 2 * batches
+            or not 0 <= aiv_calls <= 2 * batches
+            or not batches <= exact_aggregates["kernel_calls"] <= 4 * batches
+        ):
+            raise RuntimeError(f"[{case_label}] {profile} global Kernel call range closure failed")
+    return artifact
+
+
 def _format_case_context(cls_name: str, case: dict, worker) -> str:
     platform = worker._config.get("platform", "<unknown>")
     config = case.get("config", {})
@@ -1002,7 +1626,27 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
-    diagnostics_on = enable_l2_swimlane or enable_dump_args or enable_pmu or enable_dep_gen or enable_scope_stats
+    fdwic_profile = _fdwic_profile()
+    isolated_profile_on = fdwic_profile in _FDWIC_ISOLATED_PROFILES
+    submit_pmu_build_identity = None
+    if fdwic_profile in _FDWIC_SUBMIT_PMU_PROFILES:
+        platform = worker._config.get("platform")
+        runtime = getattr(type(cls_inst), "_st_runtime", None)
+        build_identity_key = _profiled_cache_key((type(cls_inst).__qualname__, platform, runtime))
+        submit_pmu_build_identity = _fdwic_build_identity_cache.get(build_identity_key)
+        if submit_pmu_build_identity is None:
+            raise RuntimeError(
+                "Submit-PMU build identity is missing for "
+                f"profiled cache key {build_identity_key!r}; refusing to run without build provenance"
+            )
+    diagnostics_on = (
+        enable_l2_swimlane
+        or enable_dump_args
+        or enable_pmu
+        or enable_dep_gen
+        or enable_scope_stats
+        or isolated_profile_on
+    )
     # device-log timing wraps each case here (not inside _run_and_validate*),
     # the same way swimlane conversion does — _run_and_validate_l2 is overridden
     # by some SceneTestCase subclasses, so threading a kwarg through it would
@@ -1028,6 +1672,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
         dlt_baseline = _snapshot_time() if dlt_on else None
         dlt_offsets = _snapshot_log_offsets(_get_device_log_dir(dlt_device_id)) if dlt_on else None
+        case_succeeded = False
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -1043,21 +1688,33 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 enable_scope_stats=enable_scope_stats,
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
+            case_succeeded = True
         except BaseException as exc:
             exc.add_note(f"SceneTest case context: {case_context}")
             raise
         finally:
             if enable_l2_swimlane:
+                strict_fdwic_v4 = (
+                    case_succeeded
+                    and enable_l2_swimlane == 4
+                    and getattr(cls_inst, "_st_runtime", None) == "fully_distributed_within_core"
+                    and worker._config.get("platform") == "a5"
+                )
                 _convert_case_swimlane(
                     case_label,
                     prefix,
                     callable_spec=callable_spec,
                     enable_overhead=enable_swimlane_overhead,
+                    strict_fdwic_v4=strict_fdwic_v4,
                 )
             if enable_dep_gen:
                 _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
             if enable_scope_stats:
                 _plot_case_scope_stats(case_label, prefix)
+            if case_succeeded and fdwic_profile in _FDWIC_SUBMIT_PMU_PROFILES:
+                _render_case_fdwic_submit_pmu(case_label, prefix, submit_pmu_build_identity)
+            if case_succeeded and fdwic_profile in _FDWIC_PERF_CLOCK_PROFILES:
+                _validate_case_fdwic_perf_clock(case_label, prefix, fdwic_profile)
             if dlt_baseline is not None:
                 _print_device_log_timing(dlt_device_id, dlt_baseline, dlt_offsets, rounds)
 
@@ -1082,6 +1739,7 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
 
 def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     """Compile a chip entry spec (orchestration + incores) -> ChipCallable. Session-cached."""
+    cache_key = _profiled_cache_key(cache_key)
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 
@@ -1098,7 +1756,11 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     kc = KernelCompiler(platform=platform)
     is_sim = platform.endswith("sim")
 
-    orch_binary = kc.compile_orchestration(runtime, orch["source"])
+    orch_binary = kc.compile_orchestration(
+        runtime,
+        orch["source"],
+        compile_definitions=_fdwic_tensormap_compile_definitions(platform, runtime),
+    )
     inc_dirs = kc.get_orchestration_include_dirs(runtime)
 
     kernel_binaries = []
@@ -1214,7 +1876,7 @@ class SceneTestCase:
         cache_key = (cls.__qualname__, platform, cls._st_runtime)
         cls.compile_chip_callable(platform)
         aicore_override = get_aicore_path_override(cache_key)
-        kwargs = {}
+        kwargs = {"fdwic_tensormap_mode": _fdwic_tensormap_mode()}
         if aicore_override is not None:
             kwargs["aicore_path_override"] = aicore_override
         w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime, **kwargs)
@@ -1668,6 +2330,13 @@ class SceneTestCase:
         parser = argparse.ArgumentParser()
         parser.add_argument("-p", "--platform", required=True)
         parser.add_argument(
+            "--fdwic-tensormap",
+            choices=["private", "shared"],
+            default="private",
+            help="Select the compile-time TensorMap artifact family for the "
+            "a5/a5sim fully_distributed_within_core runtime.",
+        )
+        parser.add_argument(
             "-d",
             "--device",
             type=str,
@@ -1801,6 +2470,12 @@ class SceneTestCase:
         )
         args = parser.parse_args()
         configure_logging(args.log_level)
+        if args.fdwic_tensormap == "shared":
+            if args.platform not in {"a5", "a5sim"}:
+                parser.error("--fdwic-tensormap shared requires -p a5 or a5sim")
+            os.environ[_FDWIC_TENSORMAP_MODE_ENV] = _FDWIC_TENSORMAP_SHARED
+        else:
+            os.environ.pop(_FDWIC_TENSORMAP_MODE_ENV, None)
 
         # Match the per-test kernel/orchestration compile to the runtime's
         # sanitizer, and require the runtime preloaded — same as conftest, since
@@ -1899,6 +2574,12 @@ class SceneTestCase:
         selected_by_cls: dict[type, list[dict]] = {}
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
+
+        try:
+            _validate_fdwic_tensormap_test_classes(args.fdwic_tensormap, selected_by_cls)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
 
         # L3 profiling not supported yet (multi-chip-process filename collision).
         # Mirror the pytest-side guard so standalone users get the same early-fail.
@@ -2000,6 +2681,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
     script = os.path.abspath(getattr(module, "__file__", sys.argv[0]))
 
     common = ["-p", args.platform, "--manual", args.manual, "--log-level", args.log_level]
+    if args.fdwic_tensormap != "private":
+        common += ["--fdwic-tensormap", args.fdwic_tensormap]
     if args.sanitizer != "none":
         common += ["--sanitizer", args.sanitizer]
     if args.rounds != 1:

@@ -150,6 +150,55 @@ def pytest_addoption(parser):
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
+        "--fdwic-tensormap",
+        action="store",
+        choices=["private", "shared"],
+        default="private",
+        help="Select the compile-time TensorMap artifact family for the a5/a5sim "
+        "fully_distributed_within_core runtime. The default is private.",
+    )
+    parser.addoption(
+        "--fdwic-profile",
+        action="store",
+        choices=[
+            "none",
+            "perf-clock",
+            "perf-clock-kernel",
+            "submit-pmu-none",
+            "submit-pmu-arg-build",
+            "submit-pmu-empty-bracket",
+            "submit-pmu-materialize",
+            "submit-pmu-claim",
+            "submit-pmu-register",
+            "submit-pmu-submit-transition",
+            "submit-pmu-efdrain-control",
+            "submit-pmu-prepare-map",
+            "submit-pmu-fanin",
+            "submit-pmu-winner-build-control",
+            "submit-pmu-alloc-complete-control",
+            "submit-pmu-loser-replay",
+        ],
+        default="none",
+        help="Select a private fully_distributed_within_core evidence build. "
+        "perf-clock keeps only the first/last Submit device clock per core; "
+        "perf-clock-kernel additionally aggregates linked-kernel time/calls inside that per-core window; "
+        "submit-pmu-none keeps one full Submit-sequence scalar/I-cache PMU window per core; "
+        "submit-pmu-arg-build attributes the Claim-to-Materialize eager-build interval; "
+        "submit-pmu-empty-bracket calibrates the adjacent begin/end observer cost at Claim.end; "
+        "submit-pmu-materialize attributes the current Materialize business span; "
+        "submit-pmu-claim attributes the current Claim business span; "
+        "submit-pmu-register attributes the RegisterOutputs call body; "
+        "submit-pmu-submit-transition attributes adjacent Submit gaps; "
+        "submit-pmu-efdrain-control attributes EfDrain scalar control while excluding linked Kernel calls; "
+        "submit-pmu-prepare-map attributes the dist_submit_prepare_map call body; "
+        "submit-pmu-fanin attributes the dynamic Kernel-winner Fanin span; "
+        "submit-pmu-winner-build-control attributes scalar control inside the complete WinnerBuild time boundary "
+        "while excluding linked Kernel calls; "
+        "submit-pmu-alloc-complete-control attributes scalar control inside the complete AllocComplete time boundary "
+        "while excluding linked Kernel calls; "
+        "submit-pmu-loser-replay attributes the real Kernel-loser drain_block_won call body.",
+    )
+    parser.addoption(
         "--use-example-exec-time",
         action="store_true",
         default=False,
@@ -433,6 +482,85 @@ def _configure_sanitizer(config):
         )
 
 
+def _configure_fdwic_profile(config):
+    """Validate and publish the private real-A5 FDWIC evidence profile."""
+    fdwic_profile = config.getoption("--fdwic-profile", default="none")
+    if fdwic_profile == "none":
+        os.environ.pop("PTO_FDWIC_PROFILE", None)
+        return
+    if fdwic_profile not in {
+        "perf-clock",
+        "perf-clock-kernel",
+        "submit-pmu-none",
+        "submit-pmu-arg-build",
+        "submit-pmu-empty-bracket",
+        "submit-pmu-materialize",
+        "submit-pmu-claim",
+        "submit-pmu-register",
+        "submit-pmu-submit-transition",
+        "submit-pmu-efdrain-control",
+        "submit-pmu-prepare-map",
+        "submit-pmu-fanin",
+        "submit-pmu-winner-build-control",
+        "submit-pmu-alloc-complete-control",
+        "submit-pmu-loser-replay",
+    }:
+        raise pytest.UsageError(f"unsupported --fdwic-profile {fdwic_profile!r}")
+
+    platform = config.getoption("--platform", default=None)
+    runtime = config.getoption("--runtime", default=None)
+    level = config.getoption("--level", default=None)
+    if platform != "a5":
+        raise pytest.UsageError(f"--fdwic-profile {fdwic_profile} requires --platform a5")
+    if runtime not in {None, "fully_distributed_within_core"}:
+        raise pytest.UsageError(f"--fdwic-profile {fdwic_profile} only supports runtime fully_distributed_within_core")
+    if level not in {None, 2}:
+        raise pytest.UsageError(f"--fdwic-profile {fdwic_profile} only supports SceneTest level 2")
+    if config.getoption("--rounds", default=1) != 1:
+        raise pytest.UsageError(
+            f"--fdwic-profile {fdwic_profile} requires --rounds 1 because its per-case artifact is single-run"
+        )
+    conflicting = []
+    for option, label in (
+        ("--enable-l2-swimlane", "--enable-l2-swimlane"),
+        ("--dump-args", "--dump-args"),
+        ("--enable-pmu", "--enable-pmu"),
+        ("--enable-dep-gen", "--enable-dep-gen"),
+        ("--enable-scope-stats", "--enable-scope-stats"),
+        ("--enable-device-log-timing", "--enable-device-log-timing"),
+        ("--enable-swimlane-overhead", "--enable-swimlane-overhead"),
+        ("--use-example-exec-time", "--use-example-exec-time"),
+    ):
+        if config.getoption(option, default=0):
+            conflicting.append(label)
+    if conflicting:
+        raise pytest.UsageError(
+            f"--fdwic-profile {fdwic_profile} must run without other diagnostics: " + ", ".join(conflicting)
+        )
+    os.environ["PTO_FDWIC_PROFILE"] = fdwic_profile
+
+
+def _configure_fdwic_tensormap(config):
+    """Validate and publish the explicit FDWIC TensorMap artifact family."""
+    mode = config.getoption("--fdwic-tensormap", default="private")
+    if mode == "private":
+        os.environ.pop("PTO_FDWIC_TENSORMAP_MODE", None)
+        return
+    if mode != "shared":
+        raise pytest.UsageError(f"unsupported --fdwic-tensormap {mode!r}")
+
+    platform = config.getoption("--platform", default=None)
+    runtime = config.getoption("--runtime", default=None)
+    level = config.getoption("--level", default=None)
+    if platform not in {"a5", "a5sim"}:
+        raise pytest.UsageError(f"--fdwic-tensormap {mode} requires --platform a5 or a5sim")
+    if runtime not in {None, "fully_distributed_within_core"}:
+        raise pytest.UsageError(f"--fdwic-tensormap {mode} only supports runtime fully_distributed_within_core")
+    if level not in {None, 2}:
+        raise pytest.UsageError(f"--fdwic-tensormap {mode} only supports SceneTest level 2")
+    os.environ["PTO_FDWIC_TENSORMAP_MODE"] = mode
+
+
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
@@ -445,6 +573,8 @@ def pytest_configure(config):
     )
 
     _configure_sanitizer(config)
+    _configure_fdwic_tensormap(config)
+    _configure_fdwic_profile(config)
 
     # Configure logging unconditionally (not only when --log-level is passed) so
     # simpler's own WARNINGs — e.g. the device-log-timing "no device log written"
@@ -612,6 +742,65 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         return (0 if level >= 3 else 1, item.nodeid)
 
     items.sort(key=sort_key)
+
+    fdwic_profile = config.getoption("--fdwic-profile", default="none")
+    if fdwic_profile in {
+        "perf-clock",
+        "perf-clock-kernel",
+        "submit-pmu-none",
+        "submit-pmu-arg-build",
+        "submit-pmu-empty-bracket",
+        "submit-pmu-materialize",
+        "submit-pmu-claim",
+        "submit-pmu-register",
+        "submit-pmu-submit-transition",
+        "submit-pmu-efdrain-control",
+        "submit-pmu-prepare-map",
+        "submit-pmu-fanin",
+        "submit-pmu-winner-build-control",
+        "submit-pmu-alloc-complete-control",
+        "submit-pmu-loser-replay",
+    }:
+        incompatible = []
+        for item in items:
+            if any(m.name == "skip" for m in item.iter_markers()):
+                continue
+            cls = getattr(item, "cls", None)
+            if cls is None:
+                incompatible.append(item.nodeid)
+                continue
+            if getattr(cls, "_st_level", None) != 2 or getattr(cls, "_st_runtime", None) != (
+                "fully_distributed_within_core"
+            ):
+                incompatible.append(item.nodeid)
+        if incompatible:
+            sample = ", ".join(incompatible[:3])
+            more = "" if len(incompatible) <= 3 else f" (+{len(incompatible) - 3} more)"
+            raise pytest.UsageError(
+                f"--fdwic-profile {fdwic_profile} only accepts level-2 fully_distributed_within_core tests; "
+                f"incompatible item(s): {sample}{more}"
+            )
+
+    fdwic_tensormap = config.getoption("--fdwic-tensormap", default="private")
+    if fdwic_tensormap == "shared":
+        incompatible = []
+        for item in items:
+            if any(m.name == "skip" for m in item.iter_markers()):
+                continue
+            cls = getattr(item, "cls", None)
+            if (
+                cls is None
+                or getattr(cls, "_st_level", None) != 2
+                or getattr(cls, "_st_runtime", None) != "fully_distributed_within_core"
+            ):
+                incompatible.append(item.nodeid)
+        if incompatible:
+            sample = ", ".join(incompatible[:3])
+            more = "" if len(incompatible) <= 3 else f" (+{len(incompatible) - 3} more)"
+            raise pytest.UsageError(
+                "--fdwic-tensormap shared only accepts level-2 fully_distributed_within_core tests; "
+                f"incompatible item(s): {sample}{more}"
+            )
 
     # L3 perf collection is not supported yet: a single L3 case forks N chip-processes
     # that all write l2_swimlane_records_<ts>.json to the same directory with
@@ -1267,6 +1456,29 @@ def _l2_poisoned():
     return set()
 
 
+def _fdwic_worker_build_config(cls, platform, runtime):
+    """Prepare mode-aware FDWIC worker arguments and pool identity."""
+    if runtime != "fully_distributed_within_core" or platform not in {"a5", "a5sim"}:
+        return {}, ""
+
+    from simpler_setup.scene_test import (  # noqa: PLC0415
+        _fdwic_tensormap_mode,
+        get_aicore_path_override,
+    )
+
+    cache_key = (cls.__qualname__, platform, runtime)
+    cls.compile_chip_callable(platform)
+    tensormap_mode = _fdwic_tensormap_mode()
+    kwargs = {"fdwic_tensormap_mode": tensormap_mode}
+    pool_token = f"{tensormap_mode}:"
+    aicore_override = get_aicore_path_override(cache_key)
+    if aicore_override is not None:
+        aicore_override = aicore_override.resolve()
+        kwargs["aicore_path_override"] = aicore_override
+        pool_token += str(aicore_override)
+    return kwargs, pool_token
+
+
 @pytest.fixture()
 def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
     """Per-test Worker.
@@ -1297,18 +1509,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
         from simpler.worker import Worker  # noqa: PLC0415
 
-        kwargs = {}
-        aicore_pool_token = ""
-        if runtime == "fully_distributed_within_core" and st_platform in {"a5", "a5sim"}:
-            from simpler_setup.scene_test import get_aicore_path_override  # noqa: PLC0415
-
-            cache_key = (cls.__qualname__, st_platform, runtime)
-            cls.compile_chip_callable(st_platform)
-            aicore_override = get_aicore_path_override(cache_key)
-            if aicore_override is not None:
-                aicore_override = aicore_override.resolve()
-                kwargs["aicore_path_override"] = aicore_override
-                aicore_pool_token = str(aicore_override)
+        kwargs, aicore_pool_token = _fdwic_worker_build_config(cls, st_platform, runtime)
 
         # L2 share: reuse any Worker already created for this runtime image in
         # the current process. Under xdist, each worker process is sliced to a

@@ -9,9 +9,9 @@ from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from pathlib import Path
 
-# Reuse the ordinary ABI's labels; do not reuse its fixed 32+64 topology.
+# Resolve beside this file even when imported through importlib by a caller.
 _spec = importlib.util.spec_from_file_location(
-    "ordinary_trace_abi", Path(__file__).resolve().parent.parent / "swimlane_converter.py"
+    "only_scheduler_trace_abi", Path(__file__).resolve().with_name("trace_abi.py")
 )
 abi = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(abi)

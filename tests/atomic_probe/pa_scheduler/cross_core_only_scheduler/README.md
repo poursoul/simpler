@@ -4,6 +4,35 @@
 cross_core_ordinary 复制而来。原目录不变。
 只增加这个独立实验，不实现 DAG 插入模式，不创建 build_graph。
 
+## 独立目录与依赖
+
+本目录可以整体复制到其他位置，不要求位于 Simpler 仓库内。
+构建、运行、泳道转换、空白分析和回归测试均只读取本目录中的源码；
+不需要 PyPTO、simpler_setup 或预先构建 Simpler runtime。
+
+- CPU：Linux、Bash、支持 C++17 的 g++、标准 C++ 库和 pthread。
+- Python 工具：Python 3.10+ 与 venv 支持，仅使用标准库，无需 pip 安装。
+  `setup.sh` 创建本目录自己的 `.venv`，不查找父目录环境。
+- A5：匹配的驱动和 CANN，含 ccec、ld.lld、ACL/runtime 库与 PTO 头文件；
+  另需 readelf、rg、awk。当前构建目标固定为 dav-c310-cube/vec，
+  使用 x86_64-linux 工具包路径，并非其他芯片/Host 架构的通用后端。
+- 上板预约：存在 task-submit 时保留独占预约和架构检查；检查脚本已随包
+  放在 `tools/check_onboard_arch.sh`，不依赖仓库 `.claude` 目录。
+  该检查使用 npu-smi、CANN platform_config，并沿用一小时检测缓存。
+- 内存：SchedulerState 约 1 GiB，另需 workspace、trace 和 Host 镜像空间。
+
+`trace_abi.py` 固化本实验实际使用的 Atomic/DCCI 编号、名称和操作类型，
+与 common 中的 raw ABI 对应，不再 import 父目录转换器。
+`fixtures/` 包含原 ordinary 的两份协议测试副本，已落实 8+8 拓扑及
+路由缓存回归接线，不再运行时读取或改写兄弟目录测试源码。
+原许可证随 [LICENSE](LICENSE) 保留；历史 occupied-count 结论也已
+[收进本目录](docs/occupied_count_reuse.md)。
+
+迁移时复制整个目录即可，但不要带走 `build/`、`.venv/`、
+`__pycache__/` 或 `*.pyc`；在目标机器重新执行 setup 和 build。
+正式的两份 A5 JSON 可以随 `test_record/` 一起复制。
+目录独立化不改变调度/计算协议，也不代表已移植到其他芯片。
+
 ## 执行边界
 
 Host 在 launch 前复用 ordinary 的构参、分配元数据和依赖生成代码，
@@ -95,11 +124,13 @@ payload/context bind、fanin、完成发布以及 drain 检查。
 
 ## 构建与运行
 
-以下命令从本目录执行。Python 使用仓库根目录的 .venv。
+以下命令从本目录执行，脚本也可通过绝对路径从其他工作目录调用。
 
 ~~~bash
-bash build.sh cpu swimlane
-bash run.sh swimlane cpu --real-compute-counts 6,28,4,1 \
+bash setup.sh
+bash test.sh
+bash build.sh cpu perf-clock
+bash run.sh perf-clock cpu --real-compute-counts 6,28,4,1 \
   --real-compute-pattern layout-diagnostic
 
 # 先 source 现有 CANN 的 set_env.sh，再编译 A5。
@@ -137,10 +168,9 @@ run.sh 输出 build/<backend>/swimlane/capture.*/swimlane.json，
 - 每核同步 kernel 不重叠，最终导出固定为 16 组、32 条 track。
 
 ~~~bash
-# 从仓库根目录执行。
-.venv/bin/python -m unittest discover \
-  -s tests/atomic_probe/pa_scheduler/cross_core_only_scheduler \
-  -p 'test_*.py' -v
+# 从本目录执行；不需要仓库根目录的 Python 环境。
+bash setup.sh
+bash test.sh
 ~~~
 
 2026-09-11：已获用户授权直接使用 device 0；
@@ -153,6 +183,24 @@ CPU 文件不进入正式记录。
 最新 v2 两种负载的设备泳道与 perf-clock 校验均通过；
 此前 occupied-count 复用试验的结论单独保留在调查记录中，
 它与本轮保留的 fanin/路由流程简化不是同一个候选。
+
+2026-09-14 独立化验证：在仓库外的带空格目录中重新 setup，
+31 项测试通过；副本没有父目录转换器或兄弟实验目录，
+并以不同工作目录和 Python isolated 模式检查导入及协议。
+CPU/A5 的 swimlane、perf-clock 四种构建通过。
+两种 real-compute 次数的 CPU perf-clock 数值与协议校验通过；
+device 0 上两种次数的 A5 swimlane、perf-clock 和数值校验均通过。
+A5 两份新导出均为 16 核、32 条 track、1024 个 kernel，
+空白分析脚本可独立运行，业务未标注时间为零。
+新采集仅用于搬迁验证，不替换正式记录、不作性能对比。
+原始两份正式采集经本地 ABI 重新转换，输出与原正式 JSON 内容完全相同。
+
+**CPU 完整 trace 的已知限制**：本机两种 real-compute 次数均遇到
+trace 校验失败；6/28/4/1 在校验入口读取内存确认多个 worker
+达到每核 65536 条上限且 dropped 非零。CPU 算术及等待时间远大于
+A5，逐次记录 polling 会耗尽固定容量；数值和任务闭环仍通过，
+但不完整 trace 必须拒绝导出。本轮没有更改容量、关闭校验或修改
+调度逻辑；CPU real-compute 回归使用 perf-clock，实际泳道使用 A5。
 
 正式 JSON 和计时口径见 [实测记录](test_record/2026-09-11/README.md)。
 

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-ORDINARY = ROOT.parent / "cross_core_ordinary"
+FIXTURES = ROOT / "fixtures"
 
 
 class ExecProtocolTest(unittest.TestCase):
@@ -31,25 +31,11 @@ class ExecProtocolTest(unittest.TestCase):
         self.assertIn("4080 reference-equivalence checks", result)
 
     def test_shared_protocol(self):
-        source = (ORDINARY / "protocol_probe/test/test_shared_exec_protocol.cpp").read_text()
-        source = source.replace('"../../common/shared_exec_protocol.h"', '"shared_exec_protocol.h"')
+        source = (FIXTURES / "test_shared_exec_protocol.cpp").read_text()
         self.assertIn("[PASS] cross-core shared execution protocol", self.compile_run(source))
 
     def test_execute_scan_and_route_cache_lifetime(self):
-        source = (ORDINARY / "test/test_cross_core_exec_scan.cpp").read_text()
-        # Adapt only the fixture's topology to the experiment's existing 8+8 contract.
-        for before, after in (
-            ("kAivBuildOwner = 34", "kAivBuildOwner = 8"),
-            ("aic_workers{7, 1, 31, 12}", "aic_workers{7, 1, 3, 2}"),
-            ("aiv_workers{63, 32, 95, 47}", "aiv_workers{15, 8, 11, 9}"),
-            ("vector_id / 2U", "vector_id"),
-            ("1U + vector_id % 2U", "1U"),
-            ("6U +", "2U +"),
-        ):
-            self.assertIn(before, source)
-            source = source.replace(before, after)
-        source = source.replace("int main() {", (ROOT / "test_route_cache_lifetime.inc").read_text()
-                                + "\nint main() {\n    TestRouteCacheLifetime();")
+        source = (FIXTURES / "test_cross_core_exec_scan.cpp").read_text()
         result = self.compile_run(source, shared=True)
         self.assertIn("[PASS] owner-route-cache-lifetime", result)
         self.assertIn("[PASS] cross-core Execute ticket and drain closure", result)

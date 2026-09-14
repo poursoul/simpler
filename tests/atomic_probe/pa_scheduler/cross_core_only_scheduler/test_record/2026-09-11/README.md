@@ -80,7 +80,7 @@ observer finish 窗口分别为 2.733574 / 0.831423 ms。
 
 曾试过同一次 progress 调用复用 occupied count，以减少重复统计扫描，
 无可重复性能收益，已撤回。
-详细 A/B 结论见[调查记录](../../../../../../docs/investigations/2026-09-only-scheduler-occupied-count-reuse.md)。
+详细 A/B 结论见[调查记录](../../docs/occupied_count_reuse.md)。
 当时的源代码只增加观察；无新增调度策略。回归 perf-clock 两种各 1 次为
 2628.531 / 728.377 μs，均通过，不作为新的性能中位数。
 

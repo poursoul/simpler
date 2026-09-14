@@ -20,6 +20,12 @@ if [[ "$BACKEND" == cpu ]]; then
     "$ROOT/cpu/main.cpp" "$ROOT/common/host_prepare.cpp" -o "$OUT/pa_scheduler_cpu"
 else
   : "${ASCEND_HOME_PATH:?source the existing CANN environment first}"
+  for tool in readelf rg awk; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "Required A5 build-check tool is missing: $tool" >&2
+      exit 2
+    fi
+  done
   PTO_ROOT="${PTO_ISA_ROOT:-$ASCEND_HOME_PATH/x86_64-linux}"
   CCEC="$ASCEND_HOME_PATH/bin/ccec"
   # Mixed ELF holds two distinct 1152-byte role objects (2304 bytes total)

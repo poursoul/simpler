@@ -2,7 +2,6 @@
 # B256 only. Source the existing CANN environment before using ccec.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$ROOT/../../../.." && pwd)"
 COMMAND="${1:-swimlane}"
 BACKEND="${2:-ccec}"
 shift "$(( $# >= 2 ? 2 : $# ))"
@@ -31,7 +30,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 run_binary() {
   if [[ "$BACKEND" == ccec ]] && command -v task-submit >/dev/null 2>&1; then
-    bash "$REPO/.claude/skills/onboard-arch-precheck/check.sh" a5
+    bash "$ROOT/tools/check_onboard_arch.sh" a5
     local device=0 previous="" argument quoted
     for argument in "$@"; do
       if [[ "$previous" == --device ]]; then device="$argument"; fi
@@ -51,9 +50,9 @@ if [[ "$COMMAND" == run ]]; then
   run_binary "${ARGS[@]}" "$@"
   exit
 fi
-PYTHON="$REPO/.venv/bin/python"
+PYTHON="$ROOT/.venv/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
-  echo "Project-local .venv/bin/python is required." >&2
+  echo "Run bash $ROOT/setup.sh first to create this directory's .venv." >&2
   exit 2
 fi
 # Keep intermediate data under ignored build/, not test_record/.

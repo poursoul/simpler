@@ -30,7 +30,7 @@ cross_core_ordinary 复制而来。原目录不变。
 
 迁移时复制整个目录即可，但不要带走 `build/`、`.venv/`、
 `__pycache__/` 或 `*.pyc`；在目标机器重新执行 setup 和 build。
-正式的两份 A5 JSON 可以随 `test_record/` 一起复制。
+正式 A5 JSON 可以随 `test_record/` 一起复制。
 目录独立化不改变调度/计算协议，也不代表已移植到其他芯片。
 
 ## 执行边界
@@ -39,6 +39,37 @@ Host 在 launch 前复用 ordinary 的构参、分配元数据和依赖生成代
 生成完整不可变执行镜像。构建时的 CPU executor 只推进元数据生命周期，
 不执行计算；随后将 1024 个 kernel cell 复位为 BUILT，
 将执行 ticket/token/drain 状态复位。256 个 Alloc 已完成。
+
+取得设备 SchedulerState 的实际 GM 地址后，Host 在同一准备阶段调用
+`PrepareStaticExecutionBindings`，完成 tensor descriptor 地址重定位、
+scalar 参数及只读 Local/GlobalContext 填充，随后才 H2D 和 launch。
+这就是本实验中 build/prepare 侧的预绑定，不新增设备 build_graph。
+CPU 回归则使用 CPU 执行镜像的实际地址。
+
+每个 kernel task 在 payload 原有空闲容量内放入 512 B 参数/context 表；
+SharedExecCell、SchedulerState、ExecutionToken 的大小均不变。
+Scalar claim 成功并 acquire 后只关联只读参数表，缓存完成及 fanin 元数据，
+不再逐项填写 descriptor/scalar/context，也不重复检查已固定的
+payload header/layout、PA 参数签名和 context 初值。这些静态检查在
+Host 准备阶段执行，失败时不 launch；动态 Claim/owner/engine 检查、
+payload 边界检查、fanin、fatal、完成与 drain 协议仍保留。
+acquire 范围真实增加 8 条 cache line，计入原有 DCCI span。
+
+预绑定限定于完整且不可变的执行镜像：内联 descriptor、数字 function ID、
+固定 PA 参数形状、稳定的设备地址；所有 active worker 的 sub_block_id=0，
+kernel 同步执行，不修改 async context。未来接入可变/异步 context 或
+运行期扩图时必须重新设计，不能直接沿用这个静态保证。
+通用动态绑定 helper 仍用于 Host 镜像构建和协议回归；只有
+RunOnlyScheduler 选择预绑定。Host/device ABI generation 更新为 55，
+防止旧 Host 与新 kernel 混用。
+
+领取采用单 CAS：`ExpectedPrebuiltPaControl` 根据固定 G1 的 task ID、
+PA 参数形状和 Host owner 重建完整 BUILT 控制字；Host 准备时逐项
+核对实际 cell 与该值一致。设备不提前读取 cell 或 payload，直接
+BUILT→CLAIMED CAS，返回值不匹配即失败，不等待运行期 Build。
+成功后才执行原有 payload DCCI acquire。每份 B256 不再有 Atomic
+site 45 状态预读，仍有 1024 次 site 48 Claim；没有新运行开关。
+本轮不改变 token 布局、初始化方式或本地存储策略。
 
 设备入口是 RunOnlyScheduler，不调用 Submit、Materialize、Register、
 Build 或依赖构建。保留 ordinary 的：
@@ -116,6 +147,10 @@ payload/context bind、fanin、完成发布以及 drain 检查。
 
 后处理把各业务阶段中没有子事件覆盖的区间标为 `[residual]`，
 明确这是源码路径归属，不是新增的指令测量。
+`dispatch_binding=host_prebound` 的新采集将 ExecBind 内 residual 改名为
+`Claim bookkeeping / attach prebuilt dispatch and task metadata`，
+避免继续把它解释成逐项填写 descriptor/context；时间边界不变。
+未带该标记的历史采集仍显示旧业务名称。
 计算 track 的间隙标为 No task issued，不冒称 engine idle/PMU。
 为保证 Perfetto 的依赖箭头仍绑定真实 producer，间隙显示在 producer
 结束后留 1 tick（A5 为 1 ns）；完整间隙与显示保护值保留在 args。
@@ -202,7 +237,20 @@ A5，逐次记录 polling 会耗尽固定容量；数值和任务闭环仍通过
 但不完整 trace 必须拒绝导出。本轮没有更改容量、关闭校验或修改
 调度逻辑；CPU real-compute 回归使用 perf-clock，实际泳道使用 A5。
 
-正式 JSON 和计时口径见 [实测记录](test_record/2026-09-11/README.md)。
+2026-09-14 预绑定优化：33 项测试通过，包含参数重定位、context 初值、
+参数表不可变、claim 竞争失败和边界拒绝、旧绑定协议及独立目录回归。
+CPU 两种次数的 perf-clock、A5 两份完整泳道和两种次数各 3 轮 A/B
+perf-clock 均通过数值及任务闭环校验。局部 residual 与完整 ExecBind
+都下降，额外 DCCI 开销计入对比。
+
+随后单 CAS 优化：37 项测试通过，包括固定控制字覆盖、无状态预读、
+错 task/owner/engine/长度/阶段拒绝，以及转换器的逐 task Claim 闭合。
+两种次数的 CPU perf-clock、A5 完整泳道和各 3 轮 A/B 独立计时通过。
+新泳道通过 Perfetto 实际导入，旧正式 JSON 已按用户要求删除。
+
+最新两份正式 JSON、静态化边界和实测数据见
+[单 CAS + 预绑定记录](test_record/2026-09-14/README.md)；
+[此前流程优化记录](test_record/2026-09-11/README.md) 仅保留历史说明。
 
 设备统计状态必须由入口持有独立的 block-local LocalStats。
 当前 mixed ELF 各保留一个 1152 B 的 AIC/AIV 对象，位于 4 KiB 预留区内；

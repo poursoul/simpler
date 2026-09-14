@@ -60,6 +60,18 @@ def business_fixture():
     return raw
 
 
+def single_cas_fixture():
+    raw = business_fixture()
+    raw["metadata"].update(dispatch_binding="host_prebound", claim_strategy="prebuilt_single_cas")
+    for r in list(raw["fdwic_events"]):
+        if r[5] == "ExecBind":
+            raw["fdwic_events"].append(r[:3] + [r[3], -1, "Atomic", r[6], r[7], 0x54, 48])
+            worker = raw["metadata"]["workers"][r[0]]
+            worker["records"] += 1
+            worker["atomic_calls"] += 1
+    return raw
+
+
 class ConverterTest(unittest.TestCase):
     def setUp(self):
         self.raw = fixture()
@@ -168,6 +180,50 @@ class ConverterTest(unittest.TestCase):
         raw = business_fixture()
         raw["fdwic_events"] = [r for r in raw["fdwic_events"] if r[5] != "ExecBind"]
         with self.assertRaisesRegex(ValueError, "incomplete ExecBind"):
+            converter.convert(raw)
+
+    def test_prebound_bind_label_preserves_measurement(self):
+        raw = business_fixture()
+        original = converter.convert(raw)
+        raw["metadata"]["dispatch_binding"] = "host_prebound"
+        prebound = converter.convert(raw)
+        old = [e for e in original["traceEvents"]
+               if e.get("args", {}).get("parent_stage") == "ExecBind"]
+        new = [e for e in prebound["traceEvents"]
+               if e.get("args", {}).get("parent_stage") == "ExecBind"]
+        self.assertEqual(len(new), 1024)
+        self.assertTrue(all(e["name"] ==
+                            "Payload checks / descriptor and context binding [residual]" for e in old))
+        self.assertTrue(all(e["name"] ==
+                            "Claim bookkeeping / attach prebuilt dispatch and task metadata [residual]" for e in new))
+        self.assertEqual([{k: v for k, v in e.items() if k != "name"} for e in old],
+                         [{k: v for k, v in e.items() if k != "name"} for e in new])
+
+    def test_single_cas_claim_coverage(self):
+        trace = converter.convert(single_cas_fixture())
+        self.assertEqual(trace["metadata"]["claim_strategy"], "prebuilt_single_cas")
+        claims = [e for e in trace["traceEvents"]
+                  if e.get("cat") == "scalar.atomic" and e["args"]["site_id"] == 48]
+        self.assertEqual(len(claims), 1024)
+
+    def test_single_cas_rejects_state_peek(self):
+        raw = single_cas_fixture()
+        next(r for r in raw["fdwic_events"] if r[5] == "Atomic")[8:10] = [0x50, 45]
+        with self.assertRaisesRegex(ValueError, "single-CAS.*state peek"):
+            converter.convert(raw)
+
+    def test_single_cas_rejects_missing_claim(self):
+        raw = single_cas_fixture()
+        claim = next(r for r in raw["fdwic_events"] if r[5] == "Atomic")
+        raw["fdwic_events"].remove(claim)
+        with self.assertRaisesRegex(ValueError, "single-CAS.*claim coverage"):
+            converter.convert(raw)
+
+    def test_single_cas_rejects_duplicate_task_claim(self):
+        raw = single_cas_fixture()
+        claims = [r for r in raw["fdwic_events"] if r[5] == "Atomic"]
+        claims[1][3] = claims[0][3]
+        with self.assertRaisesRegex(ValueError, "single-CAS.*claim coverage"):
             converter.convert(raw)
 
     def test_business_rejects_scan_count(self):

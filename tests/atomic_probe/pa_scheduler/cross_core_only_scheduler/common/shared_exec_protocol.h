@@ -420,17 +420,49 @@ struct alignas(kExecCacheLineBytes) ExecutionTokenControl {
 
 struct alignas(kExecCacheLineBytes) ExecutionDispatchBinding {
     // 这 50 个入口对应通用 dispatch ABI：有效 tensor/scalar 参数在
-    // 前缀中，local/global context 固定占最后两个入口。这里不保存
-    // builder 侧 self-pointer，executor 取得 payload 后必须重新绑定。
+    // 前缀中，local/global context 固定占最后两个入口。通用路径在
+    // Claim 后填本 token；only-scheduler 改用 launch 前重定位的只读表，
+    // prepared_args_address 只关联该表，不复制参数或保留 Host self-pointer。
     uint64_t args[kExecDispatchArgCount];
     uint8_t local_context[kExecLocalContextBytes];
     uint8_t global_context[kExecGlobalContextBytes];
+    uint32_t reserved;
+    uint64_t prepared_args_address;
     uint8_t padding[
         kExecDispatchBindingBytes -
         kExecDispatchArgCount * sizeof(uint64_t) -
-        kExecLocalContextBytes - kExecGlobalContextBytes
+        kExecLocalContextBytes - kExecGlobalContextBytes - 12U
     ];
 };
+
+// Stored after the ordinary payload's rounded-up extent, inside its unused
+// capacity. Preparation rejects images that cannot fit this immutable suffix.
+struct alignas(kExecCacheLineBytes) PreparedExecBinding {
+    uint64_t completion_vend;
+    uint64_t function_and_reference;
+    uint64_t shape_and_scalar_offset;
+    uint32_t payload_bytes;
+    uint32_t reserved;
+    uint64_t args[kExecDispatchArgCount];
+    uint8_t local_context[kExecLocalContextBytes];
+    uint8_t global_context[kExecGlobalContextBytes];
+    uint8_t padding[28];
+};
+static_assert(sizeof(PreparedExecBinding) == 512, "prebuilt binding must occupy eight cache lines");
+static_assert(offsetof(PreparedExecBinding, args) == 32 &&
+              offsetof(PreparedExecBinding, local_context) == 432 &&
+              offsetof(PreparedExecBinding, global_context) == 480,
+              "host/device prepared dispatch layout must match");
+static_assert(offsetof(ExecutionDispatchBinding, prepared_args_address) == 456,
+              "prepared dispatch pointer must reuse existing token padding");
+
+PA_DEVICE PA_GM const PreparedExecBinding &PreparedBindingForPayload(
+    PA_GM const ExecPayloadStorage &payload, uint32_t payload_lines
+) {
+    return *reinterpret_cast<PA_GM const PreparedExecBinding *>(
+        reinterpret_cast<uintptr_t>(&payload.words[payload_lines * kExecHeaderWords])
+    );
+}
 
 struct alignas(kExecCacheLineBytes) ExecutionToken {
     ExecutionTokenControl control;
@@ -1215,13 +1247,17 @@ PA_DEVICE bool ValidateBoundExecPayload(
 PA_DEVICE PA_GM uint64_t *ExecutionTokenDispatchArgs(
     PA_GM ExecutionToken &token
 ) {
-    return &token.dispatch.args[0];
+    return token.dispatch.prepared_args_address != 0
+        ? reinterpret_cast<PA_GM uint64_t *>(static_cast<uintptr_t>(token.dispatch.prepared_args_address))
+        : &token.dispatch.args[0];
 }
 
 PA_DEVICE PA_GM const uint64_t *ExecutionTokenDispatchArgs(
     PA_GM const ExecutionToken &token
 ) {
-    return &token.dispatch.args[0];
+    return token.dispatch.prepared_args_address != 0
+        ? reinterpret_cast<PA_GM const uint64_t *>(static_cast<uintptr_t>(token.dispatch.prepared_args_address))
+        : &token.dispatch.args[0];
 }
 
 template <typename Ops, typename Observer>
@@ -1334,6 +1370,7 @@ PA_DEVICE void ResetExecutionToken(
     token.control.completion_vend = 0;
     token.control.function_and_reference = 0;
     token.control.shape_and_scalar_offset = 0;
+    token.dispatch.prepared_args_address = 0;
     token.control.phase = ExecTokenPhase::Idle;
 }
 
@@ -1448,12 +1485,13 @@ PA_DEVICE bool ExecEngineCompatible(
 }
 
 template <typename Ops, typename Observer>
-PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
+PA_DEVICE ExecClaimResult ClaimObservedExecPayload(
     PA_GM SharedExecCell &cell, int64_t observed_raw,
     uint32_t task_id,
     uint32_t execute_owner, ExecEngineClass executor_engine,
     PA_GM ExecutionToken &token,
-    PA_GM SharedExecFatalControl &fatal, Observer &observer
+    PA_GM SharedExecFatalControl &fatal, Observer &observer,
+    uint32_t binding_suffix_bytes
 ) {
     if (token.control.phase != ExecTokenPhase::Idle) {
         return ExecClaimResult::TokenBusy;
@@ -1491,6 +1529,11 @@ PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
         )) {
         return ExecClaimResult::Incompatible;
     }
+    if (observed.payload_lines * kExecCacheLineBytes + binding_suffix_bytes > sizeof(ExecPayloadStorage)) {
+        (void)PublishExecFatal<Ops>(fatal, ExecFatalReason::InvalidBuiltControl,
+                                  task_id, execute_owner, observer);
+        return ExecClaimResult::InvalidControl;
+    }
     const int64_t claimed_raw = static_cast<int64_t>(
         EncodeExecState(
             ExecPhase::Claimed, observed.build_owner,
@@ -1520,7 +1563,7 @@ PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
 
     const uint64_t published_bytes =
         static_cast<uint64_t>(observed.payload_lines) *
-        kExecCacheLineBytes;
+        kExecCacheLineBytes + binding_suffix_bytes;
     // CAS 返回值已经在上面的分支中被消费。这个窄 hook 只用于比较
     // “直接 Invalidate”与“额外前置 DSB”，不得在其中读取 payload。
     Ops::BeforePayloadAcquire(task_id);
@@ -1532,6 +1575,20 @@ PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
     // BUILT 发布后没有 ordinary writer。唯一 Claim winner invalidate 后直接
     // 使用这份 immutable payload，只把可变 phase/fanin 前缀留在 owner-local
     // token，避免再向 GM token 复制 10~16 条 cacheline。
+
+    return ExecClaimResult::Claimed;
+}
+
+template <typename Ops, typename Observer>
+PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
+    PA_GM SharedExecCell &cell, int64_t observed_raw, uint32_t task_id,
+    uint32_t execute_owner, ExecEngineClass executor_engine,
+    PA_GM ExecutionToken &token, PA_GM SharedExecFatalControl &fatal, Observer &observer
+) {
+    const ExecClaimResult claim = ClaimObservedExecPayload<Ops>(
+        cell, observed_raw, task_id, execute_owner, executor_engine, token, fatal, observer, 0);
+    if (claim != ExecClaimResult::Claimed) return claim;
+    const DecodedExecState observed = DecodeExecState(observed_raw);
 
     ExecPayloadHeader header{};
     ExecPayloadLayout layout{};
@@ -1563,6 +1620,29 @@ PA_DEVICE ExecClaimResult ClaimAndBindObservedExecPayload(
         return ExecClaimResult::InvalidPayload;
     }
     CacheValidatedExecPayloadMetadata(token, header, layout);
+    token.control.phase = ExecTokenPhase::WaitingFanin;
+    return ExecClaimResult::Claimed;
+}
+
+template <typename Ops, typename Observer>
+PA_DEVICE ExecClaimResult ClaimAndBindPreparedExecPayload(
+    PA_GM SharedExecCell &cell, int64_t observed_raw, uint32_t task_id,
+    uint32_t execute_owner, ExecEngineClass executor_engine,
+    PA_GM ExecutionToken &token, PA_GM SharedExecFatalControl &fatal, Observer &observer
+) {
+    const ExecClaimResult claim = ClaimObservedExecPayload<Ops>(
+        cell, observed_raw, task_id, execute_owner, executor_engine, token, fatal, observer,
+        sizeof(PreparedExecBinding));
+    if (claim != ExecClaimResult::Claimed) return claim;
+    // The launch image validates header/layout, arguments and the synchronous
+    // context once. Acquire above covers both the payload and this suffix.
+    PA_GM const PreparedExecBinding &prepared =
+        PreparedBindingForPayload(cell.payload, token.control.payload_lines);
+    token.control.payload_bytes = prepared.payload_bytes;
+    token.control.completion_vend = prepared.completion_vend;
+    token.control.function_and_reference = prepared.function_and_reference;
+    token.control.shape_and_scalar_offset = prepared.shape_and_scalar_offset;
+    token.dispatch.prepared_args_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(prepared.args));
     token.control.phase = ExecTokenPhase::WaitingFanin;
     return ExecClaimResult::Claimed;
 }

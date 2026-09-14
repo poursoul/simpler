@@ -128,9 +128,12 @@ def add_business_coverage(events, metadata, drain, stamp, scale):
             a, b = parent["args"]["start_tick"], parent["args"]["end_tick"]
             for start, end in complement(a, b, children[id(parent)]):
                 residual_count += 1
+                label = RESIDUAL_LABELS[stage]
+                if stage == "ExecBind" and metadata.get("dispatch_binding") == "host_prebound":
+                    label = "Claim bookkeeping / attach prebuilt dispatch and task metadata"
                 events.append(dict(
                     ph="X", pid=w + 1, tid=1, ts=stamp(start), dur=(end-start)*scale,
-                    cat="scalar.residual", name=RESIDUAL_LABELS[stage] + " [residual]",
+                    cat="scalar.residual", name=label + " [residual]",
                     args=dict(worker=w, start_tick=start, end_tick=end, parent_stage=stage,
                               task_id=parent["args"].get("task_id", -1),
                               provenance="derived complement of measured child intervals",
@@ -239,6 +242,17 @@ def validate(raw):
     expected = {t for t in range(1280) if t % 5}
     require(kernels.keys() == commits.keys() == expected, "missing task execution/completion")
     require(set(drain) == set(range(16)), "missing drain")
+    if "claim_strategy" in m:
+        require(m["claim_strategy"] == "prebuilt_single_cas" and detailed and
+                m.get("dispatch_binding") == "host_prebound", "invalid single-CAS contract")
+        require(not any(r[5] == "Atomic" and r[9] == 45 for r in rows),
+                "single-CAS trace contains a cell state peek")
+        claims = [r for r in rows if r[5] == "Atomic" and r[9] == 48]
+        require(Counter(r[3] for r in claims) == Counter({t: 1 for t in expected}),
+                "single-CAS task claim coverage mismatch")
+        for r in claims:
+            require(r[0] == kernels[r[3]][0] and r[8] & (1 << 4),
+                    "single-CAS claim owner/result contract mismatch")
     if m.get("scheduler_detail") == "business_spans_v1":
         require(detailed, "business spans need v2")
         for phase in ("ExecBind", "ExecComplete"):

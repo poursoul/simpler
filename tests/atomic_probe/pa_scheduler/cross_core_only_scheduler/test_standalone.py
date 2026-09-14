@@ -37,7 +37,7 @@ class StandaloneTest(unittest.TestCase):
             "-m", "unittest", "discover", "-s", self.root,
             "-p", "test_exec_protocol.py", "-v",
         )
-        self.assertIn("Ran 3 tests", output)
+        self.assertIn("Ran 4 tests", output)
         self.assertIn("OK", output)
 
 

@@ -313,12 +313,13 @@ struct CcecOps {
         pa_scheduler::TaskKind kind, uint32_t nop_count
     ) {
         // 真正 Simpler dispatch 未来会直接消费 args 表；standalone 的
-        // Cube/Vector 模拟体仍使用专用 workspace，但必须从 token-private
+        // Cube/Vector 模拟体仍使用专用 workspace，但必须从已绑定的
         // binding 进入，避免错误回读 builder 的 TaskArgs/SubmitContext。
-        if (token.dispatch.args[
+        __gm__ const uint64_t *args = pa_scheduler::cross_core::ExecutionTokenDispatchArgs(token);
+        if (args[
                 pa_scheduler::cross_core::kExecDispatchLocalContextIndex
             ] == 0 ||
-            token.dispatch.args[
+            args[
                 pa_scheduler::cross_core::kExecDispatchGlobalContextIndex
             ] == 0) {
             return false;

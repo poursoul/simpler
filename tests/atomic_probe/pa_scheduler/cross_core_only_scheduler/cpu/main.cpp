@@ -10,6 +10,7 @@
  */
 
 #include "../common/only_scheduler_host.h"
+#include "../common/prebuilt_dispatch_host.h"
 #include "../common/winner_workload_host.h"
 
 #define PA_DEVICE inline
@@ -254,12 +255,13 @@ struct CpuOps {
         pa_scheduler::TaskKind kind, uint32_t nop_count
     ) {
         // standalone 计算体使用独立 workspace，不会真的解引用 PA
-        // TensorDesc；但执行入口必须消费 executor-private dispatch，不能
+        // TensorDesc；但执行入口必须消费已绑定的 dispatch，不能
         // 退回只凭 TaskKind 发射的旧边界。
-        if (token.dispatch.args[
+        const auto *args = pa_scheduler::cross_core::ExecutionTokenDispatchArgs(token);
+        if (args[
                 pa_scheduler::cross_core::kExecDispatchLocalContextIndex
             ] == 0 ||
-            token.dispatch.args[
+            args[
                 pa_scheduler::cross_core::kExecDispatchGlobalContextIndex
             ] == 0) {
             return false;
@@ -433,6 +435,9 @@ int main(int argc, char **argv) {
         );
 #endif
         if (!pa_scheduler::host::PrepareExecutionImage(state.get(), options)) {
+            return EXIT_FAILURE;
+        }
+        if (!pa_scheduler::host::PrepareStaticExecutionBindings(*state, reinterpret_cast<uintptr_t>(state.get()))) {
             return EXIT_FAILURE;
         }
         pa_scheduler::host::ConfigureTrace(state.get(), options, trace_memory);

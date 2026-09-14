@@ -542,6 +542,72 @@ PA_DEVICE bool ExecutePaBoundKernel(
     );
 }
 
+// The scheduler-only image is fixed PA G1: Alloc/QK/SF/PV/UP per batch,
+// inline descriptors, and every kernel cell is BUILT by the host owner.
+// Reconstruct the complete expected word without reading any device data.
+// Host preparation checks this same contract before publishing the image.
+PA_DEVICE int64_t ExpectedPrebuiltPaControl(uint32_t task_id) {
+    const uint32_t kind_id = task_id % kTasksPerBatch;
+    const TaskKind kind = static_cast<TaskKind>(kind_id);
+    PaExecShape shape{};
+    PaExecRoute route{};
+    ExecPayloadLayout layout{};
+    if (task_id >= kMaxTasks || !ResolvePaExecShape(kind, shape) ||
+        !ResolvePaExecRoute(kind, static_cast<int32_t>(kind_id) - 1, route) ||
+        !ComputeExecPayloadLayout(shape.tensor_count, shape.scalar_count, shape.fanin_count, layout)) return -1;
+    return static_cast<int64_t>(EncodeExecState(
+        ExecPhase::Built, kExecMaxOwner, kExecUnboundOwner,
+        route.engine_class, layout.payload_lines, task_id));
+}
+
+struct RuntimePaExecBinding {
+    template <typename Observer>
+    PA_DEVICE static int64_t InitialClaimControl(PA_GM SharedExecCell &cell, uint32_t task, Observer &observer) {
+        return observer.LoadCellState(&cell.control.state, task);
+    }
+    template <typename Ops, typename Observer>
+    PA_DEVICE static ExecClaimResult Claim(
+        PA_GM SharedExecCell &cell, int64_t observed, uint32_t task,
+        uint32_t owner, ExecEngineClass engine, PA_GM ExecutionToken &token,
+        PA_GM SharedExecFatalControl &fatal, Observer &observer
+    ) {
+        return ClaimAndBindObservedExecPayload<Ops>(cell, observed, task, owner, engine, token, fatal, observer);
+    }
+    PA_DEVICE static bool BindContext(PA_GM ExecutionToken &token, PA_GM const WorkerState &worker) {
+        return BindPaExecutionTokenDispatchAfterClaim(token, worker);
+    }
+    template <typename Ops>
+    PA_DEVICE static bool Execute(PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+                                 PA_GM ExecutionToken &token, TaskKind kind, uint32_t nops) {
+        return ExecutePaBoundKernel<Ops>(state, worker, token, kind, nops);
+    }
+};
+
+// Only RunOnlyScheduler uses this entry; host construction and the portable
+// protocol tests keep the full dynamic binding contract above.
+struct PrebuiltPaExecBinding {
+    template <typename Observer>
+    PA_DEVICE static int64_t InitialClaimControl(PA_GM SharedExecCell &, uint32_t task, Observer &) {
+        return ExpectedPrebuiltPaControl(task);
+    }
+    template <typename Ops, typename Observer>
+    PA_DEVICE static ExecClaimResult Claim(
+        PA_GM SharedExecCell &cell, int64_t observed, uint32_t task,
+        uint32_t owner, ExecEngineClass engine, PA_GM ExecutionToken &token,
+        PA_GM SharedExecFatalControl &fatal, Observer &observer
+    ) {
+        return ClaimAndBindPreparedExecPayload<Ops>(cell, observed, task, owner, engine, token, fatal, observer);
+    }
+    PA_DEVICE static bool BindContext(PA_GM ExecutionToken &, PA_GM const WorkerState &) { return true; }
+    template <typename Ops>
+    PA_DEVICE static bool Execute(PA_GM SchedulerState *state, PA_GM WorkerState &worker,
+                                 PA_GM ExecutionToken &token, TaskKind kind, uint32_t nops) {
+        // Dynamic role/ownership and EngineInflight are established by the
+        // caller. Static signature/context checks ran before publishing the image.
+        return Ops::ExecuteBoundKernel(state, worker, token, kind, nops);
+    }
+};
+
 template <typename Ops>
 struct PaExecReadySource {
     PA_GM SchedulerState *state;

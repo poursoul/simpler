@@ -8,10 +8,10 @@ PTO 使用该 CANN 附带头文件。用户已授权直接运行 device 0；
 
 ## 正式泳道
 
-仅保留当前流程优化版本，逐次 Atomic + 完整业务描述：
-
-- [6/28/4/1 流程优化后](only_scheduler_a5_8aic8aiv_b256_real_compute_6_28_4_1_flow_optimized_swimlane.json)
-- [1/1/1/1 流程优化后](only_scheduler_a5_8aic8aiv_b256_real_compute_1_1_1_1_flow_optimized_swimlane.json)
+旧泳道 JSON 已按用户要求删除；最新两份见
+[单 CAS + 预绑定记录](../2026-09-14/README.md)。
+本页以下保留 9 月 11 日的历史测量与流程结论，所述“两份泳道”
+指当时的采集，不是当前版本。
 
 以上均为 B256、8 个 active AIC + 8 个 active AIV，
 16 个独立 Scalar，每核两条 track，共 32 条。
@@ -196,6 +196,6 @@ CPU 最新 scalar-NOP 回归完成且导出成功；之前一次 CPU 运行的 t
 header 校验失败（任务语义通过），重采通过，未将失败样本用作交付，
 也未放宽完整 trace 校验。CPU 时间没有作为 A5 性能交付。
 
-本目录仅保留两份流程优化后的正式 JSON 和此说明；
+本目录仅保留这份历史说明，旧正式 JSON 已删除；
 无 raw/log/临时分析过程数据，
 不生成文件 SHA 校验。

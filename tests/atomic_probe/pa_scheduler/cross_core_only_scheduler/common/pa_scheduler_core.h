@@ -4563,7 +4563,7 @@ PA_DEVICE_NOINLINE bool PublishCrossCoreExecTask(
     return true;
 }
 
-template <typename Ops>
+template <typename Ops, typename Binding = cross_core::RuntimePaExecBinding>
 PA_DEVICE bool ProgressCrossCoreActiveToken(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     uint32_t token_slot, DrainPlace place,
@@ -4612,8 +4612,11 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
 
         PA_GM cross_core::SharedExecCell &cell =
             state->exec_cells[waiting_task_id];
-        const int64_t observed_raw = observer.LoadCellState(
-            &cell.control.state, waiting_task_id
+        // Dynamic construction observes publication here. The fully prebuilt
+        // policy supplies its expected word without a read; Claim CAS below
+        // is then the only observation of this mutable cell before acquire.
+        const int64_t observed_raw = Binding::InitialClaimControl(
+            cell, waiting_task_id, observer
         );
         const cross_core::DecodedExecState observed =
             cross_core::DecodeExecState(observed_raw);
@@ -4673,13 +4676,13 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         // 校验；这里仅在 owner-local control 上临时切换，不发布共享状态。
         token.control.phase = cross_core::ExecTokenPhase::Idle;
         const cross_core::ExecClaimResult claim =
-            cross_core::ClaimAndBindObservedExecPayload<Ops>(
+            Binding::template Claim<Ops>(
                 cell, observed_raw, waiting_task_id,
                 worker_id, waiting_engine, token,
                 state->exec_fatal, observer
             );
         if (claim != cross_core::ExecClaimResult::Claimed ||
-            !cross_core::BindPaExecutionTokenDispatchAfterClaim(
+            !Binding::BindContext(
                 token, worker
             )) {
             PublishCrossCoreRuntimeFailure<Ops>(
@@ -4773,7 +4776,7 @@ PA_DEVICE bool ProgressCrossCoreActiveToken(
         );
         const uint64_t kernel_begin =
             TraceTimestamp<Ops>(stats.trace, stats.result);
-        if (!cross_core::ExecutePaBoundKernel<Ops>(
+        if (!Binding::template Execute<Ops>(
                 state, worker, token, kind,
                 NopCountForKind(state->config.nops, kind)
             )) {
@@ -4902,7 +4905,7 @@ PA_DEVICE bool ObserveCrossCoreFinalDrainFatal(
     return true;
 }
 
-template <typename Ops>
+template <typename Ops, typename Binding = cross_core::RuntimePaExecBinding>
 PA_DEVICE bool ProgressCrossCoreOwnedTokens(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     DrainPlace place, LocalStats &stats,
@@ -4921,7 +4924,7 @@ PA_DEVICE bool ProgressCrossCoreOwnedTokens(
              token_slot < cross_core::kExecTokensPerWorker;
              ++token_slot) {
             bool completed = false;
-            if (!ProgressCrossCoreActiveToken<Ops>(
+            if (!ProgressCrossCoreActiveToken<Ops, Binding>(
                     state, worker, token_slot, place,
                     stats, completed
                 )) {
@@ -4945,7 +4948,7 @@ PA_DEVICE bool ProgressCrossCoreOwnedTokens(
 
 // PlanHeaderValidated 只消除 launch 前一次发布、运行期只读的摘要复核，
 // 不放宽 token/cell/payload/fanin/completion 的动态协议检查。
-template <typename Ops, bool PlanHeaderValidated = false>
+template <typename Ops, bool PlanHeaderValidated = false, typename Binding = cross_core::RuntimePaExecBinding>
 PA_DEVICE uint32_t ProgressCrossCoreExec(
     PA_GM SchedulerState *state, PA_GM WorkerState &worker,
     uint32_t task_count, bool production_closed,
@@ -4987,7 +4990,7 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
         CrossCoreEngineForRole(worker.role);
 
     uint32_t completed_count = 0;
-    if (!ProgressCrossCoreOwnedTokens<Ops>(
+    if (!ProgressCrossCoreOwnedTokens<Ops, Binding>(
             state, worker, place, stats, completed_count
         )) {
         return 0;
@@ -5097,7 +5100,7 @@ PA_DEVICE uint32_t ProgressCrossCoreExec(
             TracePhase::ExecTicketBind, ProfilePhase::ReplayTail,
             ticket_begin, TraceTimestamp<Ops>(stats.trace, stats.result)
         );
-        if (!ProgressCrossCoreOwnedTokens<Ops>(
+        if (!ProgressCrossCoreOwnedTokens<Ops, Binding>(
                 state, worker, place, stats, completed_count
             )) {
             return completed_count;
@@ -7439,7 +7442,7 @@ PA_DEVICE void RunOnlySchedulerImpl(
         const uint64_t dispatch_begin = TraceTimestamp<Ops>(stats.trace, stats.result);
         const uint32_t freed =
             cross_core_exec_ok && execute_admission_open
-            ? ProgressCrossCoreExec<Ops, true>(
+            ? ProgressCrossCoreExec<Ops, true, cross_core::PrebuiltPaExecBinding>(
                   state, worker, task_count,
                   /*production_closed=*/false,
                   DrainPlace::FinalDrain, stats

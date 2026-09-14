@@ -153,6 +153,8 @@ inline bool ExportOnlySchedulerRecords(
         "{\"metadata\":{\"schema\":\"pa-only-scheduler-v2\","
         "\"atomic_detail\":\"per_call\","
         "\"scheduler_detail\":\"business_spans_v1\","
+        "\"dispatch_binding\":\"host_prebound\","
+        "\"claim_strategy\":\"prebuilt_single_cas\","
         "\"base\":\"cross_core_ordinary\",\"aic_workers\":8,\"aiv_workers\":8,"
         "\"task_build\":\"host_before_launch\",\"batches\":%u,\"tasks\":%u,"
         "\"clock_freq_hz\":%llu,\"workload_mode\":%u,\"pattern\":\"%s\","

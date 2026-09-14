@@ -30,6 +30,10 @@ class ExecProtocolTest(unittest.TestCase):
         result = self.compile_run((ROOT / "test_fanin_snapshot.cpp").read_text())
         self.assertIn("4080 reference-equivalence checks", result)
 
+    def test_prebuilt_dispatch(self):
+        result = self.compile_run((ROOT / "test_prebuilt_dispatch.cpp").read_text(), shared=True)
+        self.assertIn("[PASS] prebuilt dispatch relocation", result)
+
     def test_shared_protocol(self):
         source = (FIXTURES / "test_shared_exec_protocol.cpp").read_text()
         self.assertIn("[PASS] cross-core shared execution protocol", self.compile_run(source))

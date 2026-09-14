@@ -4,6 +4,7 @@
  * See LICENSE in the root of the software repository.
  */
 #include "../common/only_scheduler_host.h"
+#include "../common/prebuilt_dispatch_host.h"
 #include "../common/winner_workload_host.h"
 #include <acl/acl.h>
 #include <runtime/rt.h>
@@ -100,9 +101,6 @@ int Run(int argc, char **argv) {
     PrintSharedHostHeapAdmission(plan, admission);
     if (!PrepareExecutionImage(state.get(), options)) return EXIT_FAILURE;
     const auto immutable_dispatch = state->exec_dispatch;
-    std::vector<cross_core::ExecPayloadStorage> immutable_payloads;
-    for (uint32_t t = 0; t < state->build_dispatch.task_count; ++t)
-        immutable_payloads.push_back(state->exec_cells[t].payload);
 
     const bool real = workload.mode == WinnerWorkloadMode::RealCompute;
     std::vector<float> workload_image, outputs;
@@ -130,6 +128,11 @@ int Run(int argc, char **argv) {
     Check(error, "register mixed ELF");
     if (!session.kernel) throw std::runtime_error("null kernel handle");
     auto *device = static_cast<SchedulerState *>(session.Allocate(sizeof(SchedulerState)));
+    if (!PrepareStaticExecutionBindings(*state, reinterpret_cast<uintptr_t>(device)))
+        throw std::runtime_error("invalid prebuilt dispatch image");
+    std::vector<cross_core::ExecPayloadStorage> immutable_payloads;
+    for (uint32_t t = 0; t < state->build_dispatch.task_count; ++t)
+        immutable_payloads.push_back(state->exec_cells[t].payload);
     void *workspace = real ? session.Allocate(winner_workload::kWorkspaceBytes) : nullptr;
     void *trace = options.trace_enabled ? session.Allocate(kTraceBytes) : nullptr;
     ConfigureWinnerWorkload(state.get(), workload, workspace);

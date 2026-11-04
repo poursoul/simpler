@@ -137,6 +137,7 @@ nav:
           - 接口与数据布局: zh-cn/design/a5-hbg-async-completion/interfaces-and-layout.md
           - 调度与完成协议: zh-cn/design/a5-hbg-async-completion/protocol.md
           - 后端与资源生命周期: zh-cn/design/a5-hbg-async-completion/backends-and-lifetime.md
+          - 消费准备与准入: zh-cn/design/a5-hbg-async-completion/consumer-preparation.md
           - 实现方案: zh-cn/design/a5-hbg-async-completion/implementation.md
           - 验证与性能验收: zh-cn/design/a5-hbg-async-completion/validation.md
           - 待验证选型: zh-cn/design/a5-hbg-async-completion/choices.md

@@ -28,9 +28,9 @@ SDMA 的发起资格与条件的观察资格分开定义。提交使用经过验
 | 层级 | 职责 |
 | ---- | ---- |
 | 编译器与注册层 | 提供与 kernel 身份绑定的异步能力、条件容量及 writer ABI |
-| Host bind | 展开 task/block/lane 映射，绑定资源身份，预分配记录，持有资源使用关系 |
+| Host bind | 展开 task/block/lane 映射，绑定资源及发布用途，生成消费者范围计划，预分配记录并持有资源 |
 | backend adapter | 验证提交、预留条件槽、登记带资源身份的条件、提供有界观察及可见性操作 |
-| AICore resident scheduler | 释放执行资源，领取 CHECK/FINISH，汇合完成，分段释放后继 |
+| AICore resident scheduler | 释放执行资源，领取 CHECK/FINISH，汇合完成，分段释放后继并推进消费者本核准备 |
 | AICPU 与 run/domain owner | 既有启动、错误监督、核退出、外部访问确认和最终资源回收 |
 
 ```mermaid
@@ -44,14 +44,15 @@ flowchart LR
     R --> J[静态 B/G 原子汇合]
     G --> J
     J --> F[FINISH 发布 DONE 并分段释放后继]
-    F --> D[消费者经过依赖与 admission 后执行]
+    F --> P[消费者本核获取与 cohort 准备汇合]
+    P --> D[通过最终 admission 后执行]
     F --> Q[resolve 完成计数]
     Q --> X[run 与外部资源退休]
 ```
 
 每个声明异步能力的物理执行拥有一个 `AsyncGroup`，每个含此类执行的逻辑 task 拥有一个 `AsyncTaskFinish`。CHECK 和 FINISH 是控制工作，不创建业务 TaskId，不占 dispatch slot，也不取得 cooperative admission。
 
-基础实现采用静态 group 责任计数、常驻记录、平坦活动位图、有界 strong-CAS 目录更新和统一 FINISH 路径。所有记录在 run 内不移动、不回收。纯同步 task 保持既有完成路径；已证明整个 run 无异步能力时，不分配异步区、不探测目录。
+基础实现采用静态 group 责任计数、常驻完成记录、平坦活动位图、有界 strong-CAS 目录更新和统一 FINISH 路径。完成记录在 run 内不移动、不回收；消费准备状态随 slot generation 重新初始化。同步 task 保持既有完成路径，读取异步输出时仍执行本核准备。已证明整个 run 无异步能力且无额外消费获取要求时，不分配相关区域、不探测目录。
 
 ## 3. 完成语义与不变量
 
@@ -63,7 +64,7 @@ flowchart LR
 | ResolveDrained | 后继路由、ready 发布及本 task 完成记账全部收敛 | 不能假定外部 DMA/peer 已停止访问 |
 | RunRetired | 既有 run/核退休和关联外部访问证明成立 | 不能忽略其他 run/peer 的资源使用 |
 
-消费者在读取 payload 前还必须完成其自身核需要的缓存获取操作；观察核的缓存维护不能代替消费者核。
+消费者在读取 payload 前还必须完成其自身核需要的缓存获取操作；观察核的缓存维护不能代替消费者核。该要求独立于消费者的 `may_defer`，范围与数据版本由 Host 的消费计划给出；MIX/sync-start 在全部实际成员准备完成后才取得最终执行许可。
 
 1. 一个物理执行只有一个登记写者，一个可服务记录同时只有一个 lease owner。
 2. group 身份由 run、内部 task ref、block 和 subtask 确定，不依赖可复用 slot 或 DFX 数据。
@@ -81,6 +82,7 @@ flowchart LR
 | [接口与数据布局](a5-hbg-async-completion/interfaces-and-layout.md) | 能力描述、登记接口、资源绑定、记录身份、GM 布局和容量 |
 | [调度与完成协议](a5-hbg-async-completion/protocol.md) | lease、目录、静态汇合、CHECK/FINISH、任务形状与服务预算 |
 | [后端与资源生命周期](a5-hbg-async-completion/backends-and-lifetime.md) | SDMA/COUNTER、提交结果、数据可见性、复用和错误关闭 |
+| [消费准备与准入](a5-hbg-async-completion/consumer-preparation.md) | payload 范围谱系、同步消费者、本核准备状态及 MIX/sync-start 汇合 |
 | [实现方案](a5-hbg-async-completion/implementation.md) | 模块接线、依赖顺序、兼容迁移、错误与 DFX 集成 |
 | [验证与性能验收](a5-hbg-async-completion/validation.md) | 功能矩阵、负对照、硬件资格、性能方法与交付条件 |
 | [待验证选型](a5-hbg-async-completion/choices.md) | 替代实现、验证问题、选择条件及允许改变的合同 |

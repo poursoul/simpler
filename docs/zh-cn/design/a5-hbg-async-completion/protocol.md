@@ -68,8 +68,8 @@ AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；�
 ### 不同任务形状
 
 - **普通/SPMD：** 每个具有异步能力的物理执行结算自己的 G，每个 block 独立释放 B；分波执行不要求同时驻留。
-- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。group 完成不代替 coordinator 的 B 贡献，也不长期占用 MIX mailbox 或 cohort。
-- **sync-start：** 启动许可只约束原计算 cohort。条件等待发生在执行资源释放后；已取得执行许可的核不得夹入 CHECK/FINISH。
+- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。group 完成不代替 coordinator 的 B 贡献，也不长期占用 MIX mailbox 或 cohort。执行前的消费准备须收齐实际 active lane 的 prepared ack，不能用原 arrived ack 代替。
+- **sync-start：** 启动许可只约束原计算 cohort；该 cohort 的全部实际 block/lane 完成消费准备后才能发放最终许可。条件等待发生在执行资源释放后；已取得执行许可的核不得夹入 CHECK/FINISH。
 - **predicate skip：** 合法 skip 走 runtime 的封口/结算尾部，即使业务 kernel 根本未调用，也要结算预分配 G 并释放 B。
 - **Graph：** 每个实例的 child 使用独立 group/join。child 的 TaskDone 通过原 body→EXIT 依赖推进，ENTER/EXIT 本身不分配执行 group。未激活 child 仍保留责任；不能把未执行当成取消。
 
@@ -93,6 +93,8 @@ FINISH 是无业务资源需求的控制记录，由一个 lease owner 推进。
 
 挂链成功后，原 FINISH 不再读写 waiter，因为下一 producer 可立即摘链并改写它。后续只读取自己保存的旧链引用。预算耗尽或队列暂时不可开始发布时，保存唯一责任后交权；不能重新扫描原 wake-list 重建进度。
 
+ready 只授予继续准备和 admission 的资格，不证明实际消费者核已经获取 payload。ENTER/EXIT 和 FINISH 不执行消费者的本核获取；同步消费者同样遵守[消费准备与 cohort 汇合](consumer-preparation.md)。
+
 普通 ready 与 Graph control 的入队都必须提供可识别的“尚未预留、已预留待发布、已公开”状态。内部仍有无界 fanin/CAS 循环，或把未完成发布藏进观察核私有描述符的 helper，不满足此接口。依赖与 admission 判断继续由原调度规则执行，FINISH 不能直接强制消费者进入 kernel。
 
 TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/FINISH 不计入业务 task 数。`pending_completed` 沿用已有持久核本地批量记账和 flush 机制，不把该局部值误认为已发布的全局完成计数。
@@ -105,7 +107,8 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 退出/错误检查
   → 完成回收、Graph control、已有 ready 发布
   → 异步安全服务门
-  → 无私有发布积压时尝试业务 admission
+  → 无私有发布积压时有界推进候选消费准备及 cohort 汇合
+  → 本核准备及适用的 cohort 准备完成后尝试最终业务 admission
   → 已获许可则直接执行 kernel；否则返回未获许可的服务循环
 ```
 
@@ -118,9 +121,13 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 | 目录字观察 | 4 |
 | 候选 lease 探测 | 2 |
 | 领取 CAS | 2 |
-| 条件观察、可见性步骤或依赖路由步骤 | 合计 8 |
+| 条件观察、可见性步骤、消费准备/汇合或依赖路由步骤 | 合计 8 |
 
 上述额度不包含可省略的“免费尾部”。领取前必须为本次可能发生的进度发布、交权、目录终态更新、join 贡献、FINISH 激活和已预留批次发布保留独立最坏预算；目录更新按每次最多 128 个原子操作计价。达到工作预算后不再开始新工作，只完成必要尾部。不同类型操作的实际耗时由[性能验证](validation.md)校准。
+
+最后一个 CHECK 可能先清 CHECK 位，再因 G 递减成为最后贡献者而发布 FINISH 位。这一尾部仅两次目录更新就最多需要 `2 × (1 次原子读 + 127 次 CAS) = 256` 个原子操作；lease、join、数据发布和屏障另行计价。普通工作额度为 8 不限制这个已预留的固定尾部，也不允许省掉其中一次发布。该数值是协议上界，不是常态耗时或已测性能。
+
+消费准备与 CHECK/FINISH 共享本轮普通工作额度，不能各追加一份隐藏 slice；同时有工作时轮换服务，保证预备成员和异步记录都能推进。PREPARING/PREPARED 期间继续经过安全服务门，最终许可后不再插入服务。准备 ack 的发布、cohort start 及既有已预留 ready 批次也各自按实际操作数保留固定尾部预算。
 
 CAS 失败立即返回正常服务，不等待某个 owner，不 sleep，也不给某记录设置固定重试时间。持续 PENDING、扫描与碰撞不刷新进展 watchdog；真实登记完成、条件推进、执行释放和后继发布才属于协议进展。
 

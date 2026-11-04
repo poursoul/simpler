@@ -45,6 +45,8 @@ Host 的实际 owner/lease 保存在既有资源体系中，不把 Host 指针�
 
 同一 group 可以包含多个 binding。COUNTER 从 signal Tensor 的窗口身份建立绑定，不要求 SDMA workspace。同一窗口多个合法信号槽可以共享窗口 binding；不同资源代次必须使用不同 binding。
 
+UseSet 还记录完成条件与 payload 的发布用途；signal/workspace binding 不等于 payload 范围。Host 为所有实际消费者建立独立的 `ConsumerAcquirePlan`，包括 `may_defer=false` 的同步消费者。用途、别名/Graph 传递、范围表示及本核准备协议统一见[消费准备](consumer-preparation.md)。这些计划不能通过消费者是否分配 async group 来筛选。
+
 ### 登记接口
 
 保留 `get_async_ctx(args)`，为 resident 新增带绑定的登记和预留合同：
@@ -87,6 +89,8 @@ G0(task) = logical_block_num * popcount(async_mask)
 | `AsyncTaskFinish` | 每个异步逻辑 task 一个 | 独立 lease 和可移交的 resolver cursor、待发布批次、完成贡献状态 |
 | CHECK/FINISH 目录 | 每类记录各一份 | 每 64 条记录一个 64-bit 活动字，原子访问 |
 | `AsyncResourceBinding` / UseSet 描述 | 按 run 实际绑定数 | Host 完成构造并发布，运行中只读 |
+| `AsyncPublishedUse` / `ConsumerAcquirePlan` / 范围表 | 按实际发布用途与消费者计划数 | Host 构造发布版本、payload 范围、策略和物理执行映射；运行中只读 |
+| `ConsumerPrepareState` / cohort prepared ack | 按需要准备的 live slot / cohort 成员容量 | 本核独占进度；ack 带 run、cohort 和 worker/slot generation，协调者汇合 |
 
 FINISH cursor 至少保存 producer ref、当前 waiter、旧链下一引用、fanin 索引、路由阶段、目标队列类型、总容量为 8 的待发布批次、预留身份及完成记账状态。不能引用原核的栈或私有 pending 描述符。
 
@@ -100,20 +104,25 @@ token 及 sidecar 按容量 `c_e` 预留，不按运行期实际 count 分配；
 
 ## 4. 容量、初始化与同步路径
 
-令 E 为异步物理执行数，T 为相关逻辑任务数，R/U 为绑定和使用描述数，`A(x)=align_up(x,128)`：
+令 E 为异步物理执行数，T 为相关逻辑任务数，R/U 为绑定和使用描述数，P/V 为消费计划/范围条目数，S/M 为准备 slot/cohort 成员容量，`A(x)=align_up(x,128)`：
 
 ```text
 group_bytes = Σ A(group_header + 32*c_e + 4*c_e) + E*(lease_stride + progress_stride)
 task_bytes = T*(join_stride + finish_lease_stride + finish_cursor_stride)
 directory_bytes = 128*(ceil(E/64) + ceil(T/64))
 resource_bytes = R*binding_stride + U*use_descriptor_stride + mapping_bytes
-total_bytes = group_bytes + task_bytes + directory_bytes + resource_bytes + alignment_gaps
+consume_bytes = P*plan_stride + V*range_stride + consume_mapping_bytes
+prepare_bytes = S*prepare_stride + M*prepared_ack_stride + cohort_control_bytes
+total_bytes = group_bytes + task_bytes + directory_bytes + resource_bytes
+              + consume_bytes + prepare_bytes + alignment_gaps
 ```
 
-每个 stride 以真实类型布局为准，不能只报告 token 内容。Host 同时报告分配、初始化和上传字节。空间按总执行数增长，不声称只与峰值在途数相关。
+每个 stride 以真实类型布局为准，不能只报告 token 内容。U 包含发布用途描述；ack 的身份区、原子标记隔离和 cohort 控制状态都计入实际字节。只读计划可共享条目，准备进度仍按执行核/槽独占；无消费用途时 S/M 及相关控制区为零。Host 同时报告分配、初始化和上传字节。空间按总执行数增长，不声称只与峰值在途数相关。
 
 Host 在 launch 前检查：所有乘加和对齐算术无溢出；每个 `c_e` 在 1–64；B/G0 符合当前 `INT16_MAX` 物理执行限制；全局记录索引可表示；设备预算足够；资源及 backend 能力满足。失败不进入设备，也不通过等待运行期回收来获得记录空间。
 
 初始化发布区和目录时与设备访问完全隔离。group/FINISH lease 从 DORMANT 开始，目录为零，join 为该 task 的 `(B0,G0)`；资源引用在 launch 前持有。重复 run 使用新的 run identity，只有前次真正退休后才能重置同一 backing。
 
-纯同步 task 不创建上述完成记录。整 run 的能力描述均明确同步时，Host 不分配异步区域，resident 不执行目录服务；UNKNOWN 元数据不能进入这一快速路径。
+同步 task 不创建 group/join/FINISH，但读取异步输出时仍分配或引用消费计划。准备状态每次 slot 新代次从 UNPREPARED 开始，不能沿用上次执行或另一核的 PREPARED。
+
+整 run 的能力描述均明确同步且没有额外消费获取要求时，Host 不分配异步完成/消费准备区域，resident 不执行目录服务。若外部输入合同另有消费获取要求，只保留相应准备区；它不凭空产生 CHECK/FINISH。UNKNOWN 元数据不能进入已证明同步的快速路径。

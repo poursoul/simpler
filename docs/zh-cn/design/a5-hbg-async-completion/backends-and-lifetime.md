@@ -67,7 +67,9 @@ PyPTO 保持注册专用 waiter：登记开始后只能继续登记或执行允�
 
 缓存维护按实际 cache line 扩展后的范围核对所有权。并发任务即使写不同字节，也不能默认安全地共享会被整行写回的 dirty line；不满足范围/所有权合同的接入必须拒绝或由已有安全 backend 路径处理。
 
-`acquire_completed` 的进度保存在 group，执行发布侧必要的获取和可见性动作；`before_consume` 在实际消费者核执行其本核要求。处理大范围数据时必须分段或独立计价，不能把整段缓存维护算成一个固定成本条件读取。若分段前置操作需要让出，消费者尚不能取得最终执行许可。
+`acquire_completed` 的进度保存在 group，执行发布侧必要的获取和可见性动作；`before_consume` 由[消费准备协议](consumer-preparation.md)在实际消费者核执行。Host 通过发布用途把条件与 payload 范围关联，为同步消费者及经过 Graph control 的消费者也生成计划；不能用 `may_defer` 或 signal 地址决定是否需要获取。backend 必须提供范围粒度、核/读取路径资格和有界步骤。
+
+处理大范围数据时必须分段或独立计价，不能把整段缓存维护算成一个固定成本条件读取。分段进度绑定实际执行核与 slot generation，结束前不取得最终执行许可；MIX/sync-start 还需汇合全部实际成员的准备结果。无需额外维护只在具体读取路径获得 NOOP 资格后成立，不能默认空实现或每个任务无条件清整份 cache。
 
 单调条件允许缓存已满足结果，前提是资源代次稳定、记录不会重置、payload/signal 未被下一 epoch 非法覆写。这些前提由绑定和使用协议保证，不由 `counter >= expected` 推导。
 

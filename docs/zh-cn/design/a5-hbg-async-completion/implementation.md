@@ -8,11 +8,12 @@
 | ---- | -------- | -------- |
 | capability 与注册附属数据 | `src/common/task_interface/`、`python/bindings/`、`python/simpler/callable_identity.py` | 定义版本化能力描述；随 callable 复制、序列化、身份和缓存传递 |
 | 编译与生成器接入 | `simpler_setup/kernel_compiler.py`、PyPTO 编译器与 runner | 为每个产物提供 writer ABI 和可信条件上界；自动传递窗口参数绑定 |
-| Host 异步计划 | A5 HBG `host/runtime_maker.cpp`、`host/native_graph_plan.cpp` | 按实例展开 group；检查容量；构建绑定/UseSet；预分配并发布 image |
+| Host 异步计划 | A5 HBG `host/runtime_maker.cpp`、`host/native_graph_plan.cpp` | 按实例展开 group；构建绑定/UseSet、发布用途及消费者范围计划；检查容量并发布 image |
 | kernel 登记 | `common/intrinsic.h`、`runtime/async_kernel_api.h`、`runtime/backend/sdma/` | 上下文版本、预留/commit、逐条件绑定、明确失败与封口 |
 | 原语与记录 | `runtime/scheduler/scheduler_memory.h` 及异步记录/目录模块 | 实际原子/屏障、lease、静态 join、目录有界更新、类型布局检查 |
 | 执行返回与服务 | `aicore/aicore_executor.cpp`、`scheduler_completion.h` | 封口、slot 释放、安全服务点、同步快速路径与错误传播 |
 | cooperative 完成 | `scheduler_admission.h`、`scheduler_gm_mix.h`、`scheduler_dispatch.h` | 保留计算/admission 计数，单独贡献真实 B release，不提前 TaskDone |
+| 消费准备与准入 | `scheduler_ready.h`、`scheduler_dispatch.h`、`scheduler_gm_mix.h`、`scheduler_admission.h`、`aicore/aicore_executor.cpp` | 拆开物化与 predicate 读取；按实际核/slot generation 续接获取；汇合 MIX/sync-start prepared ack；最终许可前检查 |
 | 后继路由 | `scheduler_ready.h`、`scheduler_graph_control.h` | 共用可续接 resolver、普通/control ready 发布、FINISH drain |
 | 生命周期 | A5 HBG AICPU lifecycle、既有 run/domain/通信 owner | 保持监督职责，持有 UseSet，错误 close 与未知使用隔离 |
 | 诊断 | scheduler protocol、Host 导出和 `simpler_setup/tools/hbg/` | 新事件语义、跨核身份、旧 schema 读取和有界错误报告 |
@@ -32,10 +33,11 @@ bind 按以下顺序执行：
 1. 验证全部 callable 能力、任务形状和 backend 资格。
 2. 展开普通任务及 Graph 实例的物理执行，生成唯一 group 映射、G0/B0 和 FINISH 映射。
 3. 从实际参数/域 owner 取得资源身份、代次、合法区间和使用关系，持有静态 UseSet。
-4. 计算完整 image 大小并检查预算；分配记录、sidecar、目录、映射和绑定表。
-5. 初始化静态数据和控制字，完成既有 launch publication；发布失败保留对应 owner，按是否可能已有设备副作用处理。
+4. 将完成用途关联到 payload 的实际读取范围，解析 alias、多 fanin 和 Graph 参数谱系，为全部物理消费者生成获取计划；同步消费者不能漏掉。无法解析或无 backend 获取资格时拒绝。
+5. 计算完整 image 大小并检查预算；分配记录、sidecar、目录、映射、绑定表及需要的消费准备/ack 状态。
+6. 初始化静态数据和控制字，完成既有 launch publication；发布失败保留对应 owner，按是否可能已有设备副作用处理。
 
-无异步能力的 run 在能力验证后进入原同步布局。正常快路径不扫描异步目录，也不为每个同步执行增加 group 结算。
+无异步能力且无额外消费获取要求的 run 在验证后进入原同步布局。正常快路径不扫描异步目录，也不为每个同步执行增加 group 结算；混合 run 中的同步消费者仍需满足自己的获取计划。
 
 ### dispatch 到返回
 
@@ -49,7 +51,7 @@ bind 按以下顺序执行：
 
 安全服务门先遵循已有完成/控制/发布责任，再按预算服务 CHECK 或 FINISH。CHECK 结束条件和可见性工作后结算 G；最后 join 递减者只发布 FINISH。FINISH 逐步路由后继，所有批次公开后才贡献 run 完成计数。
 
-实际消费者的必要本核缓存获取在最终执行许可之前完成；若该获取需要分段，进度必须属于持久准备状态，不能持有 async lease 等待，也不能取得 cohort 许可后再执行可让出的异步工作。
+实际消费者在依赖就绪和参数物化后，按[消费准备合同](consumer-preparation.md)有界推进自己的范围计划。进度属于本核、当前 slot generation 的持久状态；MIX coordinator 或 sync-start 协调者收齐全部实际成员的 prepared ack 后发布 start。最终 entry gate 同时检查原 admission、当前准备身份及适用的 start，不能只在单核执行入口增加一个 hook。整个准备过程不持有 async lease，取得最终许可后直接执行 kernel。
 
 ## 3. 实施依赖与完成条件
 
@@ -59,6 +61,9 @@ flowchart TD
     B[记录 原子目录 lease 静态 join] --> E[执行返回与 CHECK 服务]
     C[后端提交结果与观察能力] --> E
     D --> E
+    A --> P[消费计划与本核准备]
+    C --> P
+    P --> F
     R[可续接 resolver 与 ready 发布] --> F[普通 COUNTER/SDMA 端到端]
     E --> F
     F --> G[SPMD MIX sync-start Graph]
@@ -71,6 +76,7 @@ flowchart TD
 | 能力/绑定合同 | schema、序列化、身份传递、参数到 binding 映射 | 未知 ABI、跨 run、越界、资源代次负例通过；无仅按地址猜测的绑定 |
 | 原语与布局 | POD 布局、分配器、lease、目录、join | 真实 helper 的并发/边界测试通过，AIC/AIV 编译通过；全部上界有定义 |
 | 后端能力 | 提交结果分类、公共记录映射、观察与缓存操作 | 实际 SDMA/COUNTER 的支持矩阵通过，非零提交异常不能成为零登记成功 |
+| 消费准备 | 发布用途/范围计划、本核 cursor、prepared ack 与最终许可 | 同步消费者、多 fanin/Graph、旧 cache、slot 复用、MIX/sync-start 准备错峰测试通过 |
 | 普通闭环 | 有效上下文、返回封口、安全服务、FINISH | 真实事件晚于返回，独立任务推进，消费者及 payload 结果正确 |
 | 全形状接线 | SPMD、全部 MIX masks、sync-start、Graph | group/block 唯一贡献，实例隔离、零登记/skip、容量边界全部通过 |
 | 生命周期/诊断 | UseSet 持有、错误关闭、事件导出和工具读取 | 故障不提前释放，原始错误保留，旧诊断 schema 可读取 |
@@ -90,7 +96,7 @@ flowchart TD
 
 各 helper 返回明确的成功、未开始/可续接或错误结果。目录协议损坏、非法身份、计数错误不是普通 RETRY。失败一经被观察，调用者先锁存首错并持有相关资源，再进入既有错误收敛；清理失败不能覆盖原始错误。
 
-DFX 使用新的协议版本区分以下事件：`registration_sealed`、`execution_released`、`condition_ready/failed`、`logical_done`、`resolve_drained`。身份包含 run、task/Graph、block/subtask、group、lease、观察 worker、条件类型和 binding generation。PENDING 合并为 span/次数，不在热路径逐次打印。
+DFX 使用新的协议版本区分以下事件：`registration_sealed`、`execution_released`、`condition_ready/failed`、`logical_done`、`resolve_drained`，并记录消费准备推进、PREPARED、cohort start 与执行许可。身份包含 run、task/Graph、block/subtask、group、lease、观察 worker、条件类型和 binding generation；准备事件另含 plan、执行 worker/slot generation 与 cohort sequence。PENDING 合并为 span/次数，不在热路径逐次打印。
 
 业务 task 数不包含 CHECK/FINISH 次数。跨核因果依靠发布/领取/完成关系重建，不仅靠不同核的时间戳排序。诊断开启与否不改变 group 映射、资源持有和协议正确性。
 

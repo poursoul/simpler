@@ -11,6 +11,9 @@
 | capability 复制、序列化、缓存及 IPC | 子 callable 元数据不丢失；二进制、容量或 writer ABI 改变时身份随之改变 |
 | UNKNOWN/不匹配 ABI、容量 0/64/65 | 明确同步与合法零登记分开；异步容量越界在适当阶段拒绝 |
 | 资源绑定 | 同地址不同 generation、旧 run、跨 domain、未知 kind、越界、未对齐均按合同处理 |
+| 消费计划 | 同步消费者也取得 payload 范围；signal 与 payload 分别绑定；alias、多 fanin、Graph PARAM/SUB_TASK 谱系及数据版本不丢失 |
+| 消费准备身份 | worker/slot generation 或 cohort sequence 不匹配不能取得许可；旧 PREPARED/ack 不能被复用 |
+| 范围与 NOOP 拒绝 | 未声明 payload、非法 cache line 共享、无资格读取路径明确失败；不能隐式生成空计划 |
 | 登记预留 | token 和 sidecar 一起 commit；开放预留不能被 count 提前公布；失败不生成成功条件 |
 | lease 交接 | 旧版本 CAS 失败；同一记录同时至多一个 owner；交权前进度可见 |
 | 活动目录 | bit 0/63、重复置/清、同字并发不改邻位；合法 126 次邻位变化后仍可完成 |
@@ -19,11 +22,13 @@
 | 长 fanin/fanout | 每一步受预算约束；跨核续接不丢失、不重复 waiter 或 ready 发布 |
 | 责任移交 | waiter 挂到下一 producer 后立即被其改写，旧 FINISH 仍沿自己保存的旧链继续 |
 | resolve/退休 | TaskDone 可以早于 drain，run 完成及 backing 回收不能早于最后尾部 |
-| 服务点 | publication 持续 RETRY、admission 失败、持续业务 ready 时异步服务仍可达 |
+| 服务点 | publication 持续 RETRY、消费准备/汇合未完成、admission 失败、持续业务 ready 时各类服务仍可达 |
 
 CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于构造最坏合法交错，真实线程测试用于发现并发访问问题；不能只测试与实现同构的另一套计数器。
 
 至少保留以下有效负对照：漏掉零登记 group 结算、让普通观察者读零后再次激活、resolve 前计入完成、挂链后重新读取旧 waiter 链接。每个负对照都必须能使相应测试失败。
+
+消费准备的负对照至少包括：仅按 `may_defer` 调用获取、跨 Graph EXIT 丢失范围、复用上个 slot generation 的 PREPARED、只检查 MIX 一个 lane 或 sync-start 一个 block 的 ack。定向测试必须拒绝这些错误实现；真实 A5 可见性还须用旧 cache 和完整 payload 建立独立证据。
 
 ## 2. 真实异步与任务形状
 
@@ -43,6 +48,25 @@ CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于
 使用真实 `remote_store → notify → waiter → consumer`。先让 waiter 达到实际 AIV 饱和压力，再提交 publisher，确认释放执行核后 publisher 能推进。保持原 workload 的依赖图，不通过给 waiter 增加不必要的 publisher 依赖来回避阻塞问题。
 
 为每种受支持条件验证 AIC、AIV、自核和异核观察组合；消费核要覆盖与提交核、观察核不同的情况。预热消费者旧 cache，并构造目标旧 dirty cache，验证完整 payload 与依赖输出，不能只校验标志。
+
+消费准备需在实际生产准备入口和最终 entry gate 上验证以下矩阵：
+
+| 消费场景 | 验收判据 |
+| -------- | -------- |
+| `may_defer=false` 消费者 | 不分配 async group 仍执行必要获取；已有旧 cache 时读到完整新 payload |
+| 多 fanin、重叠 view/alias | 覆盖全部相关范围，兼容范围合法去重；不同数据版本不被误合并 |
+| `异步写 X → Graph EXIT → 同步读 X` | 获取落实到业务消费者；多 Graph invocation 保持各自 binding/generation |
+| 消费核与提交/观察核均不同 | 诊断确认实际核身份，旧 cache 确实在消费核建立；不能依靠偶然同核通过 |
+| slot 复用及更换执行核 | 准备在新 slot generation/核重新执行；旧 ack、旧 cursor 不可获得许可 |
+| 普通候选准备后暂未获准入 | 本核先执行其他业务后清除旧准备结果，重新获取；不阻塞更早的 cooperative obligation |
+| MIX 3/5/6/7 准备错峰 | 给各 active lane 不同的真实维护范围/步骤；最慢 lane 完成前所有 lane 均无最终许可 |
+| MIX mask 6 的 inactive coordinator | AIC 无业务 slot、已 release 本 lane 后仍能汇合 AIV 准备并发布 start；不得等待 AIV 执行 release 才发 start |
+| sync-start / MIX sync-start | 不同 block/lane 准备错峰；全体到齐前无 kernel 进入，后续执行保持原 cohort 合同 |
+| predicate 读取异步 payload | 覆盖 predicate-only Tensor 不在 body 参数中的普通/Graph 任务；仍生成范围计划且获取先于求值，合法 skip 不发 DMA，并按原合同结算 |
+| 经验证的 NOOP 路径 | 给出具体指令/backend/核资格，旧 cache、跨核、多轮结果通过；换成无资格读取路径时拒绝 |
+| 已就绪外部输入 | 全同步 run 的 READY_INPUT 保留入口 owner/发布版本和本核获取，不生成伪 producer/async group；缺少既有就绪证明时拒绝 |
+
+错峰准备期间独立 CHECK/FINISH 和错误服务必须推进；取得最终许可后不再出现准备或异步服务事件。预热/marker 本身不得增加会改变被测 DAG 的依赖，旧 dirty line 必须按发布侧合同在外部写入前处理；不能把事后 flush 旧数据当成有效获取。
 
 | 任务形状 | 重点 |
 | -------- | ---- |
@@ -75,7 +99,7 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 | 基础通信 | 两卡双向 SDMA、remote_store/notify、真实消费者结果与独立任务进展 |
 | 多 peer | 至少四卡的多个 peer 等待；通知乱序、迟到 peer、每 peer 数据身份可区分 |
 | 多条件/多资源 | 同组多 peer、多窗口及 SDMA/COUNTER 混合，必须等待全部必要条件 |
-| 饱和与任务形状 | waiter 达到真实 AIV 饱和压力；SPMD、MIX、sync-start、Graph 与通信交叉 |
+| 饱和与任务形状 | waiter 达到真实 AIV 饱和压力；SPMD、MIX、sync-start、Graph 与通信交叉，包含同步消费者与错峰准备 |
 | 重复与代次 | 多轮 run、保留域复用、合法独立槽、旧 token/旧窗口、peer 提前覆写下一 epoch |
 | 失败与关闭 | peer 未发布、提交/登记失败、长 PENDING、pending close、核故障和未知外部访问 |
 
@@ -121,13 +145,16 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 | ---- | ---------- |
 | 非零 group 比例从低到高 | 静态 G/动态 P 的真实更新成本、Device 与 Host 开销 |
 | 大 E、小在途数及稀疏尾部 | 目录扫描数、满足到发现延迟、初始化字节 |
-| 单热点与不同空闲核数 | 有效观察、lease 碰撞、目录 RMW、业务干扰 |
+| 单热点、多核竞争与同字集中结束 | 有效观察、lease 碰撞、目录更新及最后 CHECK 清位并发布 FINISH 的固定尾部 |
 | 每组 1/4/64 条条件 | 每条有效观察的移交和屏障成本 |
 | 短/长业务 kernel 混合 | 业务吞吐、检查响应、FINISH 尾延迟 |
 | 长 fanin/fanout、control 混排 | resolver slice 成本、ready 发布和业务公平性 |
+| 不同 payload 范围及 cohort 准备错峰 | 消费计划/准备状态字节、本核维护与汇合成本、满足到消费者执行延迟 |
 | 连续 SDMA 提交 | SQ/flag 背压、kernel 返回时间、实际重叠窗口 |
 
 每组报告 Device 总时间、kernel window、Host bind/端到端、均值及 P95，并报告完整分配/初始化/H2D 字节、峰值在途 group 和总 group 数。同步路径若出现跨重复组稳定、超出 A/A 噪声的退化，必须定位并解决，不能用局部异步收益抵消或隐去；需要改变验收目标时先明确新目标。
+
+目录与尾部实验分别报告有效条件观察、目录更新的次数/重试和耗时、lease 交权及屏障、条件满足到首次发现、到消费者进入 kernel 的延迟。覆盖同字集中结束、单热点多核争用、短业务 kernel 和稀疏尾部；单独列出最后 CHECK 两次目录更新的 256 原子操作预算及额外 lease/join/屏障，不能把它隐入 8 个工作单元。用 L3/L4 诊断解释组成，在相同负载的 L1 对照中判断整图影响。
 
 候选仅在满足相同功能、错误和生命周期合同后比较。选择依据见[选型文档](choices.md)，不将单次 CAS 或局部微基准的收益直接外推为整图收益。
 

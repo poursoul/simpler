@@ -56,6 +56,31 @@ CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于
 
 SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力和零字节请求。已知非零请求返回异常零 handle 时必须失败，不能被归类为合法零登记。
 
+### 多卡用例复用与补齐
+
+优先复用 a2a3 已有多卡异步通信场景的 DAG、通信顺序和 golden，再适配 A5 HBG resident。以下入口提供可复用的业务语义，其原有 runtime 或平台测试结果不构成新 resident 路径资格：
+
+| 现有入口 | 可复用内容 | A5 HBG 适配要求 |
+| -------- | ---------- | --------------- |
+| [a2a3 SDMA deferred demo](../../../../examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/test_sdma_async_completion_demo.py) | 两卡 peer fetch，搬运输出及依赖消费者输出的 golden | 接入 A5 的 workspace、完成记录和全核观察；证明返回后真实 PENDING 窗口 |
+| [共享 deferred_notify](../../../../tests/st/worker/comm_domain/deferred_notify/test_deferred_notify.py) | 两卡远端 payload、signal waiter 与消费者 | 保留原依赖，验证 A5 缓存可见性和 resident 完成；该入口本身不列 A5 onboard |
+| [共享 async_notify](../../../../tests/st/worker/comm_domain/async_notify/test_async_notify.py) | a2a3/A5 两卡通知 counter 和依赖结果 | 从 TMR 接到 HBG resident，增加饱和 waiter 与异核检查 |
+| [A5 SDMA deferred demo](../../../../examples/a5/tensormap_and_ringbuffer/sdma_async_completion_demo/test_sdma_async_completion_demo.py) | A5 通信域 SDMA 资源配置与两卡 golden | 复用 backend 配置，验证新的 HBG 绑定、调度和生命周期 |
+| [HBG async boundary](../../../../tests/fdwic/pa_hbg/spmd/test_async_boundary.py) | 未提供合法异步上下文时的拒绝边界 | 保留适用负例；不能用不发起异步工作的边界测试替代真实通信 |
+
+没有对应正例或故障判据的组合必须构造新增用例；不能只修改平台列表和 runtime 名称。新场景须验证实际运行的是 A5 HBG resident 及目标产物，不能由 legacy、TMR 或 kernel 内阻塞 fallback 获得通过。
+
+| 多卡覆盖 | 必须覆盖的情形 |
+| -------- | -------------- |
+| 基础通信 | 两卡双向 SDMA、remote_store/notify、真实消费者结果与独立任务进展 |
+| 多 peer | 至少四卡的多个 peer 等待；通知乱序、迟到 peer、每 peer 数据身份可区分 |
+| 多条件/多资源 | 同组多 peer、多窗口及 SDMA/COUNTER 混合，必须等待全部必要条件 |
+| 饱和与任务形状 | waiter 达到真实 AIV 饱和压力；SPMD、MIX、sync-start、Graph 与通信交叉 |
+| 重复与代次 | 多轮 run、保留域复用、合法独立槽、旧 token/旧窗口、peer 提前覆写下一 epoch |
+| 失败与关闭 | peer 未发布、提交/登记失败、长 PENDING、pending close、核故障和未知外部访问 |
+
+多卡 fixture 保留逐 rank golden、延迟条件及 peer 身份，不以各 rank 结果相同掩盖串数据。故障用例的预期结果可以是明确失败和资源隔离，但不能是提前成功或未知资源被释放。四卡或故障环境不可用时对应项保持未验证，不用两卡正常场景代替。
+
 ## 3. 错误、复用与关闭
 
 | 注入位置或输入 | 验收判据 |
@@ -74,6 +99,19 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 检查实际资源 owner、引用及后续 admission 行为，不能只检查 scheduler 的 FAILED 位。诊断截断应保留“证据不足”状态，不补造未观察到的完成事实。
 
 ## 4. 性能与选型实验
+
+正式性能测试只在完整新增功能、单卡/多卡用例和受影响的原有功能回归通过之后执行。性能标准采用 [PR #2864](https://github.com/hw-native-sys/simpler/pull/2864) 的用例集合，复用当前仓库中的清单及采集器；历史耗时只作背景，必须在同机同卡重新采集冻结基线与候选。
+
+| 基准输入 | 范围 |
+| -------- | ---- |
+| [fixed-cases.json](../../../../tools/benchmarks/a5_hbg_graph_task/fixed-cases.json) | 7 项固定无 Graph benchmark |
+| [selected-st-cases.json](../../../../tools/benchmarks/a5_hbg_graph_task/selected-st-cases.json) | 11 项具有调度性能价值的 ST |
+| [csa-cases.json](../../../../tools/benchmarks/a5_hbg_graph_task/csa-cases.json) | 1 项 CSA 补充场景 |
+| A5 Qwen3 decode | 40 层、B16、seq_len=3500，验证完整 out/K/V，再单独采集 |
+
+共 19 项无 Graph 用例加 Qwen。使用 [collect.py](../../../../tools/benchmarks/a5_hbg_graph_task/collect.py) 核对实际 pytest case 的参数/config、golden 和产物身份，清单与当前代码不一致时先修正原因。19 项至少各采三批独立进程、每批 100 稳态轮；Qwen 预热 5 轮后采集 100 稳态轮。`spmd_paged_attention` 不加入该参考性能集，但 SPMD 功能验证仍是必需项。
+
+新增异步和多卡性能对照作为补充，不能替换上述原有性能集。完整 sweep 在同一设备 allocation 内串行安排同设备的基线/候选，保留所有原始数据，禁止选择历史不同产物的最佳结果拼成当前资格。
 
 正式性能使用 L1；L3/L4 用于诊断归因，结果不混入 L1。相同机器、设备、输入、计算 kernel 和工作量，先采集 A/A 噪声，再采用 B/A/A/B 的成组对照；建议每组 5 次预热、100 次正式调用，并至少重复三组成对测量。保存所有样本及异常，不只报告最优值。
 

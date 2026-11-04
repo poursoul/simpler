@@ -19,6 +19,9 @@ a5_hbg_case(test_hbg_scheduler_contracts.cpp
 
 a5_hbg_case(test_hbg_graph_view.cpp)
 
+a5_hbg_case(test_hbg_async_directory.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_async_state.cpp NO_OBJS TIMEOUT 20)
+
 a5_hbg_case(test_hbg_ready_pool.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
 

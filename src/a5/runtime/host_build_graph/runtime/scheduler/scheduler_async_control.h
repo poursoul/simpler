@@ -82,13 +82,12 @@ inline __aicore__ bool task_index(SchedulerAsyncLocalState &local, int64_t task_
     if (local.error_code != 0 || local.layout == nullptr || task_ref < 0 ||
         static_cast<uint64_t>(task_ref) >= local.layout->task_count)
         return fail(local, task_ref);
+    // Run-entry acquisition covers these Host-initialized, immutable tables.
     auto *map = scheduler_state_at<uint32_t>(local.base, local.layout->task_map_offset);
-    observe(&map[task_ref], sizeof(uint32_t));
     index = map[task_ref];
     if (index == ASYNC_INVALID_INDEX) return true;
     if (index >= local.layout->async_task_count) return fail(local, task_ref);
     auto *tasks = scheduler_state_at<SchedulerAsyncTaskData>(local.base, local.layout->task_data_offset);
-    observe(&tasks[index], sizeof(SchedulerAsyncTaskData));
     return tasks[index].task_ref == task_ref || fail(local, task_ref);
 }
 
@@ -214,7 +213,6 @@ inline __aicore__ bool scheduler_async_execution_writer(
     if (wide_group_index >= local.layout->group_count) return fail(local, task_ref);
     const uint32_t group_index = static_cast<uint32_t>(wide_group_index);
     auto *offsets = scheduler_state_at<uint64_t>(local.base, local.layout->group_offsets_offset);
-    observe(&offsets[group_index], sizeof(uint64_t));
     const uint64_t offset = offsets[group_index];
     if (!span(local.bytes, offset, 1, sizeof(AsyncGroupData), 128)) return fail(local, task_ref);
     auto *data = scheduler_state_at<AsyncGroupData>(local.base, offset);
@@ -261,7 +259,8 @@ inline __aicore__ bool scheduler_async_begin_execution(
     if (local == nullptr) return true;
     global.async_present = 0;
     AsyncWriter writer{};
-    if (!scheduler_async_execution_writer(*local, task_ref, block, lane, writer)) return false;
+    // A group has one execution in the run; its initial header has no prior writer.
+    if (!scheduler_async_execution_writer(*local, task_ref, block, lane, writer, false)) return false;
     if (writer.image == nullptr) return true;
     if (!pto2::resident::detail::valid(writer)) return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     global.async_image_address = reinterpret_cast<uint64_t>(writer.image);
@@ -290,18 +289,19 @@ scheduler_async_seal_execution(SchedulerAsyncLocalState *local, int64_t task_ref
         );
         return fail(*local, task_ref, data->error_code);
     }
-    auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local->base, local->layout->group_progress_offset);
-    progress[writer.group_index].pending_mask = scheduler_async_condition_mask(data->count);
-    progress[writer.group_index].condition_cursor = 0;
-    progress[writer.group_index].acquire_cursor = 0;
-    publish(data, data->publication_bytes);
-    publish(&progress[writer.group_index], sizeof(SchedulerAsyncGroupProgress));
+    // Sealed records expose only [0, count); unused reserved entries have no reader.
+    publish(data, sizeof(AsyncGroupData) + static_cast<uint64_t>(data->count) * sizeof(DeferredCompletionEntry));
     if (data->count == 0) {
         if (scheduler_async_lease_finish_dormant(leases[writer.group_index]).result !=
             SchedulerAsyncLeaseResult::SUCCESS)
             return fail(*local, task_ref);
         return settle_group(*local, task_ref);
     }
+    auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local->base, local->layout->group_progress_offset);
+    progress[writer.group_index].pending_mask = scheduler_async_condition_mask(data->count);
+    progress[writer.group_index].condition_cursor = 0;
+    progress[writer.group_index].acquire_cursor = 0;
+    publish(&progress[writer.group_index], sizeof(SchedulerAsyncGroupProgress));
     auto *directory =
         scheduler_state_at<SchedulerAsyncDirectoryWord>(local->base, local->layout->check_directory_offset);
     if (scheduler_async_lease_publish(leases[writer.group_index]).result != SchedulerAsyncLeaseResult::SUCCESS ||
@@ -379,7 +379,6 @@ inline __aicore__ bool scheduler_async_check_step(
         return fail(local, ref, code);
     };
     auto *offsets = scheduler_state_at<uint64_t>(local.base, local.layout->group_offsets_offset);
-    observe(&offsets[index], sizeof(uint64_t));
     const uint64_t offset = offsets[index];
     if (!span(local.bytes, offset, 1, sizeof(AsyncGroupData), 128)) return failed(-1);
     auto *data = scheduler_state_at<AsyncGroupData>(local.base, offset);

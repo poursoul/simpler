@@ -21,6 +21,8 @@ CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 ph
 
 kernel 返回后的执行尾部先核对登记错误、开放预留、count 与容量，再封口。非零条件组初始化未满足 mask 和游标，发布数据、RUNNABLE 及目录位后才释放本次执行的局部义务；零登记/skip 走直接终态路径。任何提交副作用不明或登记错误都禁止正常 TaskDone。
 
+封口发布覆盖记录头及 `[0, count)` 的条件条目；预留但未登记的条目没有读取者，不需要逐项写回。零登记组只发布记录头，直接结算 group，不初始化或发布 CHECK 进度。分配容量仍是登记上限，不表示每次执行都需要发布整个预留区。
+
 CHECK 每次取得一个 group，按条件游标观察尚未满足的条件。一次 slice 不重复观察同一未满足条件；超过预算的条件在后续 slice 继续。READY 位不再重读，前提是本次等待期间条件单调且不会提前重置。COUNTER32 与 SDMA post-done 通过相应宽度的读取判断完成；CHECK 不代替消费者的数据获取。后端若确有额外发布动作，只在证实其必要性后接入有界步骤。
 
 ## 2. 活动目录与内存顺序
@@ -39,9 +41,10 @@ CHECK 与 FINISH 分别拥有平坦位图，每个字包含 64 条记录。每�
 
 | 共享数据 | 写入与发布 | 读取 |
 | -------- | ---------- | ---- |
+| task→group 映射、task 形状、group offset | Host 初始化并随 run 镜像发布，run 内保持只读 | run 入口完成全 DCache 获取后普通 cached 读取，不逐项重复失效 |
 | 封口身份、token | 执行核完成对应 cached 写回及实际屏障，再发布 RUNNABLE 和目录位 | 成功领取后按实际 cache 合同失效/观察，再消费数据 |
 | lease、join、目录、task 完成状态 | 专用原子操作，控制行无 cached 写入 | 权威判断使用原子观察；bypass 只能作允许过期的提示 |
-| owner 可变进度 | 独占期间 bypass 写入，发布屏障完成后交权 | 下一 owner CAS 成功并完成读取屏障后 bypass 读取 |
+| owner 可变进度 | 独占期间 cached 写入，对应行写回及屏障完成后交权 | 下一 owner CAS 成功后失效并观察进度行，完成读取屏障后读取 |
 | payload、外部完成记录 | 遵守相应 backend 的可见性合同 | 不能将运行时 atomic-add-zero 原语用于 DMA/peer 写入的外部地址 |
 
 AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；实现必须分别落实缓存维护、设备屏障及原子线性化。CPU/sim 的 C++ 原子语义不能替代这项设备实现。

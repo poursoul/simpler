@@ -133,6 +133,8 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 
 ## 3. 错误、复用与关闭
 
+[跨 run 映射刷新用例](../../../../tests/st/a5/host_build_graph/async_completion/test_run_reuse.py) 在同一 Worker、callable 和保留域上交替使用不同任务数、block 数、AIC/AIV/MIX 掩码、0/1/4/64 条条件及合法的单 lane、单 block predicate skip，连续两轮重复这些形状并更换 payload epoch。每次校验完整执行记录、输出和 signal 邻接保护区，验证 run 入口获取足以刷新复用存储中的只读映射，不能只用相同图形状的重复运行证明这一点。
+
 | 注入位置或输入 | 验收判据 |
 | -------------- | -------- |
 | 提交前容量或输入验证失败 | 该次请求没有设备副作用，未使用预留被归还 |

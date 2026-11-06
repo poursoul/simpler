@@ -89,6 +89,17 @@ CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于
 
 SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力和零字节请求。核对实际 AIV 与 SDK channel group 的映射；若多个执行者共享 channel，必须验证并落实 session/postId/SQ 状态的独占提交，不用取模分配或偶然串行通过替代并发正确性。已知非零请求返回异常零 handle 时必须失败，不能被归类为合法零登记。
 
+### 信号与多个 payload 的接入验证
+
+构造 `dispatch_wait → dispatch_gather`：waiter 只接收 `data_arrived` 并登记 epoch 条件；gather 接收 `recv_x`、`recv_scale`、`recv_weights`、`recv_routes`，通过 waiter 的 TaskId 建立依赖。不为 waiter 补传 payload 来掩盖缺失的持有链，也不增加 publisher→waiter 的图依赖改变被测等待顺序。
+
+- 核对四个 payload 和 signal 分别由哪个现有 run/domain/参数引用持有；在调用方 scope 结束、任务返回及 pending close 时仍覆盖实际最后访问。
+- 两卡、四卡覆盖全部 peer、多个 epoch 和缓冲区复用；消费者分别校验四份数据与未写范围，不只检查通知。
+- 在实际 AIC/AIV 消费核预热旧缓存。脏缓存用例须先完成旧写入向外部写者的合法交接，再验证获取不会把旧数据覆盖到新 payload；干净缓存通过不能替代该验证。
+- C++ 等价场景与真实 PyPTO 接入分别验收。PyPTO 须核对生成的参数、显式依赖、domain 使用登记和实际读取指令；仅生成异步能力或容量元数据不能获得数据安全资格。
+
+[signal_payload_defer](../../../../tests/st/a5/host_build_graph/signal_payload_defer/test_signal_payload_defer.py) 覆盖两/四 rank、AIC/AIV 标量读取及 AIV `TLOAD/TSTORE`、干净与已合法交接的旧脏缓存、scope 结束与保留 domain 的三个 epoch。waiter 只接收信号，消费者独立接收四个 payload；全宽预热和消费覆盖实际执行池，输出逐项校验全部 peer 数据及未写区域。该 C++ 场景不替代真实 PyPTO 生成代码的验收。
+
 ### 多卡用例复用与补齐
 
 本 runtime 的 [sdma_defer_wait](../../../../tests/st/a5/host_build_graph/sdma_defer_wait/test_sdma_defer_wait.py) 从既有 A5 SDMA peer-fetch 示例适配，分别使用两 rank 和四 rank，覆盖 64 KiB、4 MiB 搬运及零工作。每个 rank 获取下一 rank 的不同输入，消费者执行现有 TLOAD/计算/TSTORE 路径；scalar context 通过既有 `device_context()` 登记 domain 使用。

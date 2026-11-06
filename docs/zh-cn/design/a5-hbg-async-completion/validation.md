@@ -87,6 +87,8 @@ CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于
 
 [defer_wait_shapes](../../../../tests/st/a5/host_build_graph/defer_wait_shapes/test_defer_wait_shapes.py) 覆盖 COUNTER 的普通 AIC/AIV、超过执行容量的 SPMD、MIX 3/5/6/7、满宽 sync-start、两个 Graph 实例及单 lane predicate true/skip。各物理执行混合 0/1/64 条条件，消费者仅依赖 waiter 并检查全部必要条件和返回标记；该结果不能替代 SDMA 与旧 payload cache 的验证。
 
+[defer_wait_visibility](../../../../tests/st/a5/host_build_graph/defer_wait_visibility/test_defer_wait_visibility.py) 验证 AIC/AIV 的普通与 Graph predicate-only 输入：预热整个消费者执行池，publisher 将独立 predicate Tensor 更新为与旧值相反的值，业务 kernel 只接收两个重叠 payload view 和输出。分别校验执行、skip、两个 Graph 实例的绑定，以及 Graph EXIT 后同步消费者读取新 payload。publisher 不依赖 waiter 完成；Graph 通过既有输入 Tensor 依赖连接预热，不要求新的边界接口。
+
 SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力和零字节请求。核对实际 AIV 与 SDK channel group 的映射；若多个执行者共享 channel，必须验证并落实 session/postId/SQ 状态的独占提交，不用取模分配或偶然串行通过替代并发正确性。已知非零请求返回异常零 handle 时必须失败，不能被归类为合法零登记。
 
 ### 信号与多个 payload 的接入验证

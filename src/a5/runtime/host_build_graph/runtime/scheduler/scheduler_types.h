@@ -1786,13 +1786,17 @@ inline bool scheduler_plan_layout(
     return true;
 }
 
-inline bool
-scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout, uint64_t device_base_address) {
+inline bool scheduler_init_data_from_layout(
+    void *base, const AicoreSchedulerLayout &layout, uint64_t device_base_address, uint64_t initialized_bytes = 0
+) {
+    if (initialized_bytes == 0) initialized_bytes = layout.total_size;
     if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
         device_base_address == 0 || (device_base_address & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
-        layout.total_size > UINT64_MAX - device_base_address)
+        layout.total_size > UINT64_MAX - device_base_address || initialized_bytes > layout.total_size ||
+        (layout.async_layout_offset == 0 ? initialized_bytes != layout.total_size :
+                                           initialized_bytes < layout.async_layout_offset))
         return false;
-    __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
+    __builtin_memset(base, 0, static_cast<size_t>(initialized_bytes));
     if (layout.protocol_layout_offset != 0) {
         *scheduler_state_at<SchedulerProtocolLayout>(base, layout.protocol_layout_offset) = layout.protocol;
         auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, layout.protocol.workers_offset);

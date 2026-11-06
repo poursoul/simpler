@@ -33,15 +33,14 @@ struct WriterImage {
         data.block_index = 9;
         data.subtask_slot = 1;
         data.capacity = capacity;
-        data.publication_bytes = async_group_publication_bytes(capacity);
+        data.entries_bytes = async_group_entry_bytes(capacity);
+        data.entries_offset = 4096;
     }
 
     AsyncGroupData &group() { return *reinterpret_cast<AsyncGroupData *>(image.data() + writer.group_offset); }
 
     DeferredCompletionEntry &entry(uint32_t index) {
-        return reinterpret_cast<DeferredCompletionEntry *>(
-            image.data() + writer.group_offset + sizeof(AsyncGroupData)
-        )[index];
+        return reinterpret_cast<DeferredCompletionEntry *>(image.data() + group().entries_offset)[index];
     }
     static CompletionToken counter_token() { return {0x10080, 42, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0}; }
     static CompletionToken sdma_token() {
@@ -69,7 +68,7 @@ TEST(HbgAsyncWriter, CopiesShareReservationAndFirstError) {
 
 TEST(HbgAsyncWriter, All64ConditionsFitWithoutOverlappingNextExecution) {
     WriterImage fixture(64);
-    const uint64_t end = fixture.writer.group_offset + fixture.group().publication_bytes;
+    const uint64_t end = fixture.group().entries_offset + fixture.group().entries_bytes;
     fixture.image[end] = 0xa5;
     const auto reservation = reserve_conditions(fixture.writer, 64);
     for (uint32_t index = 0; index < 64; ++index) {
@@ -183,7 +182,7 @@ TEST(HbgAsyncWriter, ExpectedWidthEngineTypeAndCookieAreCheckedBeforeWriting) {
 }
 
 TEST(HbgAsyncWriter, InvalidImageSpansAndCapacityAreRejectedBeforeArrayAccess) {
-    const std::array<std::function<void(AsyncGroupData &)>, 6> mutations{
+    const std::array<std::function<void(AsyncGroupData &)>, 10> mutations{
         [](auto &g) {
             g.capacity = 0;
         },
@@ -194,13 +193,25 @@ TEST(HbgAsyncWriter, InvalidImageSpansAndCapacityAreRejectedBeforeArrayAccess) {
             g.reserved = 1;
         },
         [](auto &g) {
-            g.publication_bytes = UINT32_MAX;
+            g.entries_bytes = UINT32_MAX;
         },
         [](auto &g) {
             g.subtask_slot = 3;
         },
         [](auto &g) {
             g.count = 5;
+        },
+        [](auto &g) {
+            g.entries_offset = 128;
+        },
+        [](auto &g) {
+            ++g.entries_offset;
+        },
+        [](auto &g) {
+            g.entries_offset = 8192;
+        },
+        [](auto &g) {
+            g.entries_bytes += sizeof(AsyncGroupData);
         }
     };
     for (const auto &mutate : mutations) {

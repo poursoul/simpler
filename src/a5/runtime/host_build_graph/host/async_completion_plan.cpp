@@ -16,8 +16,6 @@
 #include <unordered_set>
 #include <utility>
 
-#include "async_condition_writer.h"
-
 namespace {
 
 using namespace pto2::resident;
@@ -46,6 +44,7 @@ bool plan_async_completion(
     AsyncCompletionHostPlan next;
     next.begin_offset = begin_offset;
     next.total_bytes = begin_offset;
+    next.initialized_bytes = begin_offset;
     auto &layout = next.layout;
     layout.run_epoch = run_epoch;
     layout.task_count = task_count;
@@ -70,7 +69,7 @@ bool plan_async_completion(
         if (mask.is_empty()) continue;
         const uint32_t groups = input.block_count * lane_count;
         if (groups > SCHEDULER_ASYNC_JOIN_COUNT_MAX || groups > UINT32_MAX - layout.group_count)
-            return reject(error, "async group count exceeds static join or index capacity");
+            return reject(error, "async group count exceeds join or index capacity");
         next.tasks.push_back({input.task_ref, layout.group_count, static_cast<uint16_t>(input.block_count), mask, 0});
         layout.group_count += groups;
     }
@@ -85,14 +84,7 @@ bool plan_async_completion(
         !reserve_array<SchedulerAsyncActivity>(&cursor, 1, &layout.activity_offset) ||
         !reserve_array<uint32_t>(&cursor, task_count, &layout.task_map_offset) ||
         !reserve_array<SchedulerAsyncTaskData>(&cursor, layout.async_task_count, &layout.task_data_offset) ||
-        !reserve_array<uint64_t>(&cursor, layout.group_count, &layout.group_offsets_offset) ||
-        !reserve_array<SchedulerAsyncLease>(&cursor, layout.group_count, &layout.group_leases_offset) ||
-        !reserve_array<SchedulerAsyncGroupProgress>(&cursor, layout.group_count, &layout.group_progress_offset) ||
         !reserve_array<SchedulerAsyncTaskJoin>(&cursor, layout.async_task_count, &layout.joins_offset) ||
-        !reserve_array<SchedulerAsyncLease>(&cursor, layout.async_task_count, &layout.finish_leases_offset) ||
-        !reserve_array<SchedulerAsyncFinishProgress>(
-            &cursor, layout.async_task_count, &layout.finish_progress_offset
-        ) ||
         !reserve_array<SchedulerAsyncDirectoryWord>(
             &cursor, (static_cast<uint64_t>(layout.group_count) + 63) / 64, &layout.check_directory_offset
         ) ||
@@ -103,6 +95,15 @@ bool plan_async_completion(
     if (sdma_guard_count != 0 &&
         !reserve_array<AsyncSdmaSubmissionGuard>(&cursor, sdma_guard_count, &layout.sdma_guards_offset))
         return reject(error, "SDMA submission guards overflow");
+    if (!reserve_array<AsyncGroupData>(&cursor, layout.group_count, &layout.groups_offset) ||
+        !scheduler_layout_checked_align(cursor, ASYNC_RECORD_ALIGNMENT, &next.initialized_bytes))
+        return reject(error, "header storage overflows");
+    cursor = next.initialized_bytes;
+    if (!reserve_array<SchedulerAsyncLease>(&cursor, layout.group_count, &layout.group_leases_offset) ||
+        !reserve_array<SchedulerAsyncGroupProgress>(&cursor, layout.group_count, &layout.group_progress_offset) ||
+        !reserve_array<SchedulerAsyncLease>(&cursor, layout.async_task_count, &layout.finish_leases_offset) ||
+        !reserve_array<SchedulerAsyncFinishProgress>(&cursor, layout.async_task_count, &layout.finish_progress_offset))
+        return reject(error, "deferred control storage overflows");
     uint32_t task_index = 0;
     for (const auto &input : inputs) {
         if (task_index == next.tasks.size() || input.task_ref != next.tasks[task_index].task_ref) continue;
@@ -118,10 +119,13 @@ bool plan_async_completion(
                 data.block_index = block;
                 data.subtask_slot = lane;
                 data.capacity = input.capacities[lane];
-                data.publication_bytes = async_group_publication_bytes(data.capacity);
+                data.entries_bytes = async_group_entry_bytes(data.capacity);
                 data.sdma_guards_offset = layout.sdma_guards_offset;
                 data.sdma_guard_count = layout.sdma_guard_count;
-                if (!scheduler_layout_reserve(&cursor, data.publication_bytes, ASYNC_RECORD_ALIGNMENT, &group.offset))
+                group.offset = layout.groups_offset + data.group_index * sizeof(AsyncGroupData);
+                if (!scheduler_layout_reserve(
+                        &cursor, data.entries_bytes, ASYNC_RECORD_ALIGNMENT, &data.entries_offset
+                    ))
                     return reject(error, "async publication storage overflows");
                 next.groups.push_back(group);
             }
@@ -137,11 +141,12 @@ bool plan_async_completion(
 
 bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncCompletionHostPlan &plan) {
     if (plan.layout_offset == 0)
-        return plan.tasks.empty() && plan.groups.empty() && plan.total_bytes == plan.begin_offset;
+        return plan.tasks.empty() && plan.groups.empty() && plan.total_bytes == plan.begin_offset &&
+               plan.initialized_bytes == plan.begin_offset;
     if (image == nullptr || reinterpret_cast<uintptr_t>(image) % ASYNC_RECORD_ALIGNMENT != 0 ||
-        image_bytes < plan.total_bytes || plan.begin_offset >= plan.total_bytes ||
-        plan.layout.image_bytes != plan.total_bytes || plan.layout.group_count != plan.groups.size() ||
-        plan.layout.async_task_count != plan.tasks.size())
+        image_bytes < plan.total_bytes || plan.begin_offset >= plan.initialized_bytes ||
+        plan.initialized_bytes > plan.total_bytes || plan.layout.image_bytes != plan.total_bytes ||
+        plan.layout.group_count != plan.groups.size() || plan.layout.async_task_count != plan.tasks.size())
         return false;
     *scheduler_state_at<SchedulerAsyncLayout>(image, plan.layout_offset) = plan.layout;
     if (plan.layout.sdma_guard_count != 0) {
@@ -155,19 +160,12 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
         map[ref] = ASYNC_INVALID_INDEX;
     auto *tasks = scheduler_state_at<SchedulerAsyncTaskData>(image, plan.layout.task_data_offset);
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(image, plan.layout.joins_offset);
-    auto *finish_leases = scheduler_state_at<SchedulerAsyncLease>(image, plan.layout.finish_leases_offset);
-    auto *finish_progress = scheduler_state_at<SchedulerAsyncFinishProgress>(image, plan.layout.finish_progress_offset);
     for (uint32_t index = 0; index < plan.tasks.size(); ++index) {
         const auto &task = plan.tasks[index];
         tasks[index] = task;
         map[task.task_ref] = index;
         joins[index].word = 0;
-        finish_leases[index].word = scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT);
-        finish_progress[index] = SchedulerAsyncFinishProgress{};
     }
-    auto *offsets = scheduler_state_at<uint64_t>(image, plan.layout.group_offsets_offset);
-    auto *leases = scheduler_state_at<SchedulerAsyncLease>(image, plan.layout.group_leases_offset);
-    auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(image, plan.layout.group_progress_offset);
     auto *checks = scheduler_state_at<SchedulerAsyncDirectoryWord>(image, plan.layout.check_directory_offset);
     auto *finishes = scheduler_state_at<SchedulerAsyncDirectoryWord>(image, plan.layout.finish_directory_offset);
     for (uint64_t word = 0; word < (static_cast<uint64_t>(plan.layout.group_count) + 63) / 64; ++word)
@@ -176,9 +174,6 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
         finishes[word].bits = 0;
     for (uint32_t index = 0; index < plan.groups.size(); ++index) {
         const auto &group = plan.groups[index];
-        offsets[index] = group.offset;
-        progress[index] = SchedulerAsyncGroupProgress{};
-        leases[index].word = scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT);
         *scheduler_state_at<AsyncGroupData>(image, group.offset) = group.data;
     }
     return true;

@@ -34,6 +34,7 @@ struct AsyncCompletionHostPlan {
     uint64_t begin_offset{0};
     uint64_t layout_offset{0};
     uint64_t total_bytes{0};
+    uint64_t initialized_bytes{0};
     SchedulerAsyncLayout layout{};
     std::vector<SchedulerAsyncTaskData> tasks;
     std::vector<AsyncGroupHostPlan> groups;
@@ -47,6 +48,6 @@ bool plan_async_completion(
     AsyncCompletionHostPlan *out, std::string *error, uint32_t sdma_guard_count = 0
 );
 
-// Initializes only the appended range; existing scheduler/native Graph data
-// remains intact. All references in the result are offsets from image.
+// Initializes only the appended prefix; existing scheduler/native Graph data
+// and the reserved suffix remain intact. All references are offsets from image.
 bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncCompletionHostPlan &plan);

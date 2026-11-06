@@ -54,7 +54,7 @@ flowchart LR
     Q --> X[run 与外部资源退休]
 ```
 
-每个可能调用登记接口的物理执行拥有一个 `AsyncGroup`，每个含此类执行的逻辑 task 拥有一个 `AsyncTaskFinish`。CHECK 和 FINISH 是控制工作，不创建业务 TaskId，不占 dispatch slot，也不取得 cooperative admission。
+每个可能调用登记接口的物理执行预留一个稳定 group，每个含此类执行的逻辑 task 预留独立 FINISH 状态。CHECK 和 FINISH 是控制工作，不创建业务 TaskId，不占 dispatch slot，也不取得 cooperative admission。
 
 基础实现只计入实际非零 group，复用计算释放汇合，采用常驻完成记录、平坦活动位图、有界 strong-CAS 目录更新和有界 FINISH 路径。完成记录在 run 内不移动、不回收。基础实现为可执行任务提供登记空间，所有成员均零登记的任务沿用同步完成路径，不创建 CHECK/FINISH 工作。空间、bind 和同步运行成本单独验证，优化不能引入强制的额外用户声明。
 

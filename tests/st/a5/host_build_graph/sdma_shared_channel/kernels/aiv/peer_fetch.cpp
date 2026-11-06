@@ -63,11 +63,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
             }
         }
         if (!send_request_entry(ctx, SdmaTget(target, source, scratch, workspace))) return;
-        auto *group = pto2::resident::detail::group(ctx.resident);
-        auto *entries = reinterpret_cast<__gm__ DeferredCompletionEntry *>(
-            ctx.resident.image + ctx.resident.group_offset + sizeof(pto2::resident::AsyncGroupData)
-        );
-        publish_stamp(stamps + 32 + iteration * 32 + lane * 16, entries[group->count - 1].backend_cookie);
-        publish_stamp(stamps + lane * 16 + 2, group->count);
+        const uint32_t registered = *ctx.completion_count;
+        publish_stamp(stamps + 32 + iteration * 32 + lane * 16, ctx.completion_entries[registered - 1].backend_cookie);
+        publish_stamp(stamps + lane * 16 + 2, registered);
     }
 }

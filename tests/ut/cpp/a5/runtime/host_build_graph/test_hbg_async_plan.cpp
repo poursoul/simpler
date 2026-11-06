@@ -122,6 +122,29 @@ TEST(HbgAsyncPlan, SynchronousAndControlOnlyRunsAppendNoStorage) {
     EXPECT_EQ(plan.total_bytes, kPrefix);
 }
 
+TEST(HbgAsyncPlan, HeadersDoNotStrideAcrossUnusedConditionCapacity) {
+    std::vector<AsyncTaskPlanInput> inputs;
+    for (int64_t ref = 0; ref < 64; ++ref) {
+        auto input = task(ref, 1, LaneMask::aic());
+        input.capacities[0] = MAX_COMPLETIONS_PER_TASK;
+        inputs.push_back(input);
+    }
+    AsyncCompletionHostPlan plan;
+    std::string error;
+    ASSERT_TRUE(plan_async_completion(kPrefix, 7, 64, inputs, &plan, &error)) << error;
+    ASSERT_EQ(plan.groups.size(), 64u);
+    EXPECT_EQ(plan.groups[1].offset, plan.groups[0].offset + sizeof(AsyncGroupData));
+    const uint64_t headers_end = plan.groups.back().offset + sizeof(AsyncGroupData);
+    EXPECT_LE(headers_end, plan.initialized_bytes);
+    EXPECT_LT(plan.initialized_bytes, plan.total_bytes);
+    EXPECT_LT(headers_end - kPrefix, 64 * (sizeof(AsyncGroupData) + sizeof(SchedulerAsyncTaskJoin)) + 8192);
+    for (const auto &group : plan.groups) {
+        EXPECT_EQ(group.data.capacity, MAX_COMPLETIONS_PER_TASK);
+        EXPECT_GE(group.data.entries_offset, plan.initialized_bytes);
+        EXPECT_LE(group.data.entries_offset + group.data.entries_bytes, plan.total_bytes);
+    }
+}
+
 TEST(HbgAsyncPlan, ExpandedTasksBlocksAndLanesHaveIndependentStableRecords) {
     const std::vector<AsyncTaskPlanInput> inputs{
         task(0, 2, LaneMask::aic()), task(2, 3, LaneMask::all()), task(5, 2, LaneMask::both_aiv())
@@ -156,25 +179,21 @@ TEST(HbgAsyncPlan, ExpandedTasksBlocksAndLanesHaveIndependentStableRecords) {
                 AsyncWriter writer{static_cast<uint8_t *>(image.base), plan.total_bytes, 19, group.offset, group_index};
                 EXPECT_TRUE(seal_conditions(writer));
                 if (group_index != 0)
-                    EXPECT_GE(
-                        group.offset,
-                        plan.groups[group_index - 1].offset + plan.groups[group_index - 1].data.publication_bytes
-                    );
+                    EXPECT_GE(group.offset, plan.groups[group_index - 1].offset + sizeof(AsyncGroupData));
                 ++group_index;
             }
         }
     }
     const auto *leases = scheduler_state_at<SchedulerAsyncLease>(image.base, plan.layout.group_leases_offset);
     for (uint32_t index = 0; index < plan.groups.size(); ++index)
-        EXPECT_EQ(leases[index].word, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT));
+        EXPECT_EQ(leases[index].word, UINT64_C(0xa5a5a5a5a5a5a5a5));
     const auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(image.base, plan.layout.joins_offset);
     EXPECT_EQ(joins[1].word, 0u);
     EXPECT_EQ(joins[2].word, 0u);
     EXPECT_EQ(plan.tasks[1].block_count, 3u);
     EXPECT_EQ(plan.tasks[2].block_count, 2u);
-    auto *finishes = scheduler_state_at<SchedulerAsyncFinishProgress>(image.base, plan.layout.finish_progress_offset);
-    EXPECT_EQ(finishes[0].resolver.producer_ref, -1);
-    EXPECT_EQ(finishes[0].resolver.phase, SchedulerResolvePhase::START);
+    for (uint64_t i = plan.initialized_bytes; i < plan.total_bytes; ++i)
+        EXPECT_EQ(static_cast<uint8_t *>(image.base)[i], 0xa5);
     for (uint64_t i = 0; i < kPrefix; ++i)
         EXPECT_EQ(static_cast<uint8_t *>(image.base)[i], 0xa5);
 }
@@ -214,7 +233,7 @@ TEST(HbgAsyncPlan, RelocationPreservesIndependentExecutionRecords) {
     ASSERT_TRUE(plan_async_completion(kPrefix, 9, 1, {task(0, 2, LaneMask::aiv0())}, &plan, &error)) << error;
     Image first(plan.total_bytes), relocated(plan.total_bytes);
     ASSERT_TRUE(initialize_async_completion(first.base, plan.total_bytes, plan));
-    std::memcpy(relocated.base, first.base, plan.total_bytes);
+    std::memcpy(relocated.base, first.base, plan.initialized_bytes);
     AsyncWriter writer{static_cast<uint8_t *>(relocated.base), plan.total_bytes, 9, plan.groups[0].offset, 0};
     CompletionToken token{0x10000, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
     ASSERT_TRUE(register_completion_condition(writer, token));
@@ -223,7 +242,7 @@ TEST(HbgAsyncPlan, RelocationPreservesIndependentExecutionRecords) {
     EXPECT_TRUE(seal_conditions(writer));
 }
 
-TEST(HbgAsyncPlan, DirectoriesCoverWordBoundaryAndLeaseInitializationIsNonzero) {
+TEST(HbgAsyncPlan, DirectoriesHideUninitializedLeasesAcrossWordBoundaries) {
     AsyncCompletionHostPlan plan;
     std::vector<AsyncTaskPlanInput> inputs;
     for (int64_t ref = 0; ref < 65; ++ref)
@@ -242,14 +261,14 @@ TEST(HbgAsyncPlan, DirectoriesCoverWordBoundaryAndLeaseInitializationIsNonzero) 
     }
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(image.base, plan.layout.finish_leases_offset);
     for (uint32_t index = 0; index < 65; ++index)
-        EXPECT_EQ(leases[index].word, UINT64_C(8));
+        EXPECT_EQ(leases[index].word, UINT64_C(0xa5a5a5a5a5a5a5a5));
     EXPECT_EQ(scheduler_async_condition_mask(0), 0u);
     EXPECT_EQ(scheduler_async_condition_mask(1), 1u);
     EXPECT_EQ(scheduler_async_condition_mask(63), UINT64_MAX >> 1);
     EXPECT_EQ(scheduler_async_condition_mask(64), UINT64_MAX);
 }
 
-TEST(HbgAsyncPlan, RejectsOverflowsDuplicateRefsAndInvalidStaticJoinWithoutReplacingOutput) {
+TEST(HbgAsyncPlan, RejectsOverflowsDuplicateRefsAndInvalidJoinCapacityWithoutReplacingOutput) {
     AsyncCompletionHostPlan plan;
     plan.total_bytes = 99;
     std::string error;

@@ -1607,8 +1607,8 @@ bool create_scheduler_state(
     const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
     // The slot's retained pair, each side aligned with at least total_size
     // behind it. Handed over uninitialized and never carrying anything between
-    // runs: the initialization below writes this run's whole length, and the
-    // publication ships it.
+    // runs: initialization publishes the current metadata prefix. Reserved
+    // async storage remains hidden until its first runtime publication.
     void *device_state = nullptr;
     void *host_base = nullptr;
     if (api->acquire_scheduler_state_storage(
@@ -1624,10 +1624,8 @@ bool create_scheduler_state(
     }
     const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
 
-    // The only pass over this run's total_size: it zeroes and fills the whole
-    // length, which is what makes a retained block's previous contents
-    // unreachable.
-    if (!scheduler_init_data_from_layout(host_base, layout, aligned_address)) {
+    const uint64_t initialized_bytes = async_plan.layout_offset == 0 ? layout.total_size : async_plan.initialized_bytes;
+    if (!scheduler_init_data_from_layout(host_base, layout, aligned_address, initialized_bytes)) {
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
         return false;
     }
@@ -1769,7 +1767,7 @@ bool create_scheduler_state(
         );
     }
     runtime->add_pending_metadata(
-        reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size),
+        reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(initialized_bytes),
         HostPhaseKind::Count, {}
     );
     LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);

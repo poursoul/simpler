@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
         if (scenario < 9) {
             assert(registered);
             assert(data->count == event.count && data->reservation_limit == 0);
-            auto *entries = reinterpret_cast<DeferredCompletionEntry *>(image + plan.groups[0].offset + sizeof(*data));
+            auto *entries = reinterpret_cast<DeferredCompletionEntry *>(image + data->entries_offset);
             assert(entries[0].backend_cookie == UINT64_C(0x100000003));
             assert(pto2::resident::seal_conditions(ctx.resident));
         } else {
@@ -184,8 +184,7 @@ int main(int argc, char **argv) {
         assert(ctx.completion_error_code == &data->error_code);
         assert(ctx.completion_capacity == data->capacity);
         assert(
-            ctx.completion_entries ==
-            reinterpret_cast<volatile DeferredCompletionEntry *>(image + plan.groups[0].offset + sizeof(*data))
+            ctx.completion_entries == reinterpret_cast<volatile DeferredCompletionEntry *>(image + data->entries_offset)
         );
         save_expected_notification_counter(ctx, reinterpret_cast<void *>(token.addr), 1);
         assert(*ctx.completion_count == 1);
@@ -201,6 +200,14 @@ int main(int argc, char **argv) {
         assert(data->count == 2);
         assert(data->error_code == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
         assert(!pto2::resident::seal_conditions(ctx.resident));
+    } else if (scenario == 26 || scenario == 27) {
+        if (scenario == 26) data->entries_bytes += sizeof(*data);
+        else data->entries_offset = plan.groups[0].offset;
+        auto ctx = get_async_ctx(args);
+        assert(!async_ctx_is_deferred(ctx));
+        assert(ctx.completion_entries == nullptr);
+        assert(data->count == 0);
+        assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     } else return 2;
     return 0;
 }

@@ -4,7 +4,7 @@
 
 ## 1. group 与 lease 状态机
 
-CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 phase，高 61 位为 lease generation；phase 编码为 DORMANT=0、RUNNABLE=1、OWNED=2、TERMINAL=3、FAILED=4，其余编码非法。初代为 1，交权时递增，溢出报协议错误，不能回绕。run identity 保存在不可变身份区，不能用 lease generation 替代。
+CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 phase，高 61 位为 lease generation；phase 编码为 DORMANT=0、RUNNABLE=1、OWNED=2、TERMINAL=3、FAILED=4，其余编码非法。lease 在首次发布前不具有可读取的初值，目录零位使其对扫描器不可见。唯一首次发布者先初始化进度及 DORMANT(1)，再发布 RUNNABLE 和目录位；不得重新初始化已发布或 OWNED 的记录。交权时 generation 递增，溢出报协议错误，不能回绕。run identity 保存在不可变身份区，不能用 lease generation 替代。
 
 | 转换 | 操作者 | 必须先完成的动作 |
 | ---- | ------ | ---------------- |
@@ -12,7 +12,7 @@ CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 ph
 | RUNNABLE(g) → OWNED(g) | 任意参与核 | 完整版本 CAS 成功；成功后才允许读取可变进度 |
 | OWNED(g) → RUNNABLE(g+1) | 当前 owner | 发布进度及屏障；目录位保持一 |
 | OWNED → TERMINAL | 当前 owner | 本记录负责的检查与最后进度写入结束；清目录位后结算完成责任 |
-| DORMANT/OWNED → FAILED | 对应写者或 owner | 锁存首错与身份，保留 backing；不走正常完成贡献 |
+| 首次封口失败 / OWNED → FAILED | 尚未发布的执行写者或当前 owner | 首次封口失败可初始化 FAILED；重复封口只能报错，不能覆盖已发布 lease。锁存首错并保留 backing，不贡献正常完成 |
 
 失败监督者不能覆盖仍由某核持有的 OWNED，也不通过超时抢占 lease。owner 故障按整个 run 的错误关闭处理，不恢复半写的短事务。
 
@@ -20,7 +20,7 @@ CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 ph
 
 kernel 返回后的执行尾部先核对登记错误、开放预留、count 与容量，再封口。非零条件组先增加 task 的 pending 责任，再初始化未满足 mask 和游标，发布数据、RUNNABLE 及目录位后才释放本次执行的局部义务。零登记/skip 不创建 CHECK 责任，lease 保持 DORMANT。任何提交副作用不明或登记错误都禁止正常 TaskDone。
 
-封口发布覆盖记录头及 `[0, count)` 的条件条目；预留但未登记的条目没有读取者，不需要逐项写回。零登记组只发布记录头，不更新 join、lease 或 CHECK 进度。分配容量仍是登记上限，不表示每次执行都需要发布整个预留区。
+封口发布只写回 header 的可变前缀及独立 token 区的 `[0, count)`，然后完成一次发布屏障。header 的只读尾部已由 Host 发布，预留但未登记的条目没有读取者。零登记组只发布可变 header，不更新 join、lease 或 CHECK 进度，也不触及预留后缀。分配容量仍是登记上限，不表示每次执行都需要发布整个预留区。
 
 CHECK 每次取得一个 group，按条件游标观察尚未满足的条件。一次 slice 不重复观察同一未满足条件；超过预算的条件在后续 slice 继续。READY 位不再重读，前提是本次等待期间条件单调且不会提前重置。COUNTER32 与 SDMA post-done 通过相应宽度的读取判断完成；CHECK 不代替消费者的数据获取。后端若确有额外发布动作，只在证实其必要性后接入有界步骤。
 
@@ -40,7 +40,7 @@ CHECK 与 FINISH 分别拥有平坦位图，每个字包含 64 条记录。每�
 
 | 共享数据 | 写入与发布 | 读取 |
 | -------- | ---------- | ---- |
-| task→group 映射、task 形状、group offset | Host 初始化并随 run 镜像发布，run 内保持只读 | run 入口完成全 DCache 获取后普通 cached 读取，不逐项重复失效 |
+| task→group 映射、task 形状、header 数组基址与 token 边界 | Host 初始化并随 run 镜像发布，run 内保持只读 | run 入口完成全 DCache 获取后普通 cached 读取，不逐项重复失效 |
 | 封口身份、token | 执行核完成对应 cached 写回及实际屏障，再发布 RUNNABLE 和目录位 | 成功领取后按实际 cache 合同失效/观察，再消费数据 |
 | lease、join、目录、task 完成状态 | 专用原子操作，控制行无 cached 写入 | 权威判断使用原子观察；bypass 只能作允许过期的提示 |
 | run 异步活动标记 | 独占 128 B 行；Host 在 run 前置零，执行核在首次发布 CHECK/FINISH 前以 bypass store 写一并完成 DDR 屏障 | bypass load；本核见一后可以一直缓存 true，run 内不清零 |
@@ -65,7 +65,7 @@ AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；�
 
 计算释放复用原有调度汇合：单 lane SPMD 的 `completed_blocks` 贡献必须在该 block 的 trace 发布及 slot 释放之后；MIX coordinator 收齐各 lane release 后，每 block 只贡献一次。最后贡献者关闭计算。异步路径不再为每个 block 重复维护第二份释放计数。释放 slot 前保存稳定身份，不能从已清空的 slot 反查。
 
-P 暂时为零不证明计算结束，其他尚未返回的成员仍可能登记。只有设置 closed 或递减最后 P 的原子返回值授予 FINISH 激活权；普通读取只可验证已有 FINISH 的就绪条件，不能再激活。获权者发布预分配 FINISH 的 RUNNABLE 和目录位后返回，FINISH 继续受预算约束。
+P 暂时为零不证明计算结束，其他尚未返回的成员仍可能登记。只有设置 closed 或递减最后 P 的原子返回值授予 FINISH 激活权；普通读取只可验证已有 FINISH 的就绪条件，不能再激活。获权者先初始化完整 resolver 游标和 lease，再发布预分配 FINISH 的 RUNNABLE 和目录位后返回，FINISH 继续受预算约束。
 
 所有成员均零登记的普通、SPMD、MIX 或合法 skip task 沿用同步完成及本核后继路径，不创建 CHECK/FINISH 工作。非 ordered 路径只在真实最后计算返回后读取 R；R=0 时无需写 closed，保持原同步 resolve/refill 顺序。ordered 路径在 close 返回 P=R=0 时同步完成。不得在计算汇合前缓存 R=0；曾登记但条件已经满足的 task 仍进入 FINISH。全局完成数始终晚于最终 trace 和后继发布。
 

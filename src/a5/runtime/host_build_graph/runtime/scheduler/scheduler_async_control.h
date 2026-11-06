@@ -71,10 +71,14 @@ inline __aicore__ void observe(__gm__ const void *address, uint64_t bytes) {
     scheduler_cache_barrier();
 }
 
-inline __aicore__ void publish(__gm__ void *address, uint64_t bytes) {
+inline __aicore__ void writeback(__gm__ void *address, uint64_t bytes) {
     // Publication spans start/end on isolated lines and exclude atomic words.
     for (uint64_t offset = 0; offset < bytes; offset += 64)
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(address) + offset);
+}
+
+inline __aicore__ void publish(__gm__ void *address, uint64_t bytes) {
+    writeback(address, bytes);
     scheduler_cache_barrier();
 }
 
@@ -110,6 +114,11 @@ inline __aicore__ bool activate_finish(SchedulerAsyncLocalState &local, uint32_t
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(local.base, local.layout->finish_leases_offset);
     auto *directory =
         scheduler_state_at<SchedulerAsyncDirectoryWord>(local.base, local.layout->finish_directory_offset);
+    auto *progress = scheduler_state_at<SchedulerAsyncFinishProgress>(local.base, local.layout->finish_progress_offset);
+    const SchedulerResolveCursor empty{};
+    scheduler_async_copy_resolver(progress[index].resolver, empty);
+    publish(&progress[index], sizeof(SchedulerAsyncFinishProgress));
+    scheduler_gm_store(leases[index].word, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT));
     publish_activity(local);
     scheduler_cache_barrier();
     if (scheduler_async_lease_publish(leases[index]).result != SchedulerAsyncLeaseResult::SUCCESS ||
@@ -195,7 +204,7 @@ inline __aicore__ bool scheduler_initialize_async(
             bytes, layout->task_data_offset, layout->async_task_count, sizeof(SchedulerAsyncTaskData),
             alignof(SchedulerAsyncTaskData)
         ) ||
-        !span(bytes, layout->group_offsets_offset, layout->group_count, sizeof(uint64_t), alignof(uint64_t)) ||
+        !span(bytes, layout->groups_offset, layout->group_count, sizeof(AsyncGroupData), 128) ||
         !span(bytes, layout->group_leases_offset, layout->group_count, sizeof(SchedulerAsyncLease), 128) ||
         !span(bytes, layout->group_progress_offset, layout->group_count, sizeof(SchedulerAsyncGroupProgress), 128) ||
         !span(bytes, layout->joins_offset, layout->async_task_count, sizeof(SchedulerAsyncTaskJoin), 128) ||
@@ -217,9 +226,9 @@ inline __aicore__ bool scheduler_initialize_async(
     return true;
 }
 
-inline __aicore__ bool scheduler_async_execution_writer(
+inline __aicore__ bool scheduler_async_map_execution(
     SchedulerAsyncLocalState &local, int64_t task_ref, uint32_t block, uint32_t lane,
-    pto2::resident::AsyncWriter &writer, bool observe_header = true
+    pto2::resident::AsyncWriter &writer
 ) {
     using namespace scheduler_async_detail;
     writer = AsyncWriter{};
@@ -237,17 +246,9 @@ inline __aicore__ bool scheduler_async_execution_writer(
                                       static_cast<uint32_t>(__builtin_popcount(mask & ((1U << lane) - 1)));
     if (wide_group_index >= local.layout->group_count) return fail(local, task_ref);
     const uint32_t group_index = static_cast<uint32_t>(wide_group_index);
-    auto *offsets = scheduler_state_at<uint64_t>(local.base, local.layout->group_offsets_offset);
-    const uint64_t offset = offsets[group_index];
-    if (!span(local.bytes, offset, 1, sizeof(AsyncGroupData), 128)) return fail(local, task_ref);
-    auto *data = scheduler_state_at<AsyncGroupData>(local.base, offset);
-    if (observe_header) observe(data, sizeof(*data));
-    if (data->run_epoch != local.layout->run_epoch || data->task_ref != task_ref || data->group_index != group_index ||
-        data->block_index != block || data->subtask_slot != lane ||
-        async_group_publication_bytes(data->capacity) == 0 ||
-        data->publication_bytes != async_group_publication_bytes(data->capacity) ||
-        !span(local.bytes, offset, data->publication_bytes, 1, 128))
-        return fail(local, task_ref);
+    // Bootstrap bounds the contiguous, Host-initialized header array. No
+    // header is read until the kernel requests AsyncCtx or returns to seal it.
+    const uint64_t offset = local.layout->groups_offset + static_cast<uint64_t>(group_index) * sizeof(AsyncGroupData);
     writer = {local.base, local.bytes, local.layout->run_epoch, offset, group_index};
     return true;
 }
@@ -276,10 +277,8 @@ inline __aicore__ bool scheduler_async_begin_execution(
     if (local == nullptr) return true;
     global.async_present = 0;
     AsyncWriter writer{};
-    // A group has one execution in the run; its initial header has no prior writer.
-    if (!scheduler_async_execution_writer(*local, task_ref, block, lane, writer, false)) return false;
+    if (!scheduler_async_map_execution(*local, task_ref, block, lane, writer)) return false;
     if (writer.image == nullptr) return true;
-    if (!pto2::resident::detail::valid(writer)) return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     global.async_image_address = reinterpret_cast<uint64_t>(writer.image);
     global.async_image_bytes = writer.image_bytes;
     global.async_run_epoch = writer.run_epoch;
@@ -296,18 +295,32 @@ scheduler_async_seal_execution(SchedulerAsyncLocalState *local, int64_t task_ref
     if (local == nullptr) return true;
     AsyncWriter writer{};
     // The returning kernel owns dirty count/entry lines until this seal publishes them.
-    if (!scheduler_async_execution_writer(*local, task_ref, block, lane, writer, false)) return false;
+    if (!scheduler_async_map_execution(*local, task_ref, block, lane, writer)) return false;
     if (writer.image == nullptr) return true;
     auto *data = pto2::resident::detail::group(writer);
+    if (data == nullptr || data->task_ref != task_ref || data->block_index != block || data->subtask_slot != lane)
+        return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(local->base, local->layout->group_leases_offset);
+    const bool unpublished = data->state == AsyncPublicationState::OPEN;
     if (!seal_conditions(writer)) {
-        scheduler_async_lease_fail(
-            leases[writer.group_index], scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT)
+        // No CHECK can own a group whose first seal failed. A duplicate seal
+        // must not overwrite a lease that may already be RUNNABLE or OWNED.
+        if (unpublished)
+            scheduler_gm_store(
+                leases[writer.group_index].word, scheduler_async_lease_encode(1, SchedulerAsyncPhase::FAILED)
+            );
+        return fail(
+            *local, task_ref, data->error_code != 0 ? data->error_code : SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED
         );
-        return fail(*local, task_ref, data->error_code);
     }
-    // Sealed records expose only [0, count); unused reserved entries have no reader.
-    publish(data, sizeof(AsyncGroupData) + static_cast<uint64_t>(data->count) * sizeof(DeferredCompletionEntry));
+    // Identity and entry bounds in the second header line remain Host-owned.
+    // Only the mutable header prefix and [0, count) entries need publication.
+    writeback(data, offsetof(AsyncGroupData, sdma_guards_offset));
+    if (data->count != 0)
+        writeback(
+            writer.image + data->entries_offset, static_cast<uint64_t>(data->count) * sizeof(DeferredCompletionEntry)
+        );
+    scheduler_cache_barrier();
     if (data->count == 0) return true;
     uint32_t task_index_value = ASYNC_INVALID_INDEX;
     if (!task_index(*local, task_ref, task_index_value) || task_index_value == ASYNC_INVALID_INDEX)
@@ -323,6 +336,7 @@ scheduler_async_seal_execution(SchedulerAsyncLocalState *local, int64_t task_ref
     publish(&progress[writer.group_index], sizeof(SchedulerAsyncGroupProgress));
     auto *directory =
         scheduler_state_at<SchedulerAsyncDirectoryWord>(local->base, local->layout->check_directory_offset);
+    scheduler_gm_store(leases[writer.group_index].word, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT));
     publish_activity(*local);
     if (scheduler_async_lease_publish(leases[writer.group_index]).result != SchedulerAsyncLeaseResult::SUCCESS ||
         scheduler_async_directory_publish(directory[writer.group_index / 64].bits, writer.group_index % 64) !=
@@ -396,8 +410,7 @@ inline __aicore__ bool scheduler_async_check_step(
         scheduler_async_lease_fail(leases[index], owned);
         return fail(local, ref, code);
     };
-    auto *offsets = scheduler_state_at<uint64_t>(local.base, local.layout->group_offsets_offset);
-    const uint64_t offset = offsets[index];
+    const uint64_t offset = local.layout->groups_offset + static_cast<uint64_t>(index) * sizeof(AsyncGroupData);
     if (!span(local.bytes, offset, 1, sizeof(AsyncGroupData), 128)) return failed(-1);
     auto *data = scheduler_state_at<AsyncGroupData>(local.base, offset);
     observe(data, sizeof(*data));
@@ -406,9 +419,7 @@ inline __aicore__ bool scheduler_async_check_step(
     if (task_ref < 0 || static_cast<uint64_t>(task_ref) >= local.layout->task_count ||
         pto2::resident::detail::group(writer) == nullptr || data->state != AsyncPublicationState::SEALED ||
         data->error_code != 0 || data->reserved != 0 || data->count == 0 || data->count > data->capacity ||
-        async_group_publication_bytes(data->capacity) == 0 ||
-        data->publication_bytes != async_group_publication_bytes(data->capacity) ||
-        !span(local.bytes, offset, async_group_publication_bytes(data->capacity), 1, 128))
+        !pto2::resident::detail::layout_valid(writer, *data))
         return failed(task_ref);
     auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local.base, local.layout->group_progress_offset);
     auto &current = progress[index];
@@ -418,7 +429,7 @@ inline __aicore__ bool scheduler_async_check_step(
     if (pending == 0 || (pending & ~scheduler_async_condition_mask(data->count)) != 0 || cursor >= 64 ||
         current.acquire_cursor != 0)
         return failed(task_ref);
-    auto *entries = scheduler_state_at<DeferredCompletionEntry>(local.base, offset + sizeof(AsyncGroupData));
+    auto *entries = scheduler_state_at<DeferredCompletionEntry>(local.base, data->entries_offset);
     uint64_t visited = 0;
     for (uint32_t used = 0; used < budget && (pending & ~visited) != 0; ++used) {
         uint64_t candidates = pending & ~visited;

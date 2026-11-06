@@ -20,7 +20,7 @@ struct alignas(128) SchedulerAsyncLayout {
     uint64_t image_bytes;
     uint64_t task_map_offset;
     uint64_t task_data_offset;
-    uint64_t group_offsets_offset;
+    uint64_t groups_offset;
     uint64_t group_leases_offset;
     uint64_t group_progress_offset;
     uint64_t joins_offset;
@@ -61,6 +61,33 @@ struct alignas(128) SchedulerAsyncDirectoryWord {
 struct alignas(128) SchedulerAsyncActivity {
     volatile uint64_t activated;
 };
+
+// Explicit field copies work for private/GM address spaces and preserve the
+// complete continuation, including a batch not yet published by its owner.
+template <typename Destination, typename Source>
+inline __aicore__ void scheduler_async_copy_resolver(Destination &destination, const Source &source) {
+    destination.producer_ref = source.producer_ref;
+    destination.next_waiter = source.next_waiter;
+    destination.waiter_ref = source.waiter_ref;
+    destination.saved_next = source.saved_next;
+    destination.route.task_ref = source.route.task_ref;
+    destination.route.producer_ref = source.route.producer_ref;
+    destination.route.next_fanin = source.route.next_fanin;
+    destination.route.fanin_count = source.route.fanin_count;
+    destination.route.result = source.route.result;
+    destination.publication.pending.first = source.publication.pending.first;
+    destination.publication.pending.last = source.publication.pending.last;
+    destination.publication.pending.count = source.publication.pending.count;
+    destination.publication.inbox_offset = source.publication.inbox_offset;
+    destination.publication.count = source.publication.count;
+    destination.publication.type = source.publication.type;
+    destination.publication.target = source.publication.target;
+    destination.publication.phase = source.publication.phase;
+    destination.phase = source.phase;
+    destination.visited_count = source.visited_count;
+    for (uint32_t i = 0; i < SCHEDULER_READY_PUBLICATION_CAPACITY; ++i)
+        destination.publication.refs[i] = source.publication.refs[i];
+}
 
 static_assert(sizeof(SchedulerAsyncLayout) == 128 && alignof(SchedulerAsyncLayout) == 128);
 static_assert(offsetof(SchedulerAsyncLayout, task_count) == 96);

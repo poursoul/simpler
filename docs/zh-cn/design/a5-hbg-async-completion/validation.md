@@ -19,6 +19,8 @@
 | 目录超界 | 超出一次性生命周期合同明确失败，不能跳过未完成发布后继续业务 |
 | P/R/closed 汇合 | 晚到登记、最后计算释放/最后 CHECK 任意次序；所有非零比例、零登记、skip、MIX 均不提前完成且只授予一次完成权 |
 | 计算释放顺序 | SPMD 每 block 的 trace 发布与 slot 释放先于 completed_blocks；MIX 收齐 release 后贡献，不能提前关闭计算 |
+| 初始化前缀与预留后缀 | 保持 64 条容量；脏值填充后缀、只拷贝前缀、跨 run 复用仍正确；零登记不写后缀，首次 CHECK/FINISH 初始化完整，重复封口不能覆盖 OWNED |
+| 分离 header/token | 连续 header、token 对齐/范围/不重叠；旧合并长度被拒绝；真实 AsyncCtx 指针指向 token 区，登记和观察一致 |
 | run 活动门控 | 零登记跳过空扫描；异核首次发布后服务可见，实际消费者获取生效；未激活时仍传播错误，跨 run 重置 |
 | 长 fanin/fanout | 每一步受预算约束；跨核续接不丢失、不重复 waiter 或 ready 发布 |
 | 责任移交 | waiter 挂到下一 producer 后立即被其改写，旧 FINISH 仍沿自己保存的旧链继续 |

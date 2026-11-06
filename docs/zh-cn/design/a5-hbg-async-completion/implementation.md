@@ -6,7 +6,7 @@
 
 | 模块 | 职责 |
 | ---- | ---- |
-| A5 HBG Host planner/runtime maker | 根据现有图预分配完成记录，初始化稳定 task/block/lane 映射 |
+| A5 HBG Host planner/runtime maker | 根据现有图预留完整记录容量，只初始化和上传稳定映射、header 及必要控制字前缀 |
 | kernel context 与登记 helper | 保留地址式登记接口，写入本执行的稳定记录，检查容量与首错 |
 | 执行返回与 completion/MIX 收尾 | 封口登记，释放实际执行资源，汇合计算释放和实际 pending 条件 |
 | CHECK | 任意参与核领取条件记录，每次有界检查，保存进度并交回执行机会 |
@@ -33,6 +33,8 @@
 物理执行返回与逻辑任务完成独立。SPMD 的全部 block、MIX 的全部 active lane 必须按真实释放顺序记账；零登记及合法 skip 也必须封口并释放执行资源。只有非零 group 增加 pending；计算释放全部完成后关闭登记，最后一次合法原子汇合才有 FINISH 激活权。
 
 全部成员均零登记的普通、SPMD、MIX task 沿用既有同步完成和本核后继路径，不发布独立 FINISH 工作。计算释放复用原有汇合，SPMD 必须在 trace 发布和 slot 释放后贡献 completed_blocks，MIX 必须先收齐 release。非 ordered 快路径只能在真实最后计算返回后判断是否曾登记；不能根据先返回成员的零登记或暂时 pending=0 推断整个任务同步。
+
+零登记执行不初始化任何 CHECK/FINISH 后缀状态；首次非零发布必须初始化其全部进度和 lease，目录零位保护未初始化存储。
 
 FINISH 保存完整 resolver 游标及最多 8 项发布批次，跨核恢复不重放已发生的队列发布。终态记录和目录清理完成后，才贡献 run 完成计数；正常退出不能越过尚未收尾的异步记录。
 

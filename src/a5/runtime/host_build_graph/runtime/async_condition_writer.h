@@ -50,13 +50,17 @@ inline __aicore__ bool fail(const AsyncWriter &writer, int32_t error) {
     return false;
 }
 
+inline __aicore__ bool layout_valid(const AsyncWriter &writer, __gm__ const AsyncGroupData &data) {
+    const uint32_t bytes = async_group_entry_bytes(data.capacity);
+    return data.reserved == 0 && data.task_ref >= 0 && data.subtask_slot < 3 && bytes != 0 &&
+           data.entries_bytes == bytes && data.entries_offset >= writer.group_offset + sizeof(AsyncGroupData) &&
+           span_valid(writer, data.entries_offset, bytes, ASYNC_RECORD_ALIGNMENT);
+}
+
 inline __aicore__ bool valid(const AsyncWriter &writer) {
     auto *data = group(writer);
     if (data == nullptr) return false;
-    const uint32_t bytes = async_group_publication_bytes(data->capacity);
-    if (data->reserved != 0 || data->task_ref < 0 || data->subtask_slot >= 3 || bytes == 0 ||
-        data->publication_bytes != bytes || !span_valid(writer, writer.group_offset, bytes, ASYNC_RECORD_ALIGNMENT))
-        return fail(writer, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+    if (!layout_valid(writer, *data)) return fail(writer, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     if (data->state != AsyncPublicationState::OPEN || data->error_code != SIMPLER_ERROR_NONE) return false;
     if (data->count > data->capacity) return fail(writer, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
     return true;
@@ -119,9 +123,7 @@ commit_condition(const AsyncWriter &writer, const AsyncReservation &reservation,
         return detail::fail(writer, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
     if (!detail::token_valid(token)) return detail::fail(writer, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     const uint32_t index = data->count;
-    auto *entries = reinterpret_cast<__gm__ volatile DeferredCompletionEntry *>(
-        writer.image + writer.group_offset + sizeof(AsyncGroupData)
-    );
+    auto *entries = reinterpret_cast<__gm__ volatile DeferredCompletionEntry *>(writer.image + data->entries_offset);
     entries[index].addr = token.addr;
     entries[index].backend_cookie = token.backend_cookie;
     entries[index].expected_value = token.expected_value;
@@ -150,8 +152,8 @@ inline __aicore__ bool register_completion_condition(const AsyncWriter &writer, 
            finish_reservation(writer, reservation, 1);
 }
 
-// The caller publishes the complete isolated publication span to GM, then
-// activates its lease/directory or settles a zero-count group. This function
+// The caller publishes the changed header fields and registered entries before
+// activating a nonzero group's lease/directory. This function
 // never grants scheduler ownership and never discharges a join obligation.
 inline __aicore__ bool seal_conditions(const AsyncWriter &writer) {
     auto *data = detail::group(writer);

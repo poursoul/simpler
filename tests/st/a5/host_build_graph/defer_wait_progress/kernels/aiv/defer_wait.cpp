@@ -79,18 +79,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     } else if (role == 2) {
         write_word(state + (waiters + 1) * kLineWords, 1);
     } else if (role == 3) {
-        const uint64_t started = now_ticks();
-        bool ready = false;
-        while (now_ticks() - started < 5000 * millisecond_ticks()) {
-            ready = read_word(state + (waiters + 1) * kLineWords) == 1;
-            for (int32_t i = 0; i < waiters && ready; ++i)
-                ready = read_word(state + (i + 1) * kLineWords) == 1;
-            if (ready) break;
-        }
+        // The publisher cannot wait for other tasks: a pending probe or waiter
+        // may already occupy another dispatch slot on this same execution core.
         // Expose a premature consumer while another AIV executes this publisher.
         const uint64_t delay = now_ticks();
         while (now_ticks() - delay < 5 * millisecond_ticks()) {}
-        write_word(state + (waiters + 2) * kLineWords, ready ? 1 : -1);
+        write_word(state + (waiters + 2) * kLineWords, 1);
         write_word(state, 1);
     } else if (role == 4) {
         write_word(state + (waiters + 3 + index) * kLineWords, read_word(state));
@@ -103,6 +97,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         bool ready = true;
         for (int32_t i = 0; i < chunks; ++i)
             ready = ready && read_word(state + (2 * waiters + 3 + i) * kLineWords) == 1;
+        for (int32_t i = 0; i < waiters; ++i)
+            ready = ready && read_word(state + (i + 1) * kLineWords) == 1;
         write_word(out, read_word(state + (waiters + 2) * kLineWords));
         write_word(out + kLineWords, read_word(state + (waiters + 1) * kLineWords));
         write_word(out + 2 * kLineWords, ready ? 1 : -1);

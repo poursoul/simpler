@@ -67,6 +67,7 @@
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
 #include "native_graph_plan.h"
+#include "async_completion_plan.h"
 #include "ready_pool_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
@@ -1577,6 +1578,27 @@ bool create_scheduler_state(
         return false;
     }
     layout.total_size = ready_pool_plan.total_size;
+    AsyncCompletionHostPlan async_plan;
+    std::vector<AsyncTaskPlanInput> async_inputs;
+    for (uint32_t ref = 0; ref < task_metadata.size(); ++ref) {
+        const auto &metadata = task_metadata[ref];
+        if ((metadata.flags & SCHEDULER_TASK_EXECUTABLE) == 0 || scheduler_task_is_inline(metadata.flags)) continue;
+        AsyncTaskPlanInput input;
+        input.task_ref = ref;
+        input.block_count = metadata.logical_block_num;
+        input.active_mask = metadata.active_mask;
+        async_inputs.push_back(input);
+    }
+    std::string async_error;
+    if (!plan_async_completion(
+            layout.total_size, api->run_epoch(), static_cast<uint32_t>(node_count), async_inputs, &async_plan,
+            &async_error
+        )) {
+        LOG_ERROR("A5 HBG: async completion layout failed: %s", async_error.c_str());
+        return false;
+    }
+    layout.total_size = async_plan.total_bytes;
+    layout.async_layout_offset = async_plan.layout_offset;
     layout.executable_task_count = executable_task_count;
     layout.executable_subtask_count = executable_subtask_count;
     layout.aic_worker_demand = aic_worker_demand;
@@ -1607,6 +1629,11 @@ bool create_scheduler_state(
     // unreachable.
     if (!scheduler_init_data_from_layout(host_base, layout, aligned_address)) {
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
+        return false;
+    }
+
+    if (layout.async_layout_offset != 0 && !initialize_async_completion(host_base, layout.total_size, async_plan)) {
+        LOG_ERROR("A5 HBG: failed to initialize async completion storage");
         return false;
     }
 

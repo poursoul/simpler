@@ -124,6 +124,11 @@ register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsy
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 inline __aicore__ bool
 send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc) {
+    // Resident SDMA submission requires completion-capacity reservation before effects.
+    if (ctx.resident_enabled != 0) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        return false;
+    }
     pto::comm::AsyncSession session;
     if (!pto::comm::BuildAsyncSession(desc.scratch, desc.workspace, session, desc.sync_id)) {
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);

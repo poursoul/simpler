@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <thread>
@@ -21,6 +22,7 @@
 
 #include "hbg_scheduler_test_support.h"
 #include "ready_pool_plan.h"
+#include "scheduler/scheduler_ready_publication.h"
 
 namespace {
 std::vector<SchedulerTaskMetadata> tasks(uint32_t count, uint32_t type) {
@@ -106,6 +108,148 @@ struct PoolFixture {
         );
     }
 };
+
+TEST(SchedulerReadyPoolTest, TransferablePublicationsDoNotBorrowWorkerPendingLists) {
+    for (uint32_t variant = 0; variant < 5; ++variant) {
+        SCOPED_TRACE(variant);
+        const auto kind = variant < 3  ? SchedulerReadyPoolKind::TICKET :
+                          variant == 3 ? SchedulerReadyPoolKind::LINKED :
+                                         SchedulerReadyPoolKind::CHUNK;
+        PoolFixture fixture(tasks(24, 0), 9, variant < 3 ? variant * 4 : 0, kind, variant == 4 ? 4 : 0);
+        SchedulerReadyPublication publication;
+        uint32_t owner = 0;
+        auto flush = [&] {
+            for (uint32_t attempts = 0; attempts < 1000; ++attempts) {
+                SchedulerReadyPublication moved;
+                std::memcpy(&moved, &publication, sizeof(moved));
+                auto &local = fixture.locals[++owner % fixture.locals.size()];
+                const auto result = scheduler_ready_publication_step(fixture.graph, fixture.base(), &local, moved);
+                publication = moved;
+                EXPECT_NE(result, SchedulerReadyPublishResult::ERROR);
+                for (const auto &worker : fixture.locals)
+                    EXPECT_FALSE(scheduler_ready_pool_has_pending(&worker));
+                if (result != SchedulerReadyPublishResult::YIELD) return result;
+            }
+            return SchedulerReadyPublishResult::ERROR;
+        };
+        for (int64_t ref = 0; ref < 24; ++ref) {
+            auto result =
+                scheduler_ready_publication_append(fixture.graph, fixture.base(), &fixture.locals[0], ref, publication);
+            if (result == SchedulerReadyAppendResult::FULL) {
+                ASSERT_EQ(flush(), SchedulerReadyPublishResult::DONE);
+                publication = {};
+                result = scheduler_ready_publication_append(
+                    fixture.graph, fixture.base(), &fixture.locals[0], ref, publication
+                );
+            }
+            ASSERT_EQ(result, SchedulerReadyAppendResult::ADDED);
+        }
+        ASSERT_EQ(flush(), SchedulerReadyPublishResult::DONE);
+        std::vector<bool> found(24, false);
+        uint64_t cursor = 0;
+        for (uint32_t count = 0; count < 24; ++count) {
+            SchedulerReadyClaim claim;
+            ASSERT_TRUE(fixture.pop(0, 0, &cursor, &claim));
+            ASSERT_GE(claim.task_ref, 0);
+            ASSERT_LT(claim.task_ref, 24);
+            EXPECT_FALSE(found[claim.task_ref]);
+            found[claim.task_ref] = true;
+        }
+        SchedulerReadyClaim empty;
+        ASSERT_TRUE(fixture.pop(0, 0, &cursor, &empty));
+        EXPECT_EQ(empty.task_ref, SCHEDULER_TASK_REF_INVALID);
+    }
+}
+
+TEST(SchedulerReadyPoolTest, ConcurrentTransferablePublishersAndConsumersDeliverEachTaskOnce) {
+    constexpr uint32_t task_count = 192;
+    for (uint32_t variant = 0; variant < 5; ++variant) {
+        SCOPED_TRACE(variant);
+        const auto kind = variant < 3  ? SchedulerReadyPoolKind::TICKET :
+                          variant == 3 ? SchedulerReadyPoolKind::LINKED :
+                                         SchedulerReadyPoolKind::CHUNK;
+        PoolFixture fixture(tasks(task_count, 1), 12, variant < 3 ? variant * 4 : 0, kind, variant == 4 ? 4 : 0);
+        std::vector<std::atomic<uint32_t>> seen(task_count);
+        for (auto &value : seen)
+            value.store(0);
+        std::atomic<bool> start{false};
+        std::atomic<uint32_t> consumed{0}, failures{0};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::vector<std::thread> threads;
+        for (uint32_t producer = 0; producer < 6; ++producer) {
+            threads.emplace_back([&, producer] {
+                while (!start.load(std::memory_order_acquire)) {}
+                SchedulerReadyPublication publication;
+                auto &local = fixture.locals[producer * 3];
+                auto flush = [&] {
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        SchedulerReadyPublication restored;
+                        std::memcpy(&restored, &publication, sizeof(restored));
+                        const auto result =
+                            scheduler_ready_publication_step(fixture.graph, fixture.base(), &local, restored);
+                        publication = restored;
+                        if (result == SchedulerReadyPublishResult::ERROR) return false;
+                        if (result == SchedulerReadyPublishResult::DONE) {
+                            return scheduler_ready_publication_step(
+                                       fixture.graph, fixture.base(), &local, publication
+                                   ) == SchedulerReadyPublishResult::DONE;
+                        }
+                    }
+                    return false;
+                };
+                for (uint32_t index = 0; index < 32; ++index) {
+                    const int64_t ref = producer * 32 + index;
+                    auto result =
+                        scheduler_ready_publication_append(fixture.graph, fixture.base(), &local, ref, publication);
+                    if (result == SchedulerReadyAppendResult::FULL) {
+                        if (!flush()) {
+                            ++failures;
+                            return;
+                        }
+                        publication = {};
+                        result =
+                            scheduler_ready_publication_append(fixture.graph, fixture.base(), &local, ref, publication);
+                    }
+                    if (result != SchedulerReadyAppendResult::ADDED) {
+                        ++failures;
+                        return;
+                    }
+                }
+                if (!flush()) ++failures;
+            });
+        }
+        for (uint32_t consumer = 0; consumer < 6; ++consumer) {
+            threads.emplace_back([&, consumer] {
+                while (!start.load(std::memory_order_acquire)) {}
+                uint64_t cursor = 0;
+                while (consumed.load() < task_count && failures.load() == 0 &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    SchedulerReadyClaim claim;
+                    if (!fixture.pop(consumer * 3 + 1, 1, &cursor, &claim)) {
+                        ++failures;
+                        return;
+                    }
+                    if (claim.task_ref == SCHEDULER_TASK_REF_INVALID) continue;
+                    if (claim.task_ref < 0 || claim.task_ref >= task_count) {
+                        ++failures;
+                        return;
+                    }
+                    if (seen[claim.task_ref].fetch_add(1) != 0) ++failures;
+                    ++consumed;
+                }
+            });
+        }
+        start.store(true, std::memory_order_release);
+        for (auto &thread : threads)
+            thread.join();
+        EXPECT_EQ(failures.load(), 0u);
+        EXPECT_EQ(consumed.load(), task_count);
+        for (const auto &value : seen)
+            EXPECT_EQ(value.load(), 1u);
+        for (const auto &local : fixture.locals)
+            EXPECT_FALSE(scheduler_ready_pool_has_pending(&local));
+    }
+}
 
 TEST(SchedulerReadyPoolTest, AllocatesExactlyOneEntryPerExecutableMetadataAcrossAllTopologies) {
     auto metadata = tasks(97, 0);

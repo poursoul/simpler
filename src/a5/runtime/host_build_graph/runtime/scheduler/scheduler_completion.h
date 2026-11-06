@@ -54,6 +54,15 @@ static inline __aicore__ bool scheduler_complete_ordered_task(
 ) {
     if (scheduler == nullptr || scheduler->admission == nullptr || !scheduler_task_ref_valid(graph, task_ref))
         return false;
+    bool deferred = false;
+    if (!scheduler_async_task_is_deferred(scheduler->async, task_ref, deferred)) {
+        scheduler_record_error(
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            SchedulerErrorSite::ASYNC_CONTEXT_INVALID
+        );
+        return false;
+    }
+    if (deferred) return true;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
     if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
@@ -112,6 +121,14 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const int64_t task_ref = local_slot->task_ref;
     if (!scheduler_task_ref_valid(graph, task_ref)) {
         scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, scheduler);
+        return false;
+    }
+    bool deferred = false;
+    if (!scheduler_async_task_is_deferred(scheduler->async, task_ref, deferred)) {
+        scheduler_record_error(
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            SchedulerErrorSite::ASYNC_CONTEXT_INVALID, local_slot
+        );
         return false;
     }
     SchedulerMixTracker *mix_tracker = nullptr;
@@ -252,7 +269,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     scheduler->set_timing_slot(cluster_lane, pending_slot, -1);
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     SchedulerReadyClaim resolved_ready{};
-    if (task_complete && scheduler->admission == nullptr) {
+    if (task_complete && !deferred && scheduler->admission == nullptr) {
         __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
         if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
@@ -351,6 +368,16 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, pending_slot, completed_generation
             ))
             return false;
+    } else if (deferred) {
+        // Ordinary/SPMD blocks retire after the slot and its final trace writes.
+        // A non-ordered Mix tracker owns one block only after all lanes retire.
+        if ((mix_tracker == nullptr || task_complete) && !scheduler_async_release_block(scheduler->async, task_ref)) {
+            scheduler_record_error(
+                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                SchedulerErrorSite::ASYNC_BLOCK_RELEASE_FAILED
+            );
+            return false;
+        }
     } else if (task_complete) {
         if (scheduler->admission != nullptr) {
             if (!scheduler_complete_ordered_task<RecordProtocol>(

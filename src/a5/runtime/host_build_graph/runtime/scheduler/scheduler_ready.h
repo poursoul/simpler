@@ -17,13 +17,7 @@
 #include "scheduler_error.h"
 #include "scheduler_ssbuf.h"
 #include "scheduler_ready_pool.h"
-
-enum class SchedulerRouteResult : uint64_t {
-    READY_TO_ENQUEUE = 1,
-    WAITING = 2,
-    COMPLETED = 3,
-    ERROR = 4,
-};
+#include "scheduler_resolve_state.h"
 
 enum class SchedulerPredicateResult : uint8_t {
     PASS = 0,
@@ -297,17 +291,15 @@ static_assert(offsetof(SchedulerMixTracker, active_mask) == 8);
 static_assert(offsetof(SchedulerMixTracker, completed_mask) == 9);
 static_assert(std::is_trivially_copyable_v<SchedulerMixTracker> && std::is_standard_layout_v<SchedulerMixTracker>);
 
-struct SchedulerControlResolveContinuation {
-    int64_t producer_ref{SCHEDULER_TASK_REF_INVALID};
-    int64_t next_waiter{SCHEDULER_TASK_REF_INVALID};
-};
+struct SchedulerAsyncLocalState;
 
 struct SchedulerLocalState {
     SchedulerLocalConfig config{};
     SchedulerLocalProfilingState *profiling{nullptr};
     SchedulerAdmissionLocalState *admission{nullptr};
+    SchedulerAsyncLocalState *async{nullptr};
     uint64_t pending_completed{0};
-    SchedulerControlResolveContinuation control_resolve{};
+    SchedulerResolveCursor control_resolve{};
     uint64_t last_completion_flush_cycles{0};
     uint32_t control_peer_cursor{0};
     SchedulerMixTracker mix_trackers[SCHEDULER_MIX_TRACKER_COUNT]{};
@@ -396,7 +388,7 @@ static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 144, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 632, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 808, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 248, "64-bit local profiling size changed"
 );
@@ -855,79 +847,119 @@ inline __aicore__ int64_t scheduler_observe_next_waiter(__gm__ SchedulerTaskCont
     return scheduler_gm_load(control->next_waiter);
 }
 
+// One unit initializes the cursor, observes one fanin, or attempts one wake
+// registration. A successful registration hands the waiter to another resolver:
+// every later call returns its saved verdict without reading that waiter again.
+inline __aicore__ SchedulerRouteProgress scheduler_route_task_step(
+    const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
+    __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerRouteCursor &cursor, uint32_t budget,
+    SchedulerWakeStats *stats, bool validate_current_state = true
+) {
+    uint32_t used = 0;
+    auto fail = [&](SchedulerGraphResult error, SchedulerErrorSite site = SchedulerErrorSite::UNKNOWN) __aicore__ {
+        cursor.result = SchedulerRouteResult::ERROR;
+        scheduler_record_error(run_control, task_ref, error, &graph, context, site);
+        return SchedulerRouteProgress{cursor.result, used};
+    };
+    if (context == nullptr || !scheduler_task_ref_valid(graph, task_ref))
+        return fail(SchedulerGraphResult::INVALID_TASK_ID);
+    if (cursor.task_ref != SCHEDULER_TASK_REF_INVALID && cursor.task_ref != task_ref)
+        return fail(SchedulerGraphResult::INVALID_ARGUMENTS);
+    if (cursor.result != SchedulerRouteResult::YIELD) {
+        if (cursor.task_ref == SCHEDULER_TASK_REF_INVALID) return fail(SchedulerGraphResult::INVALID_ARGUMENTS);
+        if (cursor.result != SchedulerRouteResult::WAITING && cursor.result != SchedulerRouteResult::READY_TO_ENQUEUE &&
+            cursor.result != SchedulerRouteResult::COMPLETED && cursor.result != SchedulerRouteResult::ERROR)
+            return fail(SchedulerGraphResult::INVALID_ARGUMENTS);
+        return {cursor.result, 0};
+    }
+    if (budget == 0) return {SchedulerRouteResult::YIELD, 0};
+    const bool initialize = cursor.task_ref == SCHEDULER_TASK_REF_INVALID;
+    auto *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
+    if (initialize) {
+        ++used;
+        cursor.task_ref = task_ref;
+        if (validate_current_state) {
+            const int64_t state = scheduler_gm_query(control->state);
+            if (state == static_cast<int64_t>(SchedulerTaskState::DONE)) {
+                cursor.result = SchedulerRouteResult::COMPLETED;
+                return {cursor.result, used};
+            }
+            if (state != static_cast<int64_t>(SchedulerTaskState::BLOCKED))
+                return fail(SchedulerGraphResult::INVALID_ARGUMENTS, SchedulerErrorSite::ROUTE_INVALID_STATE);
+        }
+        scheduler_observe_cache_line(&control->next_fanin_index);
+        cursor.next_fanin = control->next_fanin_index;
+        cursor.producer_ref = SCHEDULER_TASK_REF_INVALID;
+    }
+    SchedulerFaninView fanin{};
+    const auto fanin_status = scheduler_node_fanin_view(graph, task_ref, &fanin);
+    if (fanin_status != SchedulerGraphResult::OK) return fail(fanin_status);
+    if (initialize) cursor.fanin_count = fanin.count;
+    if (cursor.fanin_count != fanin.count || cursor.next_fanin < 0 ||
+        static_cast<uint32_t>(cursor.next_fanin) > fanin.count || cursor.producer_ref < SCHEDULER_TASK_REF_INVALID ||
+        (cursor.producer_ref >= 0 && (static_cast<uint32_t>(cursor.next_fanin) == fanin.count ||
+                                      !scheduler_task_ref_valid(graph, cursor.producer_ref))))
+        return fail(SchedulerGraphResult::INVALID_FANIN_ID);
+
+    while (used < budget && static_cast<uint32_t>(cursor.next_fanin) < fanin.count) {
+        ++used;
+        if (cursor.producer_ref == SCHEDULER_TASK_REF_INVALID) {
+            int64_t producer = SCHEDULER_TASK_REF_INVALID;
+            if (scheduler_fanin_ref(fanin, task_ref, static_cast<uint32_t>(cursor.next_fanin), &producer) !=
+                SchedulerGraphResult::OK)
+                return fail(SchedulerGraphResult::INVALID_FANIN_ID);
+            if (stats != nullptr) ++stats->fanin_state_load_count;
+            auto *producer_control = scheduler_task_control_at(scheduler_state_base, context, producer);
+            if (scheduler_gm_query(producer_control->state) == static_cast<int64_t>(SchedulerTaskState::DONE)) {
+                ++cursor.next_fanin;
+            } else {
+                cursor.producer_ref = producer;
+            }
+            continue;
+        }
+        auto *producer_control = scheduler_task_control_at(scheduler_state_base, context, cursor.producer_ref);
+        const int64_t observed = scheduler_gm_query(producer_control->wake_list_head);
+        if (observed == SCHEDULER_WAKE_LIST_CLOSED) {
+            if (stats != nullptr) ++stats->wake_closed_retry_count;
+            ++cursor.next_fanin;
+            cursor.producer_ref = SCHEDULER_TASK_REF_INVALID;
+            continue;
+        }
+        if (observed < SCHEDULER_WAKE_LIST_OPEN || (observed >= 0 && !scheduler_task_ref_valid(graph, observed)))
+            return fail(SchedulerGraphResult::INVALID_TASK_ID);
+        scheduler_publish_waiter_metadata(control, observed, cursor.next_fanin, cursor.producer_ref);
+        const int64_t actual = scheduler_gm_compare_exchange(producer_control->wake_list_head, observed, task_ref);
+        if (actual == observed) {
+            if (stats != nullptr) ++stats->wake_register_count;
+            cursor.result = SchedulerRouteResult::WAITING;
+            return {cursor.result, used};
+        }
+        if (stats != nullptr) ++stats->wake_cas_retry_count;
+        if (actual == SCHEDULER_WAKE_LIST_CLOSED) {
+            if (stats != nullptr) ++stats->wake_closed_retry_count;
+            ++cursor.next_fanin;
+            cursor.producer_ref = SCHEDULER_TASK_REF_INVALID;
+        } else if (actual < SCHEDULER_WAKE_LIST_OPEN || (actual >= 0 && !scheduler_task_ref_valid(graph, actual))) {
+            return fail(SchedulerGraphResult::INVALID_TASK_ID);
+        }
+    }
+    if (static_cast<uint32_t>(cursor.next_fanin) == fanin.count) cursor.result = SchedulerRouteResult::READY_TO_ENQUEUE;
+    return {cursor.result, used};
+}
+
 inline __aicore__ SchedulerRouteResult scheduler_route_task(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerWakeStats *stats,
     bool validate_current_state = true
 ) {
-    if (!scheduler_task_ref_valid(graph, task_ref)) {
-        scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, context);
-        return SchedulerRouteResult::ERROR;
-    }
-    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
-    if (validate_current_state) {
-        // A BLOCKED task belongs to at most one producer wake list. Completion
-        // detaches that list before routing the task to its next fanin.
-        int64_t state = scheduler_gm_query(control->state);
-        if (state == static_cast<int64_t>(SchedulerTaskState::DONE)) return SchedulerRouteResult::COMPLETED;
-        if (state != static_cast<int64_t>(SchedulerTaskState::BLOCKED)) {
-            scheduler_record_error(
-                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                SchedulerErrorSite::ROUTE_INVALID_STATE
-            );
-            return SchedulerRouteResult::ERROR;
-        }
-    }
-
-    SchedulerFaninView fanin{};
-    const auto fanin_status = scheduler_node_fanin_view(graph, task_ref, &fanin);
-    const uint32_t fanin_count = fanin.count;
-    if (fanin_status != SchedulerGraphResult::OK) {
-        scheduler_record_error(run_control, task_ref, fanin_status, &graph, context);
-        return SchedulerRouteResult::ERROR;
-    }
-    int32_t next_fanin = control->next_fanin_index;
-    if (next_fanin < 0 || static_cast<uint32_t>(next_fanin) > fanin_count) {
-        scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
-        return SchedulerRouteResult::ERROR;
-    }
-
-    while (static_cast<uint32_t>(next_fanin) < fanin_count) {
-        int64_t producer = -1;
-        if (scheduler_fanin_ref(fanin, task_ref, static_cast<uint32_t>(next_fanin), &producer) !=
-            SchedulerGraphResult::OK) {
-            scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
-            return SchedulerRouteResult::ERROR;
-        }
-        if (stats != nullptr) ++stats->fanin_state_load_count;
-        __gm__ SchedulerTaskControl *producer_control =
-            scheduler_task_control_at(scheduler_state_base, context, producer);
-        if (scheduler_gm_query(producer_control->state) == static_cast<int64_t>(SchedulerTaskState::DONE)) {
-            ++next_fanin;
-            continue;
-        }
-        while (true) {
-            int64_t observed = scheduler_gm_query(producer_control->wake_list_head);
-            if (observed == SCHEDULER_WAKE_LIST_CLOSED) {
-                if (stats != nullptr) ++stats->wake_closed_retry_count;
-                ++next_fanin;
-                break;
-            }
-            scheduler_publish_waiter_metadata(control, observed, next_fanin, producer);
-            int64_t actual = scheduler_gm_compare_exchange(producer_control->wake_list_head, observed, task_ref);
-            if (actual == observed) {
-                if (stats != nullptr) ++stats->wake_register_count;
-                return SchedulerRouteResult::WAITING;
-            }
-            if (stats != nullptr) ++stats->wake_cas_retry_count;
-            if (actual == SCHEDULER_WAKE_LIST_CLOSED) {
-                if (stats != nullptr) ++stats->wake_closed_retry_count;
-                ++next_fanin;
-                break;
-            }
-        }
-    }
-    return SchedulerRouteResult::READY_TO_ENQUEUE;
+    SchedulerRouteCursor cursor;
+    do {
+        scheduler_route_task_step(
+            graph, scheduler_state_base, context, run_control, task_ref, cursor, UINT32_MAX, stats,
+            validate_current_state
+        );
+    } while (cursor.result == SchedulerRouteResult::YIELD);
+    return cursor.result;
 }
 
 // The bootstrap partition gives every child one argument writer. Its exact

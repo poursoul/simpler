@@ -90,7 +90,7 @@ L/G 已接入 Host plan、bootstrap 和 dispatch；每个类型一个持久 pend
 
 第一条 L/G 候选按类型各保存一个本核 publisher 描述符；L/H 需要按目标组保存，不能把不同组的私有链合并。
 存储只包含 ref/count，任务本体仍在 run-resident GM，空间不能随未发布任务数增加本地数组。
-`SchedulerLinkedBatch` 是 24 bytes；L/G 三类型增加 72 bytes/core，`SchedulerLocalState` 从 560 增至 632 bytes。
+`SchedulerLinkedBatch` 是 24 bytes；L/G 三类型 pending 描述符占 72 bytes/core。控制解析的独立续接游标占 184 bytes，`SchedulerLocalState` 共 808 bytes（含可选异步服务状态的 8-byte 引用）；控制解析和可移交 FINISH 的待发布 batch 由各自游标持有，不借用上述本核 pending 列表。
 ready pool header 保持 128 bytes，version 升至 2，新增 kind 与 links_offset；Host 初始化独立 links 和每队列 sentinel。
 首个接入候选只允许 LINKED + group_width=0，拒绝未实现的 L/H。旧 T/G/H4/H8 仍可用同一设备 binary 进行比较。
 L/H 若每核保存全部 Q 个组则为 `24 × Q bytes/core`，必须与 GM publisher descriptors 等替代方案比较。

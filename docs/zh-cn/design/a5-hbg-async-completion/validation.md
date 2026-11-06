@@ -148,6 +148,8 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 
 [多卡 pending close 用例](../../../../tests/st/a5/host_build_graph/signal_payload_defer/test_pending_close.py) 在两/四 rank 提交后立即关闭 Worker。publisher 延后 200 ms，消费者使用 AIV `TLOAD/TSTORE` 读取四个 payload；调用方在 Worker 初始化前持有共享结果缓冲区，关闭后校验全部 peer 数据、完成状态及 domain 已释放并回收。这验证正常关闭对已接受跨卡访问的排空，不代表故障后的未知 DMA 已停止。
 
+[SDMA 错误保留用例](../../../../tests/st/a5/host_build_graph/sdma_defer_wait/test_error_close.py) 在两/四 rank 先校验 4 MiB peer TGET，再于新 run 的成功提交后触发登记容量溢出。关闭诊断采集时，逐卡读取独立目录中的设备错误日志，确认原始 `-102`、逻辑完成数为零、通信域回收被拒绝且关闭后不能创建新资源。该结果证明错误隔离与保留，不将它等同于引擎已停止或强制复用已安全。
+
 ## 4. 性能与选型实验
 
 正式性能测试只在完整新增功能、单卡/多卡用例和受影响的原有功能回归通过之后执行。性能标准采用 [PR #2864](https://github.com/hw-native-sys/simpler/pull/2864) 的用例集合，复用当前仓库中的清单及采集器；历史耗时只作背景，必须在同机同卡重新采集冻结基线与候选。

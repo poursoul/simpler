@@ -31,6 +31,8 @@ CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于
 
 ### 固定执行资源饱和
 
+基础场景为 [defer_wait_progress](../../../../tests/st/a5/host_build_graph/defer_wait_progress/test_defer_wait_progress.py)。核数由当前 run 的 `rt_available_aiv_count()` 获取，不固定设备或核数；waiter、普通 probe 和 publisher 使用同一 AIV 资源池。
+
 令 C 为实际参与测试的同类执行核数。依次测试 C−1、C、C+1 个普通 waiter，先提交 waiter，再提交使用相同核资源的 publisher。publisher 不能依赖 waiter；消费者依赖 waiter 并校验实际 payload。C 个阻塞 waiter 已足以形成资源饥饿，无须超过 C。
 
 必须观测 waiter 登记返回、publisher 获得执行、条件迟后满足、消费者最终运行；未满足条件不能放行消费者。CHECK 每次有界并交回调度权，不能把阻塞循环包装成新 task。另测持续 ready 业务下条件仍能被检查、长 PENDING 不虚报进展。

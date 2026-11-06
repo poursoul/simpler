@@ -176,6 +176,31 @@ int main(int argc, char **argv) {
                 tensor.strides[i] = 0;
             assert(pto2::detail::flat_transfer_bytes(tensor, bytes) && bytes == 0);
         }
+    } else if (scenario == 24) {
+        auto ctx = get_async_ctx(args);
+        assert(async_ctx_is_deferred(ctx));
+        assert(!ctx.task_token.is_valid());
+        assert(ctx.completion_count == &data->count);
+        assert(ctx.completion_error_code == &data->error_code);
+        assert(ctx.completion_capacity == data->capacity);
+        assert(
+            ctx.completion_entries ==
+            reinterpret_cast<volatile DeferredCompletionEntry *>(image + plan.groups[0].offset + sizeof(*data))
+        );
+        save_expected_notification_counter(ctx, reinterpret_cast<void *>(token.addr), 1);
+        assert(*ctx.completion_count == 1);
+        assert(ctx.completion_entries[0].addr == token.addr);
+    } else if (scenario == 25) {
+        for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+            auto ctx = get_async_ctx(args);
+            assert(async_ctx_is_deferred(ctx));
+            save_expected_notification_counter(ctx, reinterpret_cast<void *>(token.addr), 1);
+        }
+        auto ctx = get_async_ctx(args);
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        assert(data->count == 2);
+        assert(data->error_code == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+        assert(!pto2::resident::seal_conditions(ctx.resident));
     } else return 2;
     return 0;
 }

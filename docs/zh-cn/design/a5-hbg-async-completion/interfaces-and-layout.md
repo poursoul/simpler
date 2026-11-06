@@ -10,6 +10,8 @@
 
 `CompletionToken` 与既有 32 B `DeferredCompletionEntry` 保持原格式。COUNTER 使用 32-bit expected，SDMA post-done 使用 `backend_cookie` 保存完整 post id。登记检查支持的类型、读取宽度、地址对齐、expected 合法性及容量；地址所指 backing 的持有沿用既有 run/domain owner。
 
+条件记录不编码 signal 与 payload 的对应关系，也不会为任意裸地址自动建立资源引用。调用方必须通过现有 Tensor/Buffer 参数、domain 使用登记或明确覆盖最后访问的外部 owner 保持 signal 和 payload 有效。异步能力及最大条件数只决定登记区能力和容量，不能证明这些数据的生命周期或发布顺序。使用既有 owner 和消费者全 DCache 获取的路径不要求额外的 signal-payload 声明；需要范围获取的后端须从现有调用参数及通信操作解析实际范围，不能只根据 signal 地址推断。
+
 ## 2. 每次物理执行的完成记录
 
 `AsyncGroupData` 是 128 B 对齐的 header，记录 run epoch、task ref、block、lane、group index、容量、登记数量、首错、预留状态和封口状态。其后紧接 token 数组，不增加资源 binding 表或每条件 binding index。容量 1/64 的发布区分别占 256/2176 B。
@@ -27,6 +29,8 @@ header 中还保存 run 内 SDMA 提交互斥数组的 offset 和数量，占用
 `LocalContext` 保持 48 B，已有 slab 上下文保持 40 B，`DispatchPayload.args` 起点保持 64，完整 payload 保持 512 B。48 B `GlobalContext` 的 resident 字段提供当前执行的稳定完成记录地址与身份；`async_present` 只表示这个 dispatch 是否带 resident 上下文，不是跨 runtime 的注册协议版本。
 
 旧调度路径仍使用原 slab；resident 路径使用稳定 group。二者由当前 dispatch 填入的上下文决定，公开登记函数不要求调用方选择或重写接口。
+
+有效 resident `AsyncCtx` 的 `completion_count`、`completion_error_code`、`completion_entries` 和 `completion_capacity` 直接映射该 group 的真实存储，支持既有前端对登记区的检查；不另分配 slab，也不构造虚假的 `task_token`。`async_ctx_is_deferred()` 判断上下文身份、布局及 OPEN 状态，首个登记错误不使这个身份失效。后续登记与封口独立检查并保留首错，重复获取上下文不能清空已有条件或将溢出改写成其他错误。
 
 ## 4. Host 预分配
 

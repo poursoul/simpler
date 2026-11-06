@@ -193,16 +193,6 @@ inline __aicore__ bool scheduler_initialize_async(
     return true;
 }
 
-inline __aicore__ bool
-scheduler_async_task_is_deferred(SchedulerAsyncLocalState *local, int64_t task_ref, bool &deferred) {
-    deferred = false;
-    if (local == nullptr) return true;
-    uint32_t index = pto2::resident::ASYNC_INVALID_INDEX;
-    if (!scheduler_async_detail::task_index(*local, task_ref, index)) return false;
-    deferred = index != pto2::resident::ASYNC_INVALID_INDEX;
-    return true;
-}
-
 inline __aicore__ bool scheduler_async_execution_writer(
     SchedulerAsyncLocalState &local, int64_t task_ref, uint32_t block, uint32_t lane,
     pto2::resident::AsyncWriter &writer, bool observe_header = true
@@ -236,6 +226,31 @@ inline __aicore__ bool scheduler_async_execution_writer(
         !span(local.bytes, offset, data->publication_bytes, 1, 128))
         return fail(local, task_ref);
     writer = {local.base, local.bytes, local.layout->run_epoch, offset, group_index};
+    return true;
+}
+
+inline __aicore__ bool
+scheduler_async_task_is_deferred(SchedulerAsyncLocalState *local, int64_t task_ref, bool &deferred) {
+    using namespace scheduler_async_detail;
+    deferred = false;
+    if (local == nullptr) return true;
+    uint32_t index = ASYNC_INVALID_INDEX;
+    if (!task_index(*local, task_ref, index)) return false;
+    if (index == ASYNC_INVALID_INDEX) return true;
+    deferred = true;
+    auto *tasks = scheduler_state_at<SchedulerAsyncTaskData>(local->base, local->layout->task_data_offset);
+    const auto &task = tasks[index];
+    const uint8_t mask = *reinterpret_cast<__gm__ const uint8_t *>(&task.async_mask);
+    if (task.block_count != 1 || __builtin_popcount(mask) != 1) return true;
+    AsyncWriter writer{};
+    if (!scheduler_async_execution_writer(*local, task_ref, 0, static_cast<uint32_t>(__builtin_ctz(mask)), writer))
+        return false;
+    auto *data = pto2::resident::detail::group(writer);
+    // A sealed singleton has no other execution that could still register a
+    // condition. Preserve synchronous completion and direct successor refill
+    // when this execution registered none; multi-execution tasks retain the join.
+    deferred = data->state != AsyncPublicationState::SEALED || data->count != 0 || data->error_code != 0 ||
+               data->reserved != 0;
     return true;
 }
 
@@ -305,7 +320,14 @@ inline __aicore__ bool scheduler_async_release_block(SchedulerAsyncLocalState *l
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
     scheduler_cache_barrier();
     const auto released = scheduler_async_join_release_block(joins[index]);
-    if (released.result == SchedulerAsyncJoinResult::FINISH_OWNER) return activate_finish(*local, index);
+    if (released.result == SchedulerAsyncJoinResult::FINISH_OWNER) {
+        bool deferred = false;
+        if (!scheduler_async_task_is_deferred(local, task_ref, deferred)) return false;
+        if (deferred) return activate_finish(*local, index);
+        auto *leases = scheduler_state_at<SchedulerAsyncLease>(local->base, local->layout->finish_leases_offset);
+        return scheduler_async_lease_finish_dormant(leases[index]).result == SchedulerAsyncLeaseResult::SUCCESS ||
+               fail(*local, task_ref);
+    }
     return released.result == SchedulerAsyncJoinResult::PENDING || fail(*local, task_ref);
 }
 

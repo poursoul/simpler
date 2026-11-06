@@ -368,7 +368,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, pending_slot, completed_generation
             ))
             return false;
-    } else if (deferred) {
+    } else {
         // Ordinary/SPMD blocks retire after the slot and its final trace writes.
         // A non-ordered Mix tracker owns one block only after all lanes retire.
         if ((mix_tracker == nullptr || task_complete) && !scheduler_async_release_block(scheduler->async, task_ref)) {
@@ -378,15 +378,16 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
             );
             return false;
         }
-    } else if (task_complete) {
-        if (scheduler->admission != nullptr) {
-            if (!scheduler_complete_ordered_task<RecordProtocol>(
-                    graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, wake_stats,
-                    ready_stats, completion_stats
-                ))
-                return false;
-        } else {
-            ++scheduler->pending_completed;
+        if (task_complete && !deferred) {
+            if (scheduler->admission != nullptr) {
+                if (!scheduler_complete_ordered_task<RecordProtocol>(
+                        graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, wake_stats,
+                        ready_stats, completion_stats
+                    ))
+                    return false;
+            } else {
+                ++scheduler->pending_completed;
+            }
         }
     }
     if (direct_refilled != nullptr) *direct_refilled = refilled;

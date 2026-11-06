@@ -204,6 +204,38 @@ TEST(HbgAsyncControl, ConditionsMaySettleBeforeTheLastPhysicalBlockReleases) {
     EXPECT_EQ(f.local(2)->pending_completed, 1u);
 }
 
+TEST(HbgAsyncControl, ZeroConditionSingleExecutionKeepsItsSuccessorOnTheCompletingCore) {
+    AsyncFixture f;
+    f.storage.callable_addresses[1] = 0x1000;
+    f.graph.executable(1, 0, {0});
+    ASSERT_EQ(
+        scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, nullptr),
+        SchedulerRouteResult::WAITING
+    );
+    (void)f.start();
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
+    auto &slot = f.local()->slots[0];
+    slot.task_ref = 0;
+    slot.block_idx = 0;
+    slot.subtask_slot = 0;
+    slot.state = SchedulerDispatchSlotState::READY;
+    slot.generation = 1;
+    bool refilled = false;
+    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, 1, nullptr, nullptr, nullptr, 0, nullptr,
+        &refilled, nullptr
+    ));
+    EXPECT_TRUE(refilled);
+    EXPECT_EQ(slot.task_ref, 1);
+    EXPECT_EQ(slot.state, SchedulerDispatchSlotState::READY);
+    EXPECT_EQ(f.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    EXPECT_EQ(f.join().word, 0u);
+    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::TERMINAL);
+    EXPECT_FALSE(f.finish(1));
+    scheduler_flush_completions(f.storage.run_control, f.local());
+    EXPECT_EQ(f.storage.run_control->resolved_task_count, 1u);
+}
+
 TEST(HbgAsyncControl, EmptyAndSkippedExecutionsRemainStaticGroupObligationsForEveryMixMask) {
     for (uint32_t mask : {3u, 5u, 6u, 7u}) {
         const LaneMask lanes((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0);
@@ -287,9 +319,11 @@ TEST(HbgAsyncControl, FinishMigratesWithAnUnpublishedBatchAndCountsOnlyAfterDrai
             SchedulerRouteResult::WAITING
         );
     }
-    (void)f.start();
+    const auto writer = f.start();
+    f.register_counter(writer, 0);
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
     ASSERT_TRUE(scheduler_async_release_block(&f.workers[0], 0));
+    EXPECT_TRUE(f.check(1));
     bool saw_pending_batch = false;
     for (uint32_t step = 0;
          step < 500 && scheduler_async_lease_phase(f.finish_lease().word) != SchedulerAsyncPhase::TERMINAL; ++step) {

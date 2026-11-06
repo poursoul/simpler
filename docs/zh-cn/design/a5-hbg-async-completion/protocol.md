@@ -65,6 +65,8 @@ AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；�
 
 只有一次合法递减的返回旧值减去本次贡献后得到 `(B,G)=(0,0)`，该调用者才获得 FINISH 激活责任。它发布预分配 FINISH 的初始进度、RUNNABLE 和目录位，然后返回。其他核读取零值不触发激活。基础实现不在该调用者上直接执行 FINISH。
 
+单 block、单 active lane 且已封口的零条件 task 使用同步完成路径：没有尚待检查的条件，也没有其他执行成员能追加条件，本核可以直接完成任务并承接后继。该 completion 处理仍结算 B/G，但将 FINISH lease 从 DORMANT 直接变为 TERMINAL，不发布目录位；run 完成数仍等待该处理的 trace 和后继发布结束。此例外不适用于未封口的 group、已登记但条件已经满足的 group，或多个物理执行成员的 task。
+
 ### 不同任务形状
 
 - **普通/SPMD：** 每个具有异步能力的物理执行结算自己的 G，每个 block 独立释放 B；分波执行不要求同时驻留。

@@ -25,6 +25,7 @@ from .native_protocol import (
 MAX = (1 << 64) - 1
 EXECUTABLE, FANIN, MIX, SPMD, SYNC, INLINE, PREDICATE = (1, 2, 4, 8, 16, 32, 64)
 ENTRY, EXECUTED, COOPERATIVE, GM_GROUP, PERMIT_TAIL, PERMIT_NO_LOG, PUBLISHED = (1, 2, 4, 8, 16, 32, 64)
+DEFERRED_FINISH = 1 << 31
 
 
 def require(condition, message):
@@ -262,17 +263,20 @@ class NativeAudit:
                 "aliased or wrong task close seals",
             )
 
-    def record_identity(self, record, ref):
+    def record_identity(self, record, ref, *, completion=False):
+        flags = self.tasks[ref]["flags"]
+        if completion and record["flags"] & DEFERRED_FINISH:
+            flags |= DEFERRED_FINISH
         require(
             record["task_ref"] == ref
             and record["run_epoch"] == self.raw["run_epoch"]
-            and record["flags"] == self.tasks[ref]["flags"]
+            and record["flags"] == flags
             and record["order_key"] == self.orders.get(ref, MAX),
             "task/order/epoch/flags identity mismatch",
         )
 
-    def actor(self, actor, ref):
-        self.record_identity(actor, ref)
+    def actor(self, actor, ref, *, completion=False):
+        self.record_identity(actor, ref, completion=completion)
         require(actor["worker_index"] in self.workers, "unknown task actor")
         self.chain(actor, "before", "after")
 
@@ -699,8 +703,29 @@ class NativeAudit:
                 continue
             done = self.actors[ref]["completion"]
             require(done is not None, "missing TaskDone")
-            self.actor(done, ref)
-            if cooperative:
+            self.actor(done, ref, completion=True)
+            if done["flags"] & DEFERRED_FINISH:
+                require(
+                    task["flags"] & EXECUTABLE and not task["flags"] & INLINE and ref not in self.control_nodes,
+                    "deferred completion on an inline/control task",
+                )
+                if not cooperative:
+                    require(self.actors[ref]["admission"] is None, "ordinary deferred task has an admission event")
+                for block in self.task_blocks[ref]:
+                    self.before(
+                        point(block["owner"], "completion_after"),
+                        point(done, "before"),
+                        "deferred TaskDone before block release",
+                    )
+                count = task["block_num"] * task["active_mask"].bit_count()
+                for index in range(task["trace_base"], task["trace_base"] + count):
+                    execution = self.executions[index]
+                    self.before(
+                        point(execution, "trace_published"),
+                        point(done, "before"),
+                        "deferred TaskDone before execution release",
+                    )
+            elif cooperative:
                 last = max(self.task_blocks[ref], key=lambda block: block["owner"]["completion_ticket"])
                 owner = last["owner"]
                 require(owner["worker_index"] == done["worker_index"], "TaskDone not owned by last contributor")

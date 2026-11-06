@@ -28,6 +28,17 @@ namespace {
 
 using namespace pto2::resident;
 
+TEST(HbgAsyncControl, PreservesSpecificRegistrationFailuresAtTheRunBoundary) {
+    SchedulerAsyncLocalState local;
+    local.error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
+    EXPECT_EQ(scheduler_async_error_result(&local), SchedulerGraphResult::ASYNC_WAIT_OVERFLOW);
+    local.error_code = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+    EXPECT_EQ(scheduler_async_error_result(&local), SchedulerGraphResult::ASYNC_REGISTRATION_FAILED);
+    local.error_code = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+    EXPECT_EQ(scheduler_async_error_result(&local), SchedulerGraphResult::ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(scheduler_async_error_result(nullptr), SchedulerGraphResult::INVALID_ARGUMENTS);
+}
+
 AsyncTaskPlanInput
 async_task(int64_t task_ref, uint32_t blocks = 1, LaneMask mask = LaneMask::aic(), uint8_t capacity = 1) {
     AsyncTaskPlanInput input;

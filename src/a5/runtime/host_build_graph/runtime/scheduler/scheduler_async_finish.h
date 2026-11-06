@@ -78,10 +78,10 @@ inline __aicore__ bool scheduler_async_finish_step(
     scheduler_async_copy_resolver(cursor, progress[index].resolver);
     if (cursor.phase == SchedulerResolvePhase::START) {
         auto *control = scheduler_task_control_at(base, local, task_ref);
-        scheduler_protocol_task_done(base, local, task_ref, true);
+        scheduler_protocol_task_done(base, local, task_ref, true, true);
         scheduler_cache_barrier();
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-        scheduler_protocol_task_done(base, local, task_ref, false);
+        scheduler_protocol_task_done(base, local, task_ref, false, true);
     }
     const SchedulerResolveCursor before = cursor;
     const auto result = scheduler_resolve_completion_step(
@@ -133,7 +133,7 @@ inline __aicore__ bool scheduler_service_async_slice(
             );
     if (!ok)
         scheduler_record_error(
-            run, async.failed_task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
+            run, async.failed_task_ref, scheduler_async_error_result(&async), &graph, local,
             finish ? SchedulerErrorSite::ASYNC_FINISH_FAILED : SchedulerErrorSite::ASYNC_CHECK_FAILED
         );
     return ok;

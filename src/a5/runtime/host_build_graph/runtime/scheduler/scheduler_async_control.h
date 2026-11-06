@@ -14,6 +14,7 @@
 #include "async_condition_writer.h"
 #include "scheduler_async_directory.h"
 #include "scheduler_async_layout.h"
+#include "scheduler_graph.h"
 
 struct SchedulerAsyncLocalState {
     __gm__ uint8_t *base{nullptr};
@@ -28,6 +29,20 @@ struct SchedulerAsyncLocalState {
 };
 
 static_assert(sizeof(SchedulerAsyncLocalState) == 56);
+
+inline __aicore__ SchedulerGraphResult scheduler_async_error_result(const SchedulerAsyncLocalState *local) {
+    if (local == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
+    switch (local->error_code) {
+    case SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW:
+        return SchedulerGraphResult::ASYNC_WAIT_OVERFLOW;
+    case SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED:
+        return SchedulerGraphResult::ASYNC_REGISTRATION_FAILED;
+    case SIMPLER_ERROR_ASYNC_COMPLETION_INVALID:
+        return SchedulerGraphResult::ASYNC_COMPLETION_INVALID;
+    default:
+        return SchedulerGraphResult::INVALID_ARGUMENTS;
+    }
+}
 
 namespace scheduler_async_detail {
 

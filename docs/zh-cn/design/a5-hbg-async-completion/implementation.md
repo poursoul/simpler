@@ -52,3 +52,5 @@ FINISH 保存完整 resolver 游标及最多 8 项发布批次，跨核恢复不
 设计、实现与验收保持一致。开发记录和原始日志独立存放，文档不携带过程复述。阶段完成后及时提交、总结并继续后续工作；清理已有历史时按用户要求合并提交，之后按可验证单元组织。
 
 复用已有 DFX 输出和协议观测入口。必要事件关联 run/task/block/lane、登记封口、实际执行释放、条件满足、逻辑完成及 resolve 排空；不在热路径逐次打印 PENDING，也不为了观测扩展用户可见接口。
+
+FINISH 的 TaskDone actor 在既有 `flags` 字段中设置 bit 31，表示延迟完成。cooperative task 的 order 从已发布的 admission 记录读取，不依赖完成核仍持有原 cohort。校验器仅对带此标记的完成事件允许跨核 actor，并检查全部 block 贡献、执行 trace 发布先于逻辑完成以及后继依赖；admission、inline 和 Graph control 不能使用该标记。该诊断不替代外部完成条件和 payload 可见性的功能验证。

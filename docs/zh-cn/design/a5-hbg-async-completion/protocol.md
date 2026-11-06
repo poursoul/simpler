@@ -136,3 +136,5 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 CAS 失败立即返回正常服务，不等待某个 owner，不 sleep，也不给某记录设置固定重试时间。持续 PENDING、扫描与碰撞不刷新进展 watchdog；真实登记完成、条件推进、执行释放和后继发布才属于协议进展。
 
 进展依赖参与核持续返回服务点、原子操作能完成及合法依赖图。所有核运行长 kernel 时不承诺固定微秒发现延迟；本功能不抢占业务 kernel。服务规则必须保证 CHECK、FINISH、ready 和控制工作都不会永久饥饿。
+
+无 cooperative admission 的普通执行，每个核只认领下一项待执行任务；已有本地 READY 执行时，不再把其他普通 ready 任务预取到第二个槽。否则 publisher 运行期间可能把尚未执行的 waiter 扣在同核，其他空闲核也无法领取。cooperative slot 和参与者协议保持各自约束；该普通任务认领策略的调度成本纳入同步性能回归。

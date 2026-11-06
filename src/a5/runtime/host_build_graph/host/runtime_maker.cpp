@@ -2853,7 +2853,10 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     }
     if (runtime_status != 0) {
         if (api->observed_run_status().has_value()) {
-            LOG_ERROR("Observed runtime status: %d (shared scheduler header not read)", runtime_status);
+            const char *name = runtime_status < 0 && runtime_status >= -PTO_RUNTIME_LATCHED_CODE_MAX ?
+                                   error_name(-runtime_status) :
+                                   "unknown";
+            LOG_ERROR("Observed runtime status: %d (shared scheduler header not read) error=%s", runtime_status, name);
         } else {
             int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
             LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, sched_error_code, runtime_status);

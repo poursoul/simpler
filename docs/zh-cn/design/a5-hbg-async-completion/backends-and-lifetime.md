@@ -47,6 +47,8 @@ generation 只识别旧引用，不能阻止旧 DMA 写入已经复用的地址�
 
 首错停止新的正常发布和业务准入，但不能假定已提交 DMA/peer 访问随之停止。不能靠清零 B/G、目录为空、超时、普通 stream drain 或核 ACK 宣告外部访问结束。
 
+登记溢出、非法完成条件和登记协议错误分别保留既有 `ASYNC_WAIT_OVERFLOW`、`ASYNC_COMPLETION_INVALID`、`ASYNC_REGISTRATION_FAILED` 状态，经 AICPU 映射到现有运行结果；不能统一折叠为参数错误。错误冷路径同时记录名称及任务身份，超时记录 `SCHEDULER_TIMEOUT`。这些诊断不参与正常调度决策。
+
 正常路径复用现有 run/domain 退休。异常路径须核实当前后端究竟提供什么停止或完成保证；仅覆盖其他引擎的 drained 判断不能证明 SDMA 停止。证明不足时复用现有资源隔离与保留机制，禁止提前释放和复用，并返回原错误。
 
 不为本功能预设新的通用关闭回执 ABI。确有现有错误路径无法表达的缺口时，先给出可复现的实际访问问题，再在对应 owner/backend 做局部修复。2/4 rank 验收必须覆盖 peer 最后访问，不能用本地 reset 冒充远端停止证明。

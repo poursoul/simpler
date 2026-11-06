@@ -12,16 +12,15 @@ CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 ph
 | RUNNABLE(g) → OWNED(g) | 任意参与核 | 完整版本 CAS 成功；成功后才允许读取可变进度 |
 | OWNED(g) → RUNNABLE(g+1) | 当前 owner | 发布进度及屏障；目录位保持一 |
 | OWNED → TERMINAL | 当前 owner | 本记录负责的检查与最后进度写入结束；清目录位后结算完成责任 |
-| DORMANT → TERMINAL | 零登记或合法 skip 的执行尾部 | 登记已封口、不可能再发布条件；不设置目录位，直接结算 group |
 | DORMANT/OWNED → FAILED | 对应写者或 owner | 锁存首错与身份，保留 backing；不走正常完成贡献 |
 
 失败监督者不能覆盖仍由某核持有的 OWNED，也不通过超时抢占 lease。owner 故障按整个 run 的错误关闭处理，不恢复半写的短事务。
 
 发现候选时先检查索引范围及记录类别。成功领取并按发布合同观察不可变身份后，核对 run、task、block/subtask 和 group 映射，再读取可变进度；非法索引不能形成地址访问，身份不符不能通过回滚 lease 继续运行。
 
-kernel 返回后的执行尾部先核对登记错误、开放预留、count 与容量，再封口。非零条件组初始化未满足 mask 和游标，发布数据、RUNNABLE 及目录位后才释放本次执行的局部义务；零登记/skip 走直接终态路径。任何提交副作用不明或登记错误都禁止正常 TaskDone。
+kernel 返回后的执行尾部先核对登记错误、开放预留、count 与容量，再封口。非零条件组先增加 task 的 pending 责任，再初始化未满足 mask 和游标，发布数据、RUNNABLE 及目录位后才释放本次执行的局部义务。零登记/skip 不创建 CHECK 责任，lease 保持 DORMANT。任何提交副作用不明或登记错误都禁止正常 TaskDone。
 
-封口发布覆盖记录头及 `[0, count)` 的条件条目；预留但未登记的条目没有读取者，不需要逐项写回。零登记组只发布记录头，直接结算 group，不初始化或发布 CHECK 进度。分配容量仍是登记上限，不表示每次执行都需要发布整个预留区。
+封口发布覆盖记录头及 `[0, count)` 的条件条目；预留但未登记的条目没有读取者，不需要逐项写回。零登记组只发布记录头，不更新 join、lease 或 CHECK 进度。分配容量仍是登记上限，不表示每次执行都需要发布整个预留区。
 
 CHECK 每次取得一个 group，按条件游标观察尚未满足的条件。一次 slice 不重复观察同一未满足条件；超过预算的条件在后续 slice 继续。READY 位不再重读，前提是本次等待期间条件单调且不会提前重置。COUNTER32 与 SDMA post-done 通过相应宽度的读取判断完成；CHECK 不代替消费者的数据获取。后端若确有额外发布动作，只在证实其必要性后接入有界步骤。
 
@@ -44,6 +43,7 @@ CHECK 与 FINISH 分别拥有平坦位图，每个字包含 64 条记录。每�
 | task→group 映射、task 形状、group offset | Host 初始化并随 run 镜像发布，run 内保持只读 | run 入口完成全 DCache 获取后普通 cached 读取，不逐项重复失效 |
 | 封口身份、token | 执行核完成对应 cached 写回及实际屏障，再发布 RUNNABLE 和目录位 | 成功领取后按实际 cache 合同失效/观察，再消费数据 |
 | lease、join、目录、task 完成状态 | 专用原子操作，控制行无 cached 写入 | 权威判断使用原子观察；bypass 只能作允许过期的提示 |
+| run 异步活动标记 | 独占 128 B 行；Host 在 run 前置零，执行核在首次发布 CHECK/FINISH 前以 bypass store 写一并完成 DDR 屏障 | bypass load；本核见一后可以一直缓存 true，run 内不清零 |
 | owner 可变进度 | 独占期间 cached 写入，对应行写回及屏障完成后交权 | 下一 owner CAS 成功后失效并观察进度行，完成读取屏障后读取 |
 | payload、外部完成记录 | 遵守相应 backend 的可见性合同 | 不能将运行时 atomic-add-zero 原语用于 DMA/peer 写入的外部地址 |
 
@@ -51,31 +51,30 @@ AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；�
 
 首次发布的尾部必须完成目录置位后才允许进入业务 kernel。终态按“最后写入 → TERMINAL → 清目录位 → 完成贡献”的顺序执行。目录暂空、陈旧活动位、CAS 失败或 OWNED 均不能证明 run 完成。
 
-## 3. 静态完成汇合与任务形状
+## 3. 按实际登记汇合与任务形状
 
-每个异步逻辑 task 有一个 atomic-only join word。低 16 位为剩余 group 数 G，接着 16 位为未释放 block 数 B，高 32 位保留为零。初始化为 `(B0 << 16) | G0`，B/G0 的上限由 Host 物理执行展开检查保证。
+每个可登记的逻辑 task 有一个初值为零的 atomic-only join word：低 16 位为未完成非零 group 数 P，接着 16 位为累计登记 group 数 R，第 32 位为 computation-closed，其余位为零。R 保留“曾经登记”信息，即使所有条件提前满足，也不会把该 task 误认为同步任务。P ≤ R ≤ 32767，Host 继续检查物理执行展开上限。
 
-错误状态使用既有 run 首错 latch，不与计数字段共用编码。每次合法递减使用一次 unsigned GM fetch-add；检查返回旧值中对应计数非零、高位合法。错误计数不作补偿，不能获得 FINISH 激活资格。任务级唯一执行/lease 身份是防止重复贡献的前置条件，事后计数检查不代替它。
+| 转换 | 唯一操作者 | 顺序及返回结果 |
+| ---- | ---------- | -------------- |
+| P、R 各加一 | 非零组封口者 | 必须先于 CHECK 发布及本次执行资源释放；closed 后禁止新增 |
+| P 减一 | 最终 CHECK owner | 条件全部满足、group 终态及目录清位后；旧值 P=1 且 closed 时获得 FINISH 激活权 |
+| 设置 closed | 真实计算汇合的最后贡献者 | 全部 block/lane 已封口、trace 已发布且执行资源已释放；旧值 P=0、R>0 时获得 FINISH 激活权 |
 
-| 贡献 | 唯一操作者 | 贡献时刻 |
-| ---- | ---------- | -------- |
-| G 减一，非零组 | 最终 CHECK owner | 所有条件已满足，group 终态和目录清位结束后 |
-| G 减一，零登记/skip | 统一执行返回/skip 尾部 | 确认不会再登记且 group 最后写入完成后 |
-| B 减一，单 lane block | 该 block 的执行释放者 | 参数/trace 发布及 slot、局部执行义务释放后 |
-| B 减一，MIX block | coordinator | 收齐实际参与 lane 的返回、发布、release 与局部关闭后，只贡献一次 |
+每次转换只使用一次 unsigned GM fetch-add，并根据它返回的旧值判断结果。错误状态使用既有 run 首错 latch；非法位、溢出、下溢或重复 close 不作算术补偿，也不能获得完成权。唯一执行及 lease 身份防止重复贡献，计数校验不能替代身份验证。
 
-当前 `completed_blocks` 可继续服务 admission，但不能直接决定异步 task 的逻辑完成。释放 slot 或重置 MIX 本地状态前，保存完成贡献所需的稳定 task/group 身份，不能在清空后从旧 slot 反查。
+计算释放复用原有调度汇合：单 lane SPMD 的 `completed_blocks` 贡献必须在该 block 的 trace 发布及 slot 释放之后；MIX coordinator 收齐各 lane release 后，每 block 只贡献一次。最后贡献者关闭计算。异步路径不再为每个 block 重复维护第二份释放计数。释放 slot 前保存稳定身份，不能从已清空的 slot 反查。
 
-只有一次合法递减的返回旧值减去本次贡献后得到 `(B,G)=(0,0)`，该调用者才获得 FINISH 激活责任。它发布预分配 FINISH 的初始进度、RUNNABLE 和目录位，然后返回。其他核读取零值不触发激活。基础实现不在该调用者上直接执行 FINISH。
+P 暂时为零不证明计算结束，其他尚未返回的成员仍可能登记。只有设置 closed 或递减最后 P 的原子返回值授予 FINISH 激活权；普通读取只可验证已有 FINISH 的就绪条件，不能再激活。获权者发布预分配 FINISH 的 RUNNABLE 和目录位后返回，FINISH 继续受预算约束。
 
-单 block、单 active lane 且已封口的零条件 task 使用同步完成路径：没有尚待检查的条件，也没有其他执行成员能追加条件，本核可以直接完成任务并承接后继。该 completion 处理仍结算 B/G，但将 FINISH lease 从 DORMANT 直接变为 TERMINAL，不发布目录位；run 完成数仍等待该处理的 trace 和后继发布结束。此例外不适用于未封口的 group、已登记但条件已经满足的 group，或多个物理执行成员的 task。
+所有成员均零登记的普通、SPMD、MIX 或合法 skip task 沿用同步完成及本核后继路径，不创建 CHECK/FINISH 工作。非 ordered 路径只在真实最后计算返回后读取 R；R=0 时无需写 closed，保持原同步 resolve/refill 顺序。ordered 路径在 close 返回 P=R=0 时同步完成。不得在计算汇合前缓存 R=0；曾登记但条件已经满足的 task 仍进入 FINISH。全局完成数始终晚于最终 trace 和后继发布。
 
 ### 不同任务形状
 
-- **普通/SPMD：** 每个具有异步能力的物理执行结算自己的 G，每个 block 独立释放 B；分波执行不要求同时驻留。
-- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。group 完成不代替 coordinator 的 B 贡献，也不长期占用 MIX mailbox 或 cohort。保留既有 active lane 汇合，不因延迟完成新增消费准备 ack。
+- **普通/SPMD：** 非零物理执行登记并结算自己的 P，每个 block 通过原有计算汇合释放；分波执行不要求同时驻留。
+- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。group 完成不代替 coordinator 的 block 释放贡献，也不长期占用 MIX mailbox 或 cohort。保留既有 active lane 汇合，不因延迟完成新增消费准备 ack。
 - **sync-start：** 启动许可继续约束原计算 cohort。条件等待发生在执行资源释放后；已取得执行许可的核不得夹入 CHECK/FINISH。若特定读取路径确需额外本核获取，按[消费者可见性](consumer-preparation.md)在最终许可前完成，不将其作为所有任务的固定阶段。
-- **predicate skip：** 合法 skip 走 runtime 的封口/结算尾部，即使业务 kernel 根本未调用，也要结算预分配 G 并释放 B。
+- **predicate skip：** 合法 skip 走 runtime 封口和执行资源释放尾部；业务 kernel 未调用时不创建 pending 责任。
 - **Graph：** 每个实例的 child 使用独立 group/join。child 的 TaskDone 通过原 body→EXIT 依赖推进，ENTER/EXIT 本身不分配执行 group。未激活 child 仍保留责任；不能把未执行当成取消。
 
 ## 4. FINISH 与可续接后继发布
@@ -119,7 +118,9 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 
 所有正常 pending-publication、admission/cohort 暂不可进入的分支都经过安全服务门。前置服务必须能返回或具备独立上界；仅保证门在代码上可达不够。退出/错误路径可以直接收敛退出。
 
-初始调度参数为：有可合法执行业务时最多累计 4 次业务返回，下一次 admission 前执行至多一个 slice；无可执行业务时每轮至多一个 slice。CHECK/FINISH 轮换优先级，每类独立保持 word/bit 游标。失败探测、遇到 OWNED 和失败 CAS 也推进游标并消耗额度；一次成功领取后不再领取第二条记录。
+run 活动标记为零且没有本核错误时，服务门直接返回，不扫描 CHECK/FINISH 目录；错误传播不能被该快路径跳过。首次非零登记在发布可发现工作之前置一。该标记不归零，也不用于判断 run 完成；各核只有观察到一后才永久跳过后续标记读取。它与原子发布的目录不同，整行禁止 device cached 写入和 RMW，保证 bypass 发布/观察配对。
+
+活动开始后的初始调度参数为：有可合法执行业务时最多累计 4 次业务返回，下一次 admission 前执行至多一个 slice；无可执行业务时每轮至多一个 slice。CHECK/FINISH 轮换优先级，每类独立保持 word/bit 游标。失败探测、遇到 OWNED 和失败 CAS 也推进游标并消耗额度；一次成功领取后不再领取第二条记录。
 
 | 普通 slice 额度 | 初始上限 |
 | --------------- | -------- |

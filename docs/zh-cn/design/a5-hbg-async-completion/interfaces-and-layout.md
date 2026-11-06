@@ -36,9 +36,9 @@ header 中还保存 run 内 SDMA 提交互斥数组的 offset 和数量，占用
 
 Host 已拥有展开后的普通任务和 Graph child 元数据，按 task/block/active lane 生成稳定索引。`AsyncTaskPlanInput` 只保存这些调度信息及内部容量，不携带额外资源身份。Graph Definition、TensorData、task 参数和 callable 格式保持不变。
 
-基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行直接结算其 group，不进入 CHECK。该保守分配的成本必须纳入 bind、H2D、空间和同步运行性能验证；后续压缩不得靠新增强制用户声明或漏掉可能登记的执行实现。
+基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行封口后直接释放资源，不创建 CHECK 责任。该保守分配的成本必须纳入 bind、H2D、空间和同步运行性能验证；后续压缩不得靠新增强制用户声明或漏掉可能登记的执行实现。
 
-`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、group offset、lease、CHECK 进度、task join、FINISH 游标和活动位图位置。FINISH 的完整 resolver 游标为 184 B，放在独立 256 B 进度记录内。lease、发布数据和 cached 进度分别隔离到 128 B cache line。
+`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、group offset、lease、CHECK 进度、task join、FINISH 游标、活动位图及 run 活动标记的位置。offset 120 使用原布局余量保存 activity_offset；标记独占 128 B 行，禁止与 cached 数据共用回写行。FINISH 的完整 resolver 游标为 184 B，放在独立 256 B 进度记录内。lease、发布数据和 cached 进度分别隔离到 128 B cache line。
 
 SDMA 提交互斥字在 Host 初始化为零，只在运行中使用原子操作；SDK 的 session/postId/SQ 状态仍使用原 workspace。32 个实际 cluster 对应 4096 B 互斥存储，不能按逻辑 block 数重复分配，也不扩大公共通信 context。
 

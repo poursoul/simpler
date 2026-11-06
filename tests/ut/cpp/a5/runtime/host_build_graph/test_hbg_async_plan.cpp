@@ -168,10 +168,10 @@ TEST(HbgAsyncPlan, ExpandedTasksBlocksAndLanesHaveIndependentStableRecords) {
     for (uint32_t index = 0; index < plan.groups.size(); ++index)
         EXPECT_EQ(leases[index].word, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT));
     const auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(image.base, plan.layout.joins_offset);
-    EXPECT_EQ(scheduler_async_join_blocks(joins[1].word), 3u);
-    EXPECT_EQ(scheduler_async_join_groups(joins[1].word), 9u);
-    EXPECT_EQ(scheduler_async_join_blocks(joins[2].word), 2u);
-    EXPECT_EQ(scheduler_async_join_groups(joins[2].word), 4u);
+    EXPECT_EQ(joins[1].word, 0u);
+    EXPECT_EQ(joins[2].word, 0u);
+    EXPECT_EQ(plan.tasks[1].block_count, 3u);
+    EXPECT_EQ(plan.tasks[2].block_count, 2u);
     auto *finishes = scheduler_state_at<SchedulerAsyncFinishProgress>(image.base, plan.layout.finish_progress_offset);
     EXPECT_EQ(finishes[0].resolver.producer_ref, -1);
     EXPECT_EQ(finishes[0].resolver.phase, SchedulerResolvePhase::START);
@@ -192,8 +192,7 @@ TEST(HbgAsyncPlan, MixedCapabilityTaskCountsOnlyDeferredLanesAndAllBlocks) {
     Image image(plan.total_bytes);
     ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
     auto *join = scheduler_state_at<SchedulerAsyncTaskJoin>(image.base, plan.layout.joins_offset);
-    EXPECT_EQ(scheduler_async_join_blocks(join->word), 5u);
-    EXPECT_EQ(scheduler_async_join_groups(join->word), 10u);
+    EXPECT_EQ(join->word, 0u);
 }
 
 TEST(HbgAsyncPlan, EveryMixMaskIncludesOnlyItsActiveLanes) {

@@ -17,7 +17,9 @@
 | lease 交接 | 旧版本 CAS 失败；同一记录同时至多一个 owner；交权前进度可见 |
 | 活动目录 | bit 0/63、重复置/清、同字并发不改邻位；合法 126 次邻位变化后仍可完成 |
 | 目录超界 | 超出一次性生命周期合同明确失败，不能跳过未完成发布后继续业务 |
-| 静态 B/G | 最后 block/最后 group 任意次序，零登记、skip、多 block MIX 均只激活一次 FINISH |
+| P/R/closed 汇合 | 晚到登记、最后计算释放/最后 CHECK 任意次序；所有非零比例、零登记、skip、MIX 均不提前完成且只授予一次完成权 |
+| 计算释放顺序 | SPMD 每 block 的 trace 发布与 slot 释放先于 completed_blocks；MIX 收齐 release 后贡献，不能提前关闭计算 |
+| run 活动门控 | 零登记跳过空扫描；异核首次发布后服务可见，实际消费者获取生效；未激活时仍传播错误，跨 run 重置 |
 | 长 fanin/fanout | 每一步受预算约束；跨核续接不丢失、不重复 waiter 或 ready 发布 |
 | 责任移交 | waiter 挂到下一 producer 后立即被其改写，旧 FINISH 仍沿自己保存的旧链继续 |
 | resolve/退休 | TaskDone 可以早于 drain，run 完成及 backing 回收不能早于最后尾部 |
@@ -25,7 +27,7 @@
 
 CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于构造最坏合法交错，真实线程测试用于发现并发访问问题；不能只测试与实现同构的另一套计数器。
 
-至少保留以下有效负对照：漏掉零登记 group 结算、让普通观察者读零后再次激活、resolve 前计入完成、挂链后重新读取旧 waiter 链接。每个负对照都必须能使相应测试失败。
+至少保留以下有效负对照：尚有零登记成员未释放时提前关闭计算、让普通观察者读零后再次激活、resolve 前计入完成、挂链后重新读取旧 waiter 链接。每个负对照都必须能使相应测试失败。
 
 消费者可见性的负对照按实际读取路径设计：已有旧 cache 时绕过必要获取、Graph EXIT 后读取错误实例、MIX 或 sync-start 只有部分成员读到新数据，均不能获得通过。若采用额外获取游标或 ack，还须验证其不可跨核、slot 或数据版本复用；没有这种状态的实现不要求为了测试而增加它。真实 A5 可见性须用旧 cache 和完整 payload 建立独立证据。
 
@@ -79,7 +81,7 @@ CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于
 | -------- | ---- |
 | 普通单 lane | 非零、零登记、已经满足、实际延迟、1/64 条条件、多类型/多资源混合 |
 | SPMD | 超过并发容量的分波、不同 block 不同条件数、零登记与非零混合 |
-| MIX 3/5/6/7 | 同步 lane、零登记 lane 和 pending lane 混合；coordinator 只贡献一次 B |
+| MIX 3/5/6/7 | 同步 lane、零登记 lane 和 pending lane 混合；coordinator 每 block 只贡献一次计算释放 |
 | sync-start | 容量边界，取得许可后不插入检查；释放后的等待不扣住下一 cohort |
 | 单 lane predicate | skip 不发 DMA，预分配 group 仍结算；非法组合拒绝 |
 | Graph | 多实例、内外 fanin、多个 sink、不同实例相同 local id、普通任务交错 |

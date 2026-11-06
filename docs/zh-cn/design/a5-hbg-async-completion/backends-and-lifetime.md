@@ -45,7 +45,7 @@ generation 只识别旧引用，不能阻止旧 DMA 写入已经复用的地址�
 
 ## 5. 错误和关闭
 
-首错停止新的正常发布和业务准入，但不能假定已提交 DMA/peer 访问随之停止。不能靠清零 B/G、目录为空、超时、普通 stream drain 或核 ACK 宣告外部访问结束。
+首错停止新的正常发布和业务准入，但不能假定已提交 DMA/peer 访问随之停止。不能靠清零 pending 或强置计算关闭、目录为空、超时、普通 stream drain 或核 ACK 宣告外部访问结束。
 
 登记溢出、非法完成条件和登记协议错误分别保留既有 `ASYNC_WAIT_OVERFLOW`、`ASYNC_COMPLETION_INVALID`、`ASYNC_REGISTRATION_FAILED` 状态，经 AICPU 映射到现有运行结果；不能统一折叠为参数错误。错误冷路径同时记录名称及任务身份，超时记录 `SCHEDULER_TIMEOUT`。这些诊断不参与正常调度决策。
 

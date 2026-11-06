@@ -33,6 +33,7 @@ struct alignas(128) SchedulerAsyncLayout {
     uint32_t group_count;
     uint32_t sdma_guard_count;
     uint64_t sdma_guards_offset;
+    uint64_t activity_offset;
 };
 
 struct SchedulerAsyncTaskData {
@@ -57,8 +58,17 @@ struct alignas(128) SchedulerAsyncDirectoryWord {
     volatile uint64_t bits;
 };
 
+struct alignas(128) SchedulerAsyncActivity {
+    volatile uint64_t activated;
+};
+
 static_assert(sizeof(SchedulerAsyncLayout) == 128 && alignof(SchedulerAsyncLayout) == 128);
 static_assert(offsetof(SchedulerAsyncLayout, task_count) == 96);
+static_assert(offsetof(SchedulerAsyncLayout, activity_offset) == 120);
+static_assert(sizeof(SchedulerAsyncActivity) == 128 && alignof(SchedulerAsyncActivity) == 128);
+static_assert(
+    std::is_standard_layout_v<SchedulerAsyncActivity> && std::is_trivially_copyable_v<SchedulerAsyncActivity>
+);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
 static_assert(sizeof(SchedulerAsyncTaskData) == 16 && alignof(SchedulerAsyncTaskData) == 8);
 static_assert(

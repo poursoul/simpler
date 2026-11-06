@@ -82,6 +82,7 @@ bool plan_async_completion(
     layout.sdma_guard_count = sdma_guard_count;
     uint64_t cursor = begin_offset;
     if (!reserve_array<SchedulerAsyncLayout>(&cursor, 1, &next.layout_offset) ||
+        !reserve_array<SchedulerAsyncActivity>(&cursor, 1, &layout.activity_offset) ||
         !reserve_array<uint32_t>(&cursor, task_count, &layout.task_map_offset) ||
         !reserve_array<SchedulerAsyncTaskData>(&cursor, layout.async_task_count, &layout.task_data_offset) ||
         !reserve_array<uint64_t>(&cursor, layout.group_count, &layout.group_offsets_offset) ||
@@ -149,6 +150,7 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
             guards[index].word = 0;
     }
     auto *map = scheduler_state_at<uint32_t>(image, plan.layout.task_map_offset);
+    scheduler_state_at<SchedulerAsyncActivity>(image, plan.layout.activity_offset)->activated = 0;
     for (uint32_t ref = 0; ref < plan.layout.task_count; ++ref)
         map[ref] = ASYNC_INVALID_INDEX;
     auto *tasks = scheduler_state_at<SchedulerAsyncTaskData>(image, plan.layout.task_data_offset);
@@ -159,10 +161,7 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
         const auto &task = plan.tasks[index];
         tasks[index] = task;
         map[task.task_ref] = index;
-        uint64_t initial = 0;
-        const uint32_t groups = task.block_count * static_cast<uint32_t>(task.async_mask.count());
-        if (!scheduler_async_join_initial_word(task.block_count, groups, initial)) return false;
-        joins[index].word = initial;
+        joins[index].word = 0;
         finish_leases[index].word = scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT);
         finish_progress[index] = SchedulerAsyncFinishProgress{};
     }

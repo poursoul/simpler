@@ -542,7 +542,8 @@ __aicore__ bool run_ready_dispatch_loop(
             // Dependencies and final admission are settled. Acquire payload on
             // the actual consumer core before writing its fresh async context;
             // another core's completion observation cannot invalidate this cache.
-            if (payload->function_bin_addr != 0) scheduler_observe_data_cache(payload);
+            if (payload->function_bin_addr != 0 && scheduler_async_work_activated(context->async))
+                scheduler_observe_data_cache(payload);
             if (!scheduler_async_begin_execution(
                     context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, payload->global_context
                 )) {

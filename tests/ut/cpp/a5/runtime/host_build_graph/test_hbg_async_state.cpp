@@ -27,7 +27,6 @@ namespace {
 
 using Phase = SchedulerAsyncPhase;
 using LeaseResult = SchedulerAsyncLeaseResult;
-using JoinResult = SchedulerAsyncJoinResult;
 
 struct CountingAtomics {
     uint64_t word{0};
@@ -218,149 +217,19 @@ TEST(SchedulerAsyncStateTest, FailureWriterCannotTakeOverAnotherOwner) {
     EXPECT_EQ(scheduler_async_lease_phase(error.word), Phase::FAILED);
 }
 
-TEST(SchedulerAsyncStateTest, JoinInitialCountsAreCheckedBeforeChangingTheOutput) {
-    uint64_t word = UINT64_C(0xabcdef);
-    for (auto counts : std::vector<std::pair<uint32_t, uint32_t>>{{0, 1}, {1, 0}, {32768, 1}, {1, 32768}}) {
-        EXPECT_FALSE(scheduler_async_join_initial_word(counts.first, counts.second, word));
-        EXPECT_EQ(word, UINT64_C(0xabcdef));
-    }
-    ASSERT_TRUE(scheduler_async_join_initial_word(32767, 32767, word));
-    EXPECT_EQ(scheduler_async_join_blocks(word), 32767u);
-    EXPECT_EQ(scheduler_async_join_groups(word), 32767u);
-    EXPECT_TRUE(scheduler_async_join_word_valid(word));
-    EXPECT_FALSE(scheduler_async_join_word_valid(UINT64_C(1) << 32));
-    EXPECT_FALSE(scheduler_async_join_word_valid(UINT64_C(32768)));
-    EXPECT_FALSE(scheduler_async_join_word_valid(UINT64_C(32768) << 16));
-}
-
-TEST(SchedulerAsyncStateTest, EveryBlockAndGroupInterleavingHasExactlyOneLastDecrementOwner) {
-    std::vector<int> contributions{0, 0, 0, 0, 1, 1};
-    uint32_t sequences = 0;
-    do {
-        SchedulerAsyncTaskJoin join{};
-        uint64_t initial = 0;
-        ASSERT_TRUE(scheduler_async_join_initial_word(2, 4, initial));
-        join.word = initial;
-        uint32_t finish_owners = 0;
-        for (size_t index = 0; index < contributions.size(); ++index) {
-            const auto result = contributions[index] == 0 ? scheduler_async_join_settle_group(join) :
-                                                            scheduler_async_join_release_block(join);
-            EXPECT_EQ(
-                result.result, index + 1 == contributions.size() ? JoinResult::FINISH_OWNER : JoinResult::PENDING
-            );
-            if (result.result == JoinResult::FINISH_OWNER) ++finish_owners;
-        }
-        EXPECT_EQ(finish_owners, 1u);
-        EXPECT_EQ(join.word, 0u);
-        ++sequences;
-    } while (std::next_permutation(contributions.begin(), contributions.end()));
-    EXPECT_EQ(sequences, 15u);
-}
-
-TEST(SchedulerAsyncStateTest, ZeroRegistrationAndSkippedGroupsRemainRealJoinObligations) {
+TEST(SchedulerAsyncStateTest, FailedGroupRetainsItsPendingObligation) {
     SchedulerAsyncTaskJoin join{};
-    uint64_t initial = 0;
-    ASSERT_TRUE(scheduler_async_join_initial_word(1, 3, initial));
-    join.word = initial;
-    SchedulerAsyncLease deferred{}, empty{}, skipped{};
-    volatile uint64_t directory = 0;
-    const auto published = scheduler_async_lease_publish(deferred);
-    ASSERT_EQ(published.result, LeaseResult::SUCCESS);
-    ASSERT_EQ(scheduler_async_directory_publish(directory, 0), SchedulerAsyncDirectoryResult::SUCCESS);
-    EXPECT_EQ(scheduler_async_join_release_block(join).result, JoinResult::PENDING);
-    const auto owner = scheduler_async_lease_try_claim(deferred, published.word);
-    ASSERT_EQ(owner.result, LeaseResult::SUCCESS);
-    ASSERT_EQ(scheduler_async_lease_finish(deferred, owner.word).result, LeaseResult::SUCCESS);
-    ASSERT_EQ(scheduler_async_directory_clear(directory, 0), SchedulerAsyncDirectoryResult::SUCCESS);
-    EXPECT_EQ(scheduler_async_join_settle_group(join).result, JoinResult::PENDING);
-    EXPECT_EQ(directory, 0u);
-    EXPECT_EQ(scheduler_async_join_groups(join.word), 2u);
-
-    ASSERT_EQ(scheduler_async_lease_finish_dormant(empty).result, LeaseResult::SUCCESS);
-    EXPECT_EQ(scheduler_async_join_settle_group(join).result, JoinResult::PENDING);
-    EXPECT_EQ(scheduler_async_lease_finish_dormant(empty).result, LeaseResult::OWNERSHIP_LOST);
-    ASSERT_EQ(scheduler_async_lease_finish_dormant(skipped).result, LeaseResult::SUCCESS);
-    EXPECT_EQ(scheduler_async_join_settle_group(join).result, JoinResult::FINISH_OWNER);
-    EXPECT_EQ(join.word, 0u);
-}
-
-TEST(SchedulerAsyncStateTest, InvalidOldJoinValuesAndUnderflowNeverGrantFinishOwnership) {
-    for (uint64_t value : {UINT64_C(0), UINT64_C(1) << 16}) {
-        CountingAtomics atomics{value};
-        const auto result = scheduler_async_state_detail::contribute<true>(atomics);
-        EXPECT_EQ(result.result, JoinResult::UNDERFLOW);
-        EXPECT_EQ(result.previous, value);
-        EXPECT_EQ(atomics.additions, 1u);
-    }
-    for (uint64_t value : {UINT64_C(0), UINT64_C(1)}) {
-        CountingAtomics atomics{value};
-        EXPECT_EQ(scheduler_async_state_detail::contribute<false>(atomics).result, JoinResult::UNDERFLOW);
-        EXPECT_EQ(atomics.additions, 1u);
-    }
-    for (uint64_t value : {UINT64_C(1) << 32, UINT64_C(32768), UINT64_C(32768) << 16, UINT64_MAX}) {
-        CountingAtomics group{value};
-        CountingAtomics block{value};
-        EXPECT_EQ(scheduler_async_state_detail::contribute<true>(group).result, JoinResult::INVALID_WORD);
-        EXPECT_EQ(scheduler_async_state_detail::contribute<false>(block).result, JoinResult::INVALID_WORD);
-        EXPECT_EQ(group.additions, 1u);
-        EXPECT_EQ(block.additions, 1u);
-    }
-}
-
-TEST(SchedulerAsyncStateTest, FailedGroupDoesNotDischargeItsNormalCompletionObligation) {
-    SchedulerAsyncTaskJoin join{};
-    uint64_t initial = 0;
-    ASSERT_TRUE(scheduler_async_join_initial_word(1, 1, initial));
-    join.word = initial;
+    ASSERT_EQ(scheduler_async_pending::register_group(join).result, scheduler_async_pending::Result::PENDING);
     SchedulerAsyncLease group{};
     const auto published = scheduler_async_lease_publish(group);
     const auto owner = scheduler_async_lease_try_claim(group, published.word);
     ASSERT_EQ(owner.result, LeaseResult::SUCCESS);
-    ASSERT_EQ(scheduler_async_join_release_block(join).result, JoinResult::PENDING);
+    ASSERT_EQ(scheduler_async_pending::close_computation(join).result, scheduler_async_pending::Result::PENDING);
     ASSERT_EQ(scheduler_async_lease_fail(group, owner.word).result, LeaseResult::SUCCESS);
-    EXPECT_EQ(scheduler_async_join_blocks(join.word), 0u);
-    EXPECT_EQ(scheduler_async_join_groups(join.word), 1u);
+    EXPECT_TRUE(scheduler_async_pending::closed(join.word));
+    EXPECT_EQ(scheduler_async_pending::pending(join.word), 1u);
+    EXPECT_FALSE(scheduler_async_pending::ready_to_finish(join.word));
     EXPECT_EQ(scheduler_async_lease_finish(group, owner.word).result, LeaseResult::OWNERSHIP_LOST);
-}
-
-TEST(SchedulerAsyncStateTest, ConcurrentUniqueContributionsProduceOnlyOneFinishOwner) {
-    SchedulerAsyncTaskJoin join{};
-    uint64_t initial = 0;
-    ASSERT_TRUE(scheduler_async_join_initial_word(8, 16, initial));
-    join.word = initial;
-    std::mutex mutex;
-    std::condition_variable ready;
-    bool start = false;
-    std::atomic<uint32_t> owners{0};
-    std::atomic<uint32_t> pending{0};
-    std::atomic<uint32_t> invalid{0};
-    std::vector<std::thread> workers;
-    for (uint32_t index = 0; index < 24; ++index) {
-        workers.emplace_back([&, index] {
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                ready.wait(lock, [&] {
-                    return start;
-                });
-            }
-            const auto result =
-                index < 16 ? scheduler_async_join_settle_group(join) : scheduler_async_join_release_block(join);
-            if (result.result == JoinResult::FINISH_OWNER) ++owners;
-            else if (result.result == JoinResult::PENDING) ++pending;
-            else ++invalid;
-        });
-    }
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        start = true;
-    }
-    ready.notify_all();
-    for (auto &worker : workers)
-        worker.join();
-    EXPECT_EQ(owners, 1u);
-    EXPECT_EQ(pending, 23u);
-    EXPECT_EQ(invalid, 0u);
-    EXPECT_EQ(join.word, 0u);
 }
 
 }  // namespace

@@ -543,11 +543,20 @@ class NativeAudit:
             self.before(
                 point(execution, "visible"), point(owner, "completion_before"), "block completed before outputs visible"
             )
-            self.before(
-                point(owner, "completion_after"),
-                point(execution, "completion_consumed"),
-                "pure completion ticket after retirement",
-            )
+            if owner["completion_after"][1] < execution["completion_consumed"][1]:
+                # Captures whose block counter precedes local retirement.
+                self.before(
+                    point(owner, "completion_after"),
+                    point(execution, "completion_consumed"),
+                    "pure completion ticket after retirement",
+                )
+            else:
+                # A release join may move after retirement, but never inside it.
+                self.before(
+                    point(execution, "trace_published"),
+                    point(owner, "completion_before"),
+                    "pure completion join before trace retirement",
+                )
         for ref, blocks in self.task_blocks.items():
             by_claim = sorted(blocks, key=lambda block: block["owner"]["block_idx"])
             self.ordered_intervals([b["owner"] for b in by_claim], "claim_before", "claim_after")

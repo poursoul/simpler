@@ -26,6 +26,7 @@ struct SchedulerAsyncLocalState {
     int32_t error_code{0};
     uint32_t business_returns{0};
     bool finish_first{false};
+    bool work_activated{false};
 };
 
 static_assert(sizeof(SchedulerAsyncLocalState) == 56);
@@ -77,6 +78,20 @@ inline __aicore__ void publish(__gm__ void *address, uint64_t bytes) {
     scheduler_cache_barrier();
 }
 
+inline __aicore__ void publish_activity(SchedulerAsyncLocalState &local) {
+    if (local.work_activated) return;
+    auto *activity = scheduler_state_at<SchedulerAsyncActivity>(local.base, local.layout->activity_offset);
+    // Host initializes zero before the run. Every device writer stores one;
+    // this isolated line has no cached writes or RMW, and never returns to zero.
+#if defined(__CCE_AICORE__)
+    st_dev(UINT64_C(1), const_cast<__gm__ uint64_t *>(&activity->activated), 0);
+    dsb(DSB_DDR);
+#else
+    __atomic_store_n(&activity->activated, UINT64_C(1), __ATOMIC_RELEASE);
+#endif
+    local.work_activated = true;
+}
+
 inline __aicore__ bool task_index(SchedulerAsyncLocalState &local, int64_t task_ref, uint32_t &index) {
     index = ASYNC_INVALID_INDEX;
     if (local.error_code != 0 || local.layout == nullptr || task_ref < 0 ||
@@ -95,6 +110,7 @@ inline __aicore__ bool activate_finish(SchedulerAsyncLocalState &local, uint32_t
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(local.base, local.layout->finish_leases_offset);
     auto *directory =
         scheduler_state_at<SchedulerAsyncDirectoryWord>(local.base, local.layout->finish_directory_offset);
+    publish_activity(local);
     scheduler_cache_barrier();
     if (scheduler_async_lease_publish(leases[index]).result != SchedulerAsyncLeaseResult::SUCCESS ||
         scheduler_async_directory_publish(directory[index / 64].bits, index % 64) !=
@@ -108,9 +124,9 @@ inline __aicore__ bool settle_group(SchedulerAsyncLocalState &local, int64_t tas
     if (!task_index(local, task_ref, index) || index == ASYNC_INVALID_INDEX) return fail(local, task_ref);
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local.base, local.layout->joins_offset);
     scheduler_cache_barrier();
-    const auto settled = scheduler_async_join_settle_group(joins[index]);
-    if (settled.result == SchedulerAsyncJoinResult::FINISH_OWNER) return activate_finish(local, index);
-    return settled.result == SchedulerAsyncJoinResult::PENDING || fail(local, task_ref);
+    const auto settled = scheduler_async_pending::complete_group(joins[index]);
+    if (settled.result == scheduler_async_pending::Result::FINISH_OWNER) return activate_finish(local, index);
+    return settled.result == scheduler_async_pending::Result::PENDING || fail(local, task_ref);
 }
 
 // A directory scan visits one word. Cursors advance past a claimed record so
@@ -146,6 +162,14 @@ inline __aicore__ bool claim(
 
 }  // namespace scheduler_async_detail
 
+inline __aicore__ bool scheduler_async_work_activated(SchedulerAsyncLocalState *local) {
+    if (local == nullptr || local->layout == nullptr) return false;
+    if (local->work_activated) return true;
+    auto *activity = scheduler_state_at<SchedulerAsyncActivity>(local->base, local->layout->activity_offset);
+    local->work_activated = scheduler_gm_query(activity->activated) != 0;
+    return local->work_activated;
+}
+
 inline __aicore__ bool scheduler_initialize_async(
     __gm__ void *base, uint64_t bytes, uint64_t offset, uint64_t epoch, uint64_t tasks, SchedulerAsyncLocalState &local
 ) {
@@ -161,6 +185,7 @@ inline __aicore__ bool scheduler_initialize_async(
     if (epoch == 0 || layout->run_epoch != epoch || layout->image_bytes != bytes || layout->task_count != tasks ||
         layout->async_task_count == 0 || layout->async_task_count > tasks ||
         layout->group_count < layout->async_task_count ||
+        !span(bytes, layout->activity_offset, 1, sizeof(SchedulerAsyncActivity), 128) ||
         (layout->sdma_guard_count != 0 && !span(
                                               bytes, layout->sdma_guards_offset, layout->sdma_guard_count,
                                               sizeof(pto2::resident::AsyncSdmaSubmissionGuard), 128
@@ -227,28 +252,20 @@ inline __aicore__ bool scheduler_async_execution_writer(
     return true;
 }
 
+// The caller has observed the existing computation join's TASK_LAST result.
+// A pre-join zero observation cannot exclude another execution's registration.
 inline __aicore__ bool
-scheduler_async_task_is_deferred(SchedulerAsyncLocalState *local, int64_t task_ref, bool &deferred) {
+scheduler_async_has_registered_groups(SchedulerAsyncLocalState *local, int64_t task_ref, bool &registered) {
     using namespace scheduler_async_detail;
-    deferred = false;
+    registered = false;
     if (local == nullptr) return true;
     uint32_t index = ASYNC_INVALID_INDEX;
     if (!task_index(*local, task_ref, index)) return false;
     if (index == ASYNC_INVALID_INDEX) return true;
-    deferred = true;
-    auto *tasks = scheduler_state_at<SchedulerAsyncTaskData>(local->base, local->layout->task_data_offset);
-    const auto &task = tasks[index];
-    const uint8_t mask = *reinterpret_cast<__gm__ const uint8_t *>(&task.async_mask);
-    if (task.block_count != 1 || __builtin_popcount(mask) != 1) return true;
-    AsyncWriter writer{};
-    if (!scheduler_async_execution_writer(*local, task_ref, 0, static_cast<uint32_t>(__builtin_ctz(mask)), writer))
-        return false;
-    auto *data = pto2::resident::detail::group(writer);
-    // A sealed singleton has no other execution that could still register a
-    // condition. Preserve synchronous completion and direct successor refill
-    // when this execution registered none; multi-execution tasks retain the join.
-    deferred = data->state != AsyncPublicationState::SEALED || data->count != 0 || data->error_code != 0 ||
-               data->reserved != 0;
+    auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
+    const uint64_t word = scheduler_gm_fetch_add(joins[index].word, UINT64_C(0));
+    if (!scheduler_async_pending::valid(word) || scheduler_async_pending::closed(word)) return fail(*local, task_ref);
+    registered = scheduler_async_pending::registered(word) != 0;
     return true;
 }
 
@@ -291,12 +308,14 @@ scheduler_async_seal_execution(SchedulerAsyncLocalState *local, int64_t task_ref
     }
     // Sealed records expose only [0, count); unused reserved entries have no reader.
     publish(data, sizeof(AsyncGroupData) + static_cast<uint64_t>(data->count) * sizeof(DeferredCompletionEntry));
-    if (data->count == 0) {
-        if (scheduler_async_lease_finish_dormant(leases[writer.group_index]).result !=
-            SchedulerAsyncLeaseResult::SUCCESS)
-            return fail(*local, task_ref);
-        return settle_group(*local, task_ref);
-    }
+    if (data->count == 0) return true;
+    uint32_t task_index_value = ASYNC_INVALID_INDEX;
+    if (!task_index(*local, task_ref, task_index_value) || task_index_value == ASYNC_INVALID_INDEX)
+        return fail(*local, task_ref);
+    auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
+    if (scheduler_async_pending::register_group(joins[task_index_value]).result !=
+        scheduler_async_pending::Result::PENDING)
+        return fail(*local, task_ref);
     auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local->base, local->layout->group_progress_offset);
     progress[writer.group_index].pending_mask = scheduler_async_condition_mask(data->count);
     progress[writer.group_index].condition_cursor = 0;
@@ -304,6 +323,7 @@ scheduler_async_seal_execution(SchedulerAsyncLocalState *local, int64_t task_ref
     publish(&progress[writer.group_index], sizeof(SchedulerAsyncGroupProgress));
     auto *directory =
         scheduler_state_at<SchedulerAsyncDirectoryWord>(local->base, local->layout->check_directory_offset);
+    publish_activity(*local);
     if (scheduler_async_lease_publish(leases[writer.group_index]).result != SchedulerAsyncLeaseResult::SUCCESS ||
         scheduler_async_directory_publish(directory[writer.group_index / 64].bits, writer.group_index % 64) !=
             SchedulerAsyncDirectoryResult::SUCCESS)
@@ -311,24 +331,22 @@ scheduler_async_seal_execution(SchedulerAsyncLocalState *local, int64_t task_ref
     return true;
 }
 
-inline __aicore__ bool scheduler_async_release_block(SchedulerAsyncLocalState *local, int64_t task_ref) {
+// All execution resources and final traces have retired before computation closes.
+inline __aicore__ bool
+scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_ref, bool &deferred) {
     using namespace scheduler_async_detail;
+    deferred = false;
     if (local == nullptr) return true;
     uint32_t index = ASYNC_INVALID_INDEX;
     if (!task_index(*local, task_ref, index)) return false;
     if (index == ASYNC_INVALID_INDEX) return true;
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
     scheduler_cache_barrier();
-    const auto released = scheduler_async_join_release_block(joins[index]);
-    if (released.result == SchedulerAsyncJoinResult::FINISH_OWNER) {
-        bool deferred = false;
-        if (!scheduler_async_task_is_deferred(local, task_ref, deferred)) return false;
-        if (deferred) return activate_finish(*local, index);
-        auto *leases = scheduler_state_at<SchedulerAsyncLease>(local->base, local->layout->finish_leases_offset);
-        return scheduler_async_lease_finish_dormant(leases[index]).result == SchedulerAsyncLeaseResult::SUCCESS ||
-               fail(*local, task_ref);
-    }
-    return released.result == SchedulerAsyncJoinResult::PENDING || fail(*local, task_ref);
+    const auto closed = scheduler_async_pending::close_computation(joins[index]);
+    if (closed.result == scheduler_async_pending::Result::SYNCHRONOUS) return true;
+    deferred = true;
+    if (closed.result == scheduler_async_pending::Result::FINISH_OWNER) return activate_finish(*local, index);
+    return closed.result == scheduler_async_pending::Result::PENDING || fail(*local, task_ref);
 }
 
 struct SchedulerAsyncCompletionObserver {

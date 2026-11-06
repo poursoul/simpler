@@ -467,12 +467,6 @@ static inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
     group.slot_index = UINT8_MAX;
     group.slot_generation = 0;
     group.subtask_slot = UINT8_MAX;
-    if (!scheduler_async_release_block(local->async, admission.current_task_ref)) {
-        scheduler_admission_fail(
-            graph, local, run, admission.current_task_ref, SchedulerErrorSite::ASYNC_BLOCK_RELEASE_FAILED
-        );
-        return SchedulerGmMixResult::ERROR;
-    }
     return finished == SchedulerBlockFinishResult::TASK_LAST ? SchedulerGmMixResult::TASK_LAST :
                                                                SchedulerGmMixResult::PROGRESS;
 }

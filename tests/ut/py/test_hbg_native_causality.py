@@ -265,6 +265,31 @@ def test_v6_rejects_invalid_claim_seal_proof(mask, fault):
         audit_native_protocol(raw, identities)
 
 
+@pytest.mark.parametrize("mask", (1, 2, 4))
+@pytest.mark.parametrize("partial_retirement", (False, True))
+def test_pure_completion_join_after_retirement_requires_the_final_trace(mask, partial_retirement):
+    raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
+    for block in raw["blocks"]:
+        owner = block["owner"]
+        execution = next(row for row in raw["executions"] if row["index"] == block["index"])
+        fields = [
+            (owner, "completion_before"),
+            (owner, "completion_after"),
+            (execution, "completion_consumed"),
+            (execution, "trace_published"),
+        ]
+        stamps = [row[name] for row, name in fields]
+        order = (2, 0, 1, 3) if partial_retirement else (2, 3, 0, 1)
+        for stamp, index in zip(stamps, order):
+            row, name = fields[index]
+            row[name] = stamp
+    if partial_retirement:
+        with pytest.raises(ValueError, match="completion join before trace retirement"):
+            audit_native_protocol(raw, identities)
+    else:
+        assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2, 3, 16))
 @pytest.mark.parametrize("tail", (False, True))

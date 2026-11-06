@@ -71,7 +71,8 @@ inline __aicore__ bool scheduler_async_finish_step(
     };
     if (!scheduler_task_ref_valid(graph, task_ref)) return failed();
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(base, async.layout->joins_offset);
-    if (scheduler_gm_fetch_add(joins[index].word, UINT64_C(0)) != 0) return failed();
+    if (!scheduler_async_pending::ready_to_finish(scheduler_gm_fetch_add(joins[index].word, UINT64_C(0))))
+        return failed();
     auto *progress = scheduler_state_at<SchedulerAsyncFinishProgress>(base, async.layout->finish_progress_offset);
     observe(&progress[index], sizeof(SchedulerAsyncFinishProgress));
     SchedulerResolveCursor cursor{};
@@ -120,9 +121,10 @@ inline __aicore__ bool scheduler_service_async_slice(
     if (local->async == nullptr) return true;
     if (scheduler_read_error(run) != 0) return false;
     auto &async = *local->async;
+    async.business_returns = 0;
+    if (async.error_code == 0 && !scheduler_async_work_activated(&async)) return true;
     const bool finish = async.finish_first;
     async.finish_first = !finish;
-    async.business_returns = 0;
     const bool ok =
         finish ?
             scheduler_async_finish_step(

@@ -38,21 +38,25 @@ flowchart LR
     H[Host 绑定与预分配] --> K[执行 kernel 并登记条件]
     K --> S[封口 group]
     S --> R[释放 slot 与 block 执行义务]
-    S --> C[任意参与核执行 CHECK]
+    S -->|非零登记| C[任意参与核执行 CHECK]
     C -->|PENDING| C
     C -->|全部满足| G[结算 group]
-    R --> J[静态 B/G 原子汇合]
+    R --> J[实际 pending 与计算释放汇合]
     G --> J
-    J --> F[FINISH 发布 DONE 并分段释放后继]
-    F --> P[消费者沿已验证读取路径获取数据]
-    P --> D[通过最终 admission 后执行]
+    J -->|曾登记且条件满足| F[FINISH 发布 DONE 并分段释放后继]
+    J -->|全部零登记| T[原同步完成与后继发布]
+    F --> A[后继满足依赖并取得执行许可]
+    T --> A
+    A --> P[实际消费核沿已验证路径获取数据]
+    P --> D[执行 kernel]
     F --> Q[resolve 完成计数]
+    T --> Q
     Q --> X[run 与外部资源退休]
 ```
 
 每个可能调用登记接口的物理执行拥有一个 `AsyncGroup`，每个含此类执行的逻辑 task 拥有一个 `AsyncTaskFinish`。CHECK 和 FINISH 是控制工作，不创建业务 TaskId，不占 dispatch slot，也不取得 cooperative admission。
 
-基础实现采用静态 group 责任计数、常驻完成记录、平坦活动位图、有界 strong-CAS 目录更新和统一 FINISH 路径。完成记录在 run 内不移动、不回收。基础实现为可执行任务提供登记空间，零登记执行不进入 CHECK。空间、bind 和同步运行成本单独验证，优化不能引入强制的额外用户声明。
+基础实现只计入实际非零 group，复用计算释放汇合，采用常驻完成记录、平坦活动位图、有界 strong-CAS 目录更新和有界 FINISH 路径。完成记录在 run 内不移动、不回收。基础实现为可执行任务提供登记空间，所有成员均零登记的任务沿用同步完成路径，不创建 CHECK/FINISH 工作。空间、bind 和同步运行成本单独验证，优化不能引入强制的额外用户声明。
 
 ## 3. 完成语义与不变量
 
@@ -60,7 +64,7 @@ flowchart LR
 | ---- | -------------- | -------------------- |
 | KernelReturned | 调用结束，当前执行的登记封口 | 不能假定异步 payload 已可用 |
 | ExecutionReleased | slot 及该执行的局部义务结束；MIX 按参与 lane 收尾 | 不能直接发布逻辑 TaskDone |
-| TaskDone | 全部 block 已释放、全部 group 已结算、发布侧可见性合同成立 | 不能假定后继已全部路由或 run 可回收 |
+| TaskDone | 全部 block 已释放、全部已登记 group 已结算、发布侧可见性合同成立 | 不能假定后继已全部路由或 run 可回收 |
 | ResolveDrained | 后继路由、ready 发布及本 task 完成记账全部收敛 | 不能假定外部 DMA/peer 已停止访问 |
 | RunRetired | 既有 run/核退休和关联外部访问证明成立 | 不能忽略其他 run/peer 的资源使用 |
 
@@ -68,8 +72,8 @@ flowchart LR
 
 1. 一个物理执行只有一个登记写者，一个可服务记录同时只有一个 lease owner。
 2. group 身份由 run、内部 task ref、block 和 subtask 确定，不依赖可复用 slot 或 DFX 数据。
-3. 每个计划 group 都恰好结算一次，包含零登记与合法 skip；每个逻辑 block 都恰好释放一次。
-4. 只有使汇合计数归零的原子递减者获得 FINISH 激活责任，读到零值的观察者不能再次激活。
+3. 每个非零 group 恰好登记、结算一次；零登记与合法 skip 仍须封口并释放执行资源，每个逻辑 block 恰好贡献一次计算释放。
+4. 只有关闭计算或递减最后 pending 的原子操作返回值能授予 FINISH 激活责任；必须同时满足计算已释放且 pending 为零，普通观察者不能激活。
 5. TaskDone 恰好发布一次；run 完成计数晚于该 task 的全部后继发布和最后记录写入。
 6. 每次服务有步骤预算，任何私有发布责任都不能跨越下一次业务 kernel。
 7. cached 写回不得覆盖 atomic-only 控制行；跨核交权必须有实际 GM 发布/观察顺序。
@@ -80,7 +84,7 @@ flowchart LR
 | 文档 | 唯一定义的内容 |
 | ---- | -------------- |
 | [接口与数据布局](a5-hbg-async-completion/interfaces-and-layout.md) | 既有登记接口、内部上下文、记录身份、GM 布局和容量 |
-| [调度与完成协议](a5-hbg-async-completion/protocol.md) | lease、目录、静态汇合、CHECK/FINISH、任务形状与服务预算 |
+| [调度与完成协议](a5-hbg-async-completion/protocol.md) | lease、目录、完成汇合、CHECK/FINISH、任务形状与服务预算 |
 | [后端与资源生命周期](a5-hbg-async-completion/backends-and-lifetime.md) | SDMA/COUNTER、提交结果、数据可见性、复用和错误关闭 |
 | [消费者数据可见性](a5-hbg-async-completion/consumer-preparation.md) | 既有读取路径、必要获取的范围与执行位置、跨核验证 |
 | [实现方案](a5-hbg-async-completion/implementation.md) | 模块接线、依赖顺序、兼容迁移、错误与 DFX 集成 |

@@ -12,12 +12,13 @@
 #pragma once
 
 #include "scheduler_memory.h"
+#include "scheduler_async_pending.h"
 
 enum class SchedulerAsyncPhase : uint8_t { DORMANT = 0, RUNNABLE = 1, OWNED = 2, TERMINAL = 3, FAILED = 4 };
 
 inline constexpr uint32_t SCHEDULER_ASYNC_LEASE_PHASE_BITS = 3;
 inline constexpr uint64_t SCHEDULER_ASYNC_LEASE_GENERATION_MAX = UINT64_MAX >> SCHEDULER_ASYNC_LEASE_PHASE_BITS;
-inline constexpr uint32_t SCHEDULER_ASYNC_JOIN_COUNT_MAX = INT16_MAX;
+inline constexpr uint32_t SCHEDULER_ASYNC_JOIN_COUNT_MAX = scheduler_async_pending::COUNT_MAX;
 
 constexpr inline __aicore__ uint64_t scheduler_async_lease_encode(uint64_t generation, SchedulerAsyncPhase phase) {
     if (generation == 0 || generation > SCHEDULER_ASYNC_LEASE_GENERATION_MAX ||
@@ -45,9 +46,7 @@ struct alignas(128) SchedulerAsyncLease {
     volatile uint64_t word{scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT)};
 };
 
-struct alignas(128) SchedulerAsyncTaskJoin {
-    volatile uint64_t word{0};
-};
+using SchedulerAsyncTaskJoin = scheduler_async_pending::Join;
 
 static_assert(sizeof(SchedulerAsyncLease) == 128 && alignof(SchedulerAsyncLease) == 128);
 static_assert(sizeof(SchedulerAsyncTaskJoin) == 128 && alignof(SchedulerAsyncTaskJoin) == 128);
@@ -72,36 +71,6 @@ struct SchedulerAsyncLeaseOutcome {
     // SUCCESS returns the new word; failure retains the input snapshot or CAS result.
     uint64_t word;
 };
-
-enum class SchedulerAsyncJoinResult : uint8_t { PENDING, FINISH_OWNER, INVALID_WORD, UNDERFLOW };
-
-struct SchedulerAsyncJoinOutcome {
-    SchedulerAsyncJoinResult result;
-    uint64_t previous;
-};
-
-constexpr inline __aicore__ uint32_t scheduler_async_join_groups(uint64_t word) {
-    return static_cast<uint32_t>(word & UINT64_C(0xffff));
-}
-
-constexpr inline __aicore__ uint32_t scheduler_async_join_blocks(uint64_t word) {
-    return static_cast<uint32_t>((word >> 16) & UINT64_C(0xffff));
-}
-
-constexpr inline __aicore__ bool scheduler_async_join_word_valid(uint64_t word) {
-    return (word >> 32) == 0 && scheduler_async_join_groups(word) <= SCHEDULER_ASYNC_JOIN_COUNT_MAX &&
-           scheduler_async_join_blocks(word) <= SCHEDULER_ASYNC_JOIN_COUNT_MAX;
-}
-
-// Only async tasks own joins: both initial counts are nonzero. Initialization
-// precedes device publication and is not a reset operation on a live run.
-inline __aicore__ bool scheduler_async_join_initial_word(uint32_t blocks, uint32_t groups, uint64_t &word) {
-    if (blocks == 0 || groups == 0 || blocks > SCHEDULER_ASYNC_JOIN_COUNT_MAX ||
-        groups > SCHEDULER_ASYNC_JOIN_COUNT_MAX)
-        return false;
-    word = (static_cast<uint64_t>(blocks) << 16) | groups;
-    return true;
-}
 
 namespace scheduler_async_state_detail {
 
@@ -159,18 +128,6 @@ owner_transition(Atomics &atomics, uint64_t owned, SchedulerAsyncPhase desired_p
     return transition(atomics, owned, scheduler_async_lease_encode(generation, desired_phase));
 }
 
-template <bool Group, typename Atomics>
-inline __aicore__ SchedulerAsyncJoinOutcome contribute(Atomics &atomics) {
-    constexpr uint64_t contribution = Group ? UINT64_C(1) : (UINT64_C(1) << 16);
-    const uint64_t previous = atomics.fetch_add(UINT64_C(0) - contribution);
-    if (!scheduler_async_join_word_valid(previous)) return {SchedulerAsyncJoinResult::INVALID_WORD, previous};
-    const uint32_t count = Group ? scheduler_async_join_groups(previous) : scheduler_async_join_blocks(previous);
-    if (count == 0) return {SchedulerAsyncJoinResult::UNDERFLOW, previous};
-    return {
-        previous == contribution ? SchedulerAsyncJoinResult::FINISH_OWNER : SchedulerAsyncJoinResult::PENDING, previous
-    };
-}
-
 }  // namespace scheduler_async_state_detail
 
 // All live accesses are atomic. No lease is reset while any run participant may
@@ -206,16 +163,6 @@ scheduler_async_lease_finish(__gm__ SchedulerAsyncLease &lease, uint64_t owned) 
     return scheduler_async_state_detail::owner_transition(atomics, owned, SchedulerAsyncPhase::TERMINAL);
 }
 
-// A sealed zero-registration or skipped execution has a group obligation even
-// though it never publishes a CHECK directory bit.
-inline __aicore__ SchedulerAsyncLeaseOutcome scheduler_async_lease_finish_dormant(__gm__ SchedulerAsyncLease &lease) {
-    scheduler_async_state_detail::GmAtomics atomics{lease.word};
-    return scheduler_async_state_detail::transition(
-        atomics, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT),
-        scheduler_async_lease_encode(1, SchedulerAsyncPhase::TERMINAL)
-    );
-}
-
 inline __aicore__ SchedulerAsyncLeaseOutcome
 scheduler_async_lease_fail(__gm__ SchedulerAsyncLease &lease, uint64_t expected) {
     if (!scheduler_async_lease_word_valid(expected)) return {SchedulerAsyncLeaseResult::INVALID_WORD, expected};
@@ -227,17 +174,4 @@ scheduler_async_lease_fail(__gm__ SchedulerAsyncLease &lease, uint64_t expected)
         atomics, expected,
         scheduler_async_lease_encode(scheduler_async_lease_generation(expected), SchedulerAsyncPhase::FAILED)
     );
-}
-
-// A unique execution/lease grant authorizes each contribution, including zero
-// registration and skip. Error outcomes may follow an invalid RMW and require
-// run failure; neither compensation nor reading a zero grants FINISH ownership.
-inline __aicore__ SchedulerAsyncJoinOutcome scheduler_async_join_settle_group(__gm__ SchedulerAsyncTaskJoin &join) {
-    scheduler_async_state_detail::GmAtomics atomics{join.word};
-    return scheduler_async_state_detail::contribute<true>(atomics);
-}
-
-inline __aicore__ SchedulerAsyncJoinOutcome scheduler_async_join_release_block(__gm__ SchedulerAsyncTaskJoin &join) {
-    scheduler_async_state_detail::GmAtomics atomics{join.word};
-    return scheduler_async_state_detail::contribute<false>(atomics);
 }

@@ -8,7 +8,7 @@
 | ---- | ---- |
 | A5 HBG Host planner/runtime maker | 根据现有图预分配完成记录，初始化稳定 task/block/lane 映射 |
 | kernel context 与登记 helper | 保留地址式登记接口，写入本执行的稳定记录，检查容量与首错 |
-| 执行返回与 completion/MIX 收尾 | 封口登记，释放实际执行资源，贡献 block/group 完成义务 |
+| 执行返回与 completion/MIX 收尾 | 封口登记，释放实际执行资源，汇合计算释放和实际 pending 条件 |
 | CHECK | 任意参与核领取条件记录，每次有界检查，保存进度并交回执行机会 |
 | FINISH 与 resolver | 唯一发布 TaskDone，分段路由后继，排空发布后贡献 resolved_task_count |
 | 已有 run/domain owner | 保持 heap、staging、导入 backing、通信 context/window/workspace 至实际退休 |
@@ -28,11 +28,11 @@
 
 ## 3. 服务与完成顺序
 
-普通业务与控制工作共享服务额度：最多 4 次业务返回后服务一次 CHECK/FINISH；空闲和准入受阻时仍提供控制服务。CHECK/FINISH 轮转，每次最多领取一个记录，基础工作预算为 8。PENDING 或失败 CAS 不计为真实进展，不延长 watchdog。
+整个 run 尚未发布异步工作时跳过空目录扫描和额外消费者获取；活动标记不抑制错误传播。活动开始后，普通业务与控制工作共享服务额度：最多 4 次业务返回后服务一次 CHECK/FINISH；空闲和准入受阻时仍提供控制服务。CHECK/FINISH 轮转，每次最多领取一个记录，基础工作预算为 8。PENDING 或失败 CAS 不计为真实进展，不延长 watchdog。
 
-物理执行返回与逻辑任务完成独立。SPMD 的全部 block、MIX 的全部 active lane 必须按真实释放顺序记账；零登记及合法 skip 也必须恰好结算。最后一次合法原子汇合才有 FINISH 激活权。
+物理执行返回与逻辑任务完成独立。SPMD 的全部 block、MIX 的全部 active lane 必须按真实释放顺序记账；零登记及合法 skip 也必须封口并释放执行资源。只有非零 group 增加 pending；计算释放全部完成后关闭登记，最后一次合法原子汇合才有 FINISH 激活权。
 
-单 block、单 active lane 的 task 在登记封口且 count 为零时，沿用既有同步完成和本核直接派发后继的路径，不发布独立 FINISH 工作。同一次 completion 处理结算 B/G，并将未激活的 FINISH lease 直接置为终态，再允许 run 完成计数排空。多执行 task 仍保留完整汇合，不能根据某个先返回成员的零登记推断其他成员不会登记条件。
+全部成员均零登记的普通、SPMD、MIX task 沿用既有同步完成和本核后继路径，不发布独立 FINISH 工作。计算释放复用原有汇合，SPMD 必须在 trace 发布和 slot 释放后贡献 completed_blocks，MIX 必须先收齐 release。非 ordered 快路径只能在真实最后计算返回后判断是否曾登记；不能根据先返回成员的零登记或暂时 pending=0 推断整个任务同步。
 
 FINISH 保存完整 resolver 游标及最多 8 项发布批次，跨核恢复不重放已发生的队列发布。终态记录和目录清理完成后，才贡献 run 完成计数；正常退出不能越过尚未收尾的异步记录。
 

@@ -113,7 +113,7 @@ struct AsyncFixture {
     bool check(uint32_t worker = 0, uint32_t budget = 8) {
         bool progress = false;
         EXPECT_TRUE(scheduler_async_check_step(
-            workers[worker], worker == 0 ? 1 : 2, budget, SchedulerAsyncCounterObserver{}, progress
+            workers[worker], worker == 0 ? 1 : 2, budget, SchedulerAsyncCompletionObserver{}, progress
         ));
         return progress;
     }
@@ -317,11 +317,35 @@ TEST(HbgAsyncControl, InvalidCounterAndMalformedRecordFailWithoutNormalCompletio
                 ->backend_cookie = 1;
         ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
         bool progress = false;
-        EXPECT_FALSE(scheduler_async_check_step(f.workers[1], 2, 8, SchedulerAsyncCounterObserver{}, progress));
+        EXPECT_FALSE(scheduler_async_check_step(f.workers[1], 2, 8, SchedulerAsyncCompletionObserver{}, progress));
         EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::FAILED);
         EXPECT_EQ(scheduler_async_join_groups(f.join().word), 1u);
         EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::DORMANT);
     }
+}
+
+TEST(HbgAsyncControl, CounterAndFullWidthSdmaRecordsMustBothCompleteAndAreNeverCleared) {
+    AsyncFixture f(1, {async_task(0, 1, LaneMask::aic(), 2)});
+    alignas(128) uint64_t completed_post = UINT64_C(0xffffffff);
+    const auto writer = f.start();
+    f.register_counter(writer);
+    const CompletionToken dma{
+        reinterpret_cast<uint64_t>(&completed_post), 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD,
+        UINT64_C(0x100000003)
+    };
+    ASSERT_TRUE(register_completion_condition(writer, dma));
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
+    ASSERT_TRUE(scheduler_async_release_block(&f.workers[0], 0));
+    EXPECT_FALSE(f.check(1));
+    f.signal[0] = 1;
+    EXPECT_TRUE(f.check(2));
+    EXPECT_EQ(scheduler_async_join_groups(f.join().word), 1u);
+    EXPECT_EQ(completed_post, UINT64_C(0xffffffff));
+    completed_post = UINT64_C(0x100000003);
+    EXPECT_TRUE(f.check(0));
+    EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
+    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
+    EXPECT_EQ(completed_post, UINT64_C(0x100000003));
 }
 
 TEST(HbgAsyncControl, OneSliceClaimsOnlyOneRecordAndAlternatesCheckAndFinish) {

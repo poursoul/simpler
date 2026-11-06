@@ -41,6 +41,14 @@ struct alignas(ASYNC_RECORD_ALIGNMENT) AsyncGroupData {
     volatile uint32_t reservation_begin;
     volatile uint32_t reservation_written;
     volatile AsyncPublicationState state;
+    uint64_t sdma_guards_offset;
+    uint32_t sdma_guard_count;
+};
+
+// SDK session creation and SQ/post-id updates share one writer per physical
+// cluster. Both AIV lanes use the same default channel group.
+struct alignas(ASYNC_RECORD_ALIGNMENT) AsyncSdmaSubmissionGuard {
+    volatile uint64_t word;
 };
 
 struct AsyncReservation {
@@ -60,6 +68,10 @@ static_assert(sizeof(AsyncGroupData) == 128 && alignof(AsyncGroupData) == ASYNC_
 static_assert(offsetof(AsyncGroupData, count) == 36 && offsetof(AsyncGroupData, state) == 60);
 static_assert(std::is_standard_layout_v<AsyncGroupData> && std::is_trivially_copyable_v<AsyncGroupData>);
 static_assert(sizeof(AsyncReservation) == 24);
+static_assert(sizeof(AsyncSdmaSubmissionGuard) == 128);
+static_assert(
+    std::is_standard_layout_v<AsyncSdmaSubmissionGuard> && std::is_trivially_copyable_v<AsyncSdmaSubmissionGuard>
+);
 static_assert(async_group_publication_bytes(1) == 256 && async_group_publication_bytes(64) == 2176);
 
 }  // namespace pto2::resident

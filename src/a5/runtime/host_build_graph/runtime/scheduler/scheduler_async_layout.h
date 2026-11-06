@@ -31,6 +31,8 @@ struct alignas(128) SchedulerAsyncLayout {
     uint32_t task_count;
     uint32_t async_task_count;
     uint32_t group_count;
+    uint32_t sdma_guard_count;
+    uint64_t sdma_guards_offset;
 };
 
 struct SchedulerAsyncTaskData {

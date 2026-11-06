@@ -1592,7 +1592,7 @@ bool create_scheduler_state(
     std::string async_error;
     if (!plan_async_completion(
             layout.total_size, api->run_epoch(), static_cast<uint32_t>(node_count), async_inputs, &async_plan,
-            &async_error
+            &async_error, static_cast<uint32_t>(spmd.cluster_count)
         )) {
         LOG_ERROR("A5 HBG: async completion layout failed: %s", async_error.c_str());
         return false;

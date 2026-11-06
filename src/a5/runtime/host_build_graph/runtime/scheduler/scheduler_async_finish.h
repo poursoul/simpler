@@ -129,7 +129,7 @@ inline __aicore__ bool scheduler_service_async_slice(
                 graph, base, local, run, async, 8, made_progress, profiling_level, wake, ready, completion
             ) :
             scheduler_async_check_step(
-                async, UINT32_C(1) << local->config.self_core_type, 8, SchedulerAsyncCounterObserver{}, made_progress
+                async, UINT32_C(1) << local->config.self_core_type, 8, SchedulerAsyncCompletionObserver{}, made_progress
             );
     if (!ok)
         scheduler_record_error(

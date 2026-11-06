@@ -16,6 +16,8 @@
 
 `AsyncWriter` 是 kernel 栈上的访问视图，只包含稳定 image 基址、长度、epoch、group offset/index。它不持有完成条件本体；复制视图仍操作同一个 group，容量、预留和首错不会因复制而分叉。
 
+header 中还保存 run 内 SDMA 提交互斥数组的 offset 和数量，占用既有对齐余量，header 总长仍为 128 B。该数组按实际 cluster 数分配，每项 128 B；同 cluster 的 AIV 使用同一项，在 session 构造和提交期间互斥。它不描述外部资源身份，不持有 payload，也不参与完成等待。
+
 登记区只有当前物理执行写入。正常返回或 predicate skip 后 runtime 封口并发布；后续观察不能依赖已经释放的 dispatch payload、原核栈或 UB。首错不可覆盖，未关闭预留、越界或忽略登记失败都使封口失败。
 
 后端提交若需要预留，在副作用前用内部 `reserve_conditions` 占用足够容量；提交后按实际公共完成记录数 commit，再关闭预留。登记普通 COUNTER 时一次调用内部完成这三个步骤，不要求业务代码提供额外绑定对象。
@@ -33,6 +35,8 @@ Host 已拥有展开后的普通任务和 Graph child 元数据，按 task/block
 基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行直接结算其 group，不进入 CHECK。该保守分配的成本必须纳入 bind、H2D、空间和同步运行性能验证；后续压缩不得靠新增强制用户声明或漏掉可能登记的执行实现。
 
 `SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、group offset、lease、CHECK 进度、task join、FINISH 游标和活动位图位置。FINISH 的完整 resolver 游标为 184 B，放在独立 256 B 进度记录内。lease、发布数据和 cached 进度分别隔离到 128 B cache line。
+
+SDMA 提交互斥字在 Host 初始化为零，只在运行中使用原子操作；SDK 的 session/postId/SQ 状态仍使用原 workspace。32 个实际 cluster 对应 4096 B 互斥存储，不能按逻辑 block 数重复分配，也不扩大公共通信 context。
 
 所有偏移、乘法、对齐与总分配长度采用 checked arithmetic。控制-only 图不分配 group；分配失败在启动前返回错误，不提交部分图。记录在整个 run 内保持稳定。
 

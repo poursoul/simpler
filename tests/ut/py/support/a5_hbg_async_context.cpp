@@ -19,7 +19,42 @@
 
 #include "async_completion_plan.h"
 #include "async_kernel_api.h"
+#include "backend/sdma/sdma_completion_registration.h"
 #include "dispatch_payload.h"
+
+namespace {
+struct Session {};
+struct Event {
+    bool postFailed{false};
+    uint64_t handle{1};
+    pto::comm::DmaEngine engine{pto::comm::DmaEngine::SDMA};
+    uint32_t count{2};
+    pto::comm::AsyncCompletionRecord records[2]{};
+
+    Event() {
+        for (uint32_t i = 0; i < 2; ++i) {
+            records[i].addr = reinterpret_cast<__gm__ uint8_t *>(UINT64_C(0x10000) + i * 128);
+            records[i].expected = UINT64_C(0x100000003) + i;
+            records[i].kind = pto::comm::CompletionKind::SDMA_POST_DONE;
+        }
+    }
+    uint32_t CompletionRecordCount(const Session &) const { return count; }
+    pto::comm::AsyncCompletionRecord CompletionRecordAt(const Session &, uint32_t index) const {
+        assert(index < 2);
+        return records[index];
+    }
+};
+
+struct FlatTensor {
+    using RawDType = uint32_t;
+    int64_t shapes[5]{1, 1, 1, 1, 16};
+    int64_t strides[5]{16, 16, 16, 16, 1};
+    uint32_t *pointer{reinterpret_cast<uint32_t *>(UINT64_C(0x20000))};
+    int64_t GetShape(int dim) const { return shapes[static_cast<uint32_t>(dim)]; }
+    int64_t GetStride(int dim) const { return strides[static_cast<uint32_t>(dim)]; }
+    uint32_t *data() const { return pointer; }
+};
+}  // namespace
 
 int main(int argc, char **argv) {
     assert(argc == 2);
@@ -99,6 +134,48 @@ int main(int argc, char **argv) {
         assert(!register_completion_condition(ctx, invalid));
         assert(data->count == 0);
         assert(!pto2::resident::seal_conditions(ctx.resident));
+    } else if (scenario >= 7 && scenario <= 17) {
+        auto ctx = get_async_ctx(args);
+        const auto reservation = pto2::resident::reserve_conditions(ctx.resident, 2);
+        Event event;
+        if (scenario == 8) event.count = 1;
+        if (scenario == 9) event.handle = 0;
+        if (scenario == 10) event.postFailed = true;
+        if (scenario == 11) event.count = UINT32_MAX;
+        if (scenario == 12) event.count = 3;
+        if (scenario == 13) event.records[1].kind = static_cast<pto::comm::CompletionKind>(255);
+        if (scenario == 14) event.records[1].expected = 0;
+        if (scenario == 15) event.records[0].addr += 1;
+        if (scenario == 16) event.engine = pto::comm::DmaEngine::URMA;
+        if (scenario == 17) event.count = 0;
+        const bool registered = pto2::detail::register_pto_async_event(ctx, event, Session{}, reservation, 2);
+        if (scenario < 9) {
+            assert(registered);
+            assert(data->count == event.count && data->reservation_limit == 0);
+            auto *entries = reinterpret_cast<DeferredCompletionEntry *>(image + plan.groups[0].offset + sizeof(*data));
+            assert(entries[0].backend_cookie == UINT64_C(0x100000003));
+            assert(pto2::resident::seal_conditions(ctx.resident));
+        } else {
+            assert(!registered && data->error_code != 0);
+            assert(!pto2::resident::seal_conditions(ctx.resident));
+        }
+    } else if (scenario >= 18 && scenario <= 23) {
+        FlatTensor tensor;
+        uint64_t bytes = 0;
+        if (scenario == 19) tensor.shapes[0] = 2;
+        if (scenario == 20) tensor.shapes[4] = -1;
+        if (scenario == 21) tensor.strides[4] = 2;
+        if (scenario == 22) tensor.shapes[4] = UINT64_C(0x100000000);
+        if (scenario == 23) tensor.pointer = reinterpret_cast<uint32_t *>(UINT64_MAX - 31);
+        assert(pto2::detail::flat_transfer_bytes(tensor, bytes) == (scenario == 18));
+        if (scenario == 18) {
+            assert(bytes == 64);
+            tensor.pointer = nullptr;
+            tensor.shapes[4] = 0;
+            for (uint32_t i = 0; i < 4; ++i)
+                tensor.strides[i] = 0;
+            assert(pto2::detail::flat_transfer_bytes(tensor, bytes) && bytes == 0);
+        }
     } else return 2;
     return 0;
 }

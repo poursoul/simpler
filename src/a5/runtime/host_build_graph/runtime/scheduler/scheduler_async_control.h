@@ -147,6 +147,10 @@ inline __aicore__ bool scheduler_initialize_async(
     if (epoch == 0 || layout->run_epoch != epoch || layout->image_bytes != bytes || layout->task_count != tasks ||
         layout->async_task_count == 0 || layout->async_task_count > tasks ||
         layout->group_count < layout->async_task_count ||
+        (layout->sdma_guard_count != 0 && !span(
+                                              bytes, layout->sdma_guards_offset, layout->sdma_guard_count,
+                                              sizeof(pto2::resident::AsyncSdmaSubmissionGuard), 128
+                                          )) ||
         !span(bytes, layout->task_map_offset, tasks, sizeof(uint32_t), alignof(uint32_t)) ||
         !span(
             bytes, layout->task_data_offset, layout->async_task_count, sizeof(SchedulerAsyncTaskData),
@@ -290,11 +294,19 @@ inline __aicore__ bool scheduler_async_release_block(SchedulerAsyncLocalState *l
     return released.result == SchedulerAsyncJoinResult::PENDING || fail(*local, task_ref);
 }
 
-struct SchedulerAsyncCounterObserver {
+struct SchedulerAsyncCompletionObserver {
     inline __aicore__ CompletionPollResult operator()(const CompletionToken &token, uint32_t observer_mask) const {
-        if (observer_mask == 0 || (observer_mask & ~3U) != 0 || !pto2::resident::detail::token_valid(token) ||
-            token.completion_type != COMPLETION_TYPE_COUNTER)
+        if (observer_mask == 0 || (observer_mask & ~3U) != 0 || !pto2::resident::detail::token_valid(token))
             return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+        if (token.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) {
+            auto *record = reinterpret_cast<__gm__ uint64_t *>(token.addr);
+#if defined(__CCE_AICORE__)
+            const uint64_t completed = __builtin_cce_ld_dev(record, 0);
+#else
+            const uint64_t completed = __atomic_load_n(record, __ATOMIC_ACQUIRE);
+#endif
+            return {completed >= token.backend_cookie ? CompletionPollState::READY : CompletionPollState::PENDING, 0};
+        }
         auto *counter = reinterpret_cast<__gm__ uint32_t *>(token.addr);
 #if defined(__CCE_AICORE__)
         const uint32_t value = static_cast<uint32_t>(__builtin_cce_ld_dev(counter, 0));

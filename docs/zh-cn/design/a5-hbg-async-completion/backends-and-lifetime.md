@@ -14,7 +14,13 @@ SDMA 使用当前 SDK 公共完成记录 API 返回的 post-done 地址和完整
 
 SDMA adapter 保持现有调用接口。提交前检查形状、字节数和明确的零工作，并为可能产生的完成记录预留足够容量；提交后使用公共记录数量/索引 API 登记实际条件，归还未用预留。非零请求得到零 handle、未知完成类型、登记溢出或 helper 失败必须锁存错误，不把它们当成零登记成功。
 
-同 run 内多个 task、物理 worker、AIV lane 使用同一 channel/session 的独占和并发规则必须以实际 SDK 路径验证。defer_wait 不会使提交队列满、SyncAll 或 kernel 内轮询自动让出；kernel 必须正常返回，调度器才重新取得执行资源。
+SDK 默认以物理 `get_block_idx()` 选择 channel group，同一 cluster 的两个 AIV 共享该值。resident 为每个实际 cluster 保存一个独立 cache line 的提交互斥字；所有 task 和 Graph 实例共享这组 run 内状态。取得互斥权后才构造 session，完成提交、SDK postId/SQ 状态持久化及条件登记后交权。不同 cluster 可以并行，同 cluster 的不同 workspace 保守串行提交。
+
+SDK 保存 SQ tail 时既写入 GM，也更新提交核的 scalar cache。交权前必须完成临时 pipeline，并写回这些元数据缓存行；否则旧 owner 的后续 session 缓存维护可能覆盖新 owner 已推进的 SQ 状态。基础 adapter 使用 SDK 同类的全 DCache 写回及设备屏障，随后原子释放互斥字；这不代表 DMA payload 已完成。
+
+互斥仅覆盖提交，不等待本次 DMA 完成。成功提交释放互斥字，异常退出将其置为失败，后续提交不得继续使用可能不一致的 session 状态。争用等待使用设备时钟限制为 5 秒，超时使当前登记失败，不抢占或清除其他核的所有权；核硬故障仍由既有 run 退出流程处理。跨 run 的同一 domain 使用继续依赖既有 worker 执行顺序和 fence，run 内互斥不能替代它们。
+
+defer_wait 不会使提交队列满、上述提交争用、SyncAll 或 kernel 内轮询自动让出；kernel 必须正常返回，调度器才重新取得执行资源。CHECK 本身始终有界且不等待提交互斥字。验收必须包含同一 cluster 双 AIV 连续提交，验证公共完成记录的 postId 不重复及全部数据结果，不能只测试单个提交者。
 
 ## 3. 复用已有 owner
 

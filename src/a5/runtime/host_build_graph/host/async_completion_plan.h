@@ -44,7 +44,7 @@ struct AsyncCompletionHostPlan {
 // Failure leaves out untouched; a synchronous run appends no bytes.
 bool plan_async_completion(
     uint64_t begin_offset, uint64_t run_epoch, uint32_t task_count, const std::vector<AsyncTaskPlanInput> &tasks,
-    AsyncCompletionHostPlan *out, std::string *error
+    AsyncCompletionHostPlan *out, std::string *error, uint32_t sdma_guard_count = 0
 );
 
 // Initializes only the appended range; existing scheduler/native Graph data

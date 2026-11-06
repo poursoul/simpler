@@ -38,7 +38,7 @@ bool reserve_array(uint64_t *cursor, uint64_t count, uint64_t *offset) {
 
 bool plan_async_completion(
     uint64_t begin_offset, uint64_t run_epoch, uint32_t task_count, const std::vector<AsyncTaskPlanInput> &inputs,
-    AsyncCompletionHostPlan *out, std::string *error
+    AsyncCompletionHostPlan *out, std::string *error, uint32_t sdma_guard_count
 ) {
     if (out == nullptr || run_epoch == 0 || begin_offset < sizeof(SchedulerRunControl) ||
         begin_offset % ASYNC_RECORD_ALIGNMENT != 0 || task_count > INT32_MAX)
@@ -79,6 +79,7 @@ bool plan_async_completion(
         return true;
     }
     layout.async_task_count = static_cast<uint32_t>(next.tasks.size());
+    layout.sdma_guard_count = sdma_guard_count;
     uint64_t cursor = begin_offset;
     if (!reserve_array<SchedulerAsyncLayout>(&cursor, 1, &next.layout_offset) ||
         !reserve_array<uint32_t>(&cursor, task_count, &layout.task_map_offset) ||
@@ -98,6 +99,9 @@ bool plan_async_completion(
             &cursor, (static_cast<uint64_t>(layout.async_task_count) + 63) / 64, &layout.finish_directory_offset
         ))
         return reject(error, "async control storage overflows");
+    if (sdma_guard_count != 0 &&
+        !reserve_array<AsyncSdmaSubmissionGuard>(&cursor, sdma_guard_count, &layout.sdma_guards_offset))
+        return reject(error, "SDMA submission guards overflow");
     uint32_t task_index = 0;
     for (const auto &input : inputs) {
         if (task_index == next.tasks.size() || input.task_ref != next.tasks[task_index].task_ref) continue;
@@ -114,6 +118,8 @@ bool plan_async_completion(
                 data.subtask_slot = lane;
                 data.capacity = input.capacities[lane];
                 data.publication_bytes = async_group_publication_bytes(data.capacity);
+                data.sdma_guards_offset = layout.sdma_guards_offset;
+                data.sdma_guard_count = layout.sdma_guard_count;
                 if (!scheduler_layout_reserve(&cursor, data.publication_bytes, ASYNC_RECORD_ALIGNMENT, &group.offset))
                     return reject(error, "async publication storage overflows");
                 next.groups.push_back(group);
@@ -137,6 +143,11 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
         plan.layout.async_task_count != plan.tasks.size())
         return false;
     *scheduler_state_at<SchedulerAsyncLayout>(image, plan.layout_offset) = plan.layout;
+    if (plan.layout.sdma_guard_count != 0) {
+        auto *guards = scheduler_state_at<AsyncSdmaSubmissionGuard>(image, plan.layout.sdma_guards_offset);
+        for (uint32_t index = 0; index < plan.layout.sdma_guard_count; ++index)
+            guards[index].word = 0;
+    }
     auto *map = scheduler_state_at<uint32_t>(image, plan.layout.task_map_offset);
     for (uint32_t ref = 0; ref < plan.layout.task_count; ++ref)
         map[ref] = ASYNC_INVALID_INDEX;

@@ -12,13 +12,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "async_completion_plan.h"
 #include "async_condition_writer.h"
+#include "backend/sdma/sdma_submission_guard.h"
 
 namespace {
 
@@ -46,6 +49,64 @@ struct Image {
 };
 
 constexpr uint64_t kPrefix = sizeof(SchedulerRunControl);
+
+TEST(HbgAsyncPlan, SdmaGuardsAreSharedByExecutionsAndIsolatedByCluster) {
+    AsyncCompletionHostPlan plan;
+    std::string error;
+    ASSERT_TRUE(plan_async_completion(kPrefix, 1, 1, {task(0, 2, LaneMask::both_aiv())}, &plan, &error, 32));
+    Image image(plan.total_bytes);
+    ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
+    EXPECT_EQ(plan.layout.sdma_guard_count, 32u);
+    EXPECT_EQ(plan.layout.sdma_guards_offset % 128, 0u);
+    AsyncSdmaSubmissionGuard *first = nullptr;
+    for (const auto &group : plan.groups) {
+        AsyncWriter writer{
+            static_cast<uint8_t *>(image.base), plan.total_bytes, 1, group.offset, group.data.group_index
+        };
+        auto *guard = sdma_submission_guard(writer, 7);
+        ASSERT_NE(guard, nullptr);
+        if (first == nullptr) first = guard;
+        EXPECT_EQ(guard, first);
+        EXPECT_NE(sdma_submission_guard(writer, 8), guard);
+        EXPECT_EQ(guard->word, 0u);
+    }
+    const auto &group = plan.groups[0];
+    AsyncWriter writer{static_cast<uint8_t *>(image.base), plan.total_bytes, 1, group.offset, 0};
+    EXPECT_EQ(sdma_submission_guard(writer, 32), nullptr);
+    EXPECT_FALSE(seal_conditions(writer));
+}
+
+TEST(HbgAsyncPlan, SdmaGuardSerializesSessionStateAndRetainsFailure) {
+    AsyncSdmaSubmissionGuard guard{};
+    uint64_t post_id = 0;
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> submitters;
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+        submitters.emplace_back([&]() {
+            for (uint32_t iteration = 0; iteration < 2000; ++iteration) {
+                SdmaGuardResult result;
+                do {
+                    result = sdma_try_acquire(guard);
+                } while (result == SdmaGuardResult::BUSY);
+                if (result != SdmaGuardResult::ACQUIRED) {
+                    failed = true;
+                    return;
+                }
+                ++post_id;
+                if (!sdma_release(guard, true)) failed = true;
+            }
+        });
+    }
+    for (auto &thread : submitters)
+        thread.join();
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(post_id, 4000u);
+    EXPECT_EQ(sdma_try_acquire(guard), SdmaGuardResult::ACQUIRED);
+    EXPECT_EQ(sdma_try_acquire(guard), SdmaGuardResult::BUSY);
+    EXPECT_TRUE(sdma_release(guard, false));
+    EXPECT_EQ(sdma_try_acquire(guard), SdmaGuardResult::FAILED);
+    EXPECT_EQ(guard.word, 2u);
+}
 
 TEST(HbgAsyncPlan, SynchronousAndControlOnlyRunsAppendNoStorage) {
     AsyncCompletionHostPlan plan;

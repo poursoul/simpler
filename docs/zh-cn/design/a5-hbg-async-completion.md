@@ -30,7 +30,7 @@ SDMA 的发起资格与条件的观察资格分开定义。提交使用经过验
 | 编译器与注册层 | 保持既有 callable 和 kernel 登记接口，生成可正常返回的 waiter |
 | Host bind | 从现有图展开 task/block/lane 映射，预分配调度记录；复用既有 run 资源持有 |
 | backend adapter | 验证提交、预留条件槽、登记实际完成条件、提供有界观察及可见性操作 |
-| AICore resident scheduler | 释放执行资源，领取 CHECK/FINISH，汇合完成，分段释放后继并推进消费者本核准备 |
+| AICore resident scheduler | 释放执行资源，领取 CHECK/FINISH，汇合完成，分段释放后继；保持既有消费与准入顺序 |
 | AICPU 与 run/domain owner | 既有启动、错误监督、核退出、外部访问确认和最终资源回收 |
 
 ```mermaid
@@ -44,7 +44,7 @@ flowchart LR
     R --> J[静态 B/G 原子汇合]
     G --> J
     J --> F[FINISH 发布 DONE 并分段释放后继]
-    F --> P[消费者本核获取与 cohort 准备汇合]
+    F --> P[消费者沿已验证读取路径获取数据]
     P --> D[通过最终 admission 后执行]
     F --> Q[resolve 完成计数]
     Q --> X[run 与外部资源退休]
@@ -52,7 +52,7 @@ flowchart LR
 
 每个可能调用登记接口的物理执行拥有一个 `AsyncGroup`，每个含此类执行的逻辑 task 拥有一个 `AsyncTaskFinish`。CHECK 和 FINISH 是控制工作，不创建业务 TaskId，不占 dispatch slot，也不取得 cooperative admission。
 
-基础实现采用静态 group 责任计数、常驻完成记录、平坦活动位图、有界 strong-CAS 目录更新和统一 FINISH 路径。完成记录在 run 内不移动、不回收；消费准备状态随 slot generation 重新初始化。基础实现为可执行任务提供登记空间，零登记执行不进入 CHECK。空间、bind 和同步运行成本单独验证，优化不能引入强制的额外用户声明。
+基础实现采用静态 group 责任计数、常驻完成记录、平坦活动位图、有界 strong-CAS 目录更新和统一 FINISH 路径。完成记录在 run 内不移动、不回收。基础实现为可执行任务提供登记空间，零登记执行不进入 CHECK。空间、bind 和同步运行成本单独验证，优化不能引入强制的额外用户声明。
 
 ## 3. 完成语义与不变量
 
@@ -79,10 +79,10 @@ flowchart LR
 
 | 文档 | 唯一定义的内容 |
 | ---- | -------------- |
-| [接口与数据布局](a5-hbg-async-completion/interfaces-and-layout.md) | 能力描述、登记接口、资源绑定、记录身份、GM 布局和容量 |
+| [接口与数据布局](a5-hbg-async-completion/interfaces-and-layout.md) | 既有登记接口、内部上下文、记录身份、GM 布局和容量 |
 | [调度与完成协议](a5-hbg-async-completion/protocol.md) | lease、目录、静态汇合、CHECK/FINISH、任务形状与服务预算 |
 | [后端与资源生命周期](a5-hbg-async-completion/backends-and-lifetime.md) | SDMA/COUNTER、提交结果、数据可见性、复用和错误关闭 |
-| [消费准备与准入](a5-hbg-async-completion/consumer-preparation.md) | payload 范围谱系、同步消费者、本核准备状态及 MIX/sync-start 汇合 |
+| [消费者数据可见性](a5-hbg-async-completion/consumer-preparation.md) | 既有读取路径、必要获取的范围与执行位置、跨核验证 |
 | [实现方案](a5-hbg-async-completion/implementation.md) | 模块接线、依赖顺序、兼容迁移、错误与 DFX 集成 |
 | [验证与性能验收](a5-hbg-async-completion/validation.md) | 功能矩阵、负对照、硬件资格、性能方法与交付条件 |
 | [待验证选型](a5-hbg-async-completion/choices.md) | 替代实现、验证问题、选择条件及允许改变的合同 |

@@ -11,7 +11,7 @@ CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 ph
 | DORMANT → RUNNABLE | 首次发布者 | 发布封口数据及初始进度；之后在固定尾部设置目录位 |
 | RUNNABLE(g) → OWNED(g) | 任意参与核 | 完整版本 CAS 成功；成功后才允许读取可变进度 |
 | OWNED(g) → RUNNABLE(g+1) | 当前 owner | 发布进度及屏障；目录位保持一 |
-| OWNED → TERMINAL | 当前 owner | 数据可见性工作和最后记录写入结束；清目录位后结算完成责任 |
+| OWNED → TERMINAL | 当前 owner | 本记录负责的检查与最后进度写入结束；清目录位后结算完成责任 |
 | DORMANT → TERMINAL | 零登记或合法 skip 的执行尾部 | 登记已封口、不可能再发布条件；不设置目录位，直接结算 group |
 | DORMANT/OWNED → FAILED | 对应写者或 owner | 锁存首错与身份，保留 backing；不走正常完成贡献 |
 
@@ -21,7 +21,7 @@ CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 ph
 
 kernel 返回后的执行尾部先核对登记错误、开放预留、count 与容量，再封口。非零条件组初始化未满足 mask 和游标，发布数据、RUNNABLE 及目录位后才释放本次执行的局部义务；零登记/skip 走直接终态路径。任何提交副作用不明或登记错误都禁止正常 TaskDone。
 
-CHECK 每次取得一个 group，按条件游标观察尚未满足的条件。一次 slice 不重复观察同一未满足条件；超过预算的条件在后续 slice 继续。READY 位不再重读，前提是该资源 generation 内条件单调且不会提前重置。需要分段执行的可见性动作另存游标；只有条件和可见性工作都结束才进入 TERMINAL。
+CHECK 每次取得一个 group，按条件游标观察尚未满足的条件。一次 slice 不重复观察同一未满足条件；超过预算的条件在后续 slice 继续。READY 位不再重读，前提是本次等待期间条件单调且不会提前重置。COUNTER32 与 SDMA post-done 通过相应宽度的读取判断完成；CHECK 不代替消费者的数据获取。后端若确有额外发布动作，只在证实其必要性后接入有界步骤。
 
 ## 2. 活动目录与内存顺序
 
@@ -56,7 +56,7 @@ AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；�
 
 | 贡献 | 唯一操作者 | 贡献时刻 |
 | ---- | ---------- | -------- |
-| G 减一，非零组 | 最终 CHECK owner | group 的可见性动作、终态和目录清位结束后 |
+| G 减一，非零组 | 最终 CHECK owner | 所有条件已满足，group 终态和目录清位结束后 |
 | G 减一，零登记/skip | 统一执行返回/skip 尾部 | 确认不会再登记且 group 最后写入完成后 |
 | B 减一，单 lane block | 该 block 的执行释放者 | 参数/trace 发布及 slot、局部执行义务释放后 |
 | B 减一，MIX block | coordinator | 收齐实际参与 lane 的返回、发布、release 与局部关闭后，只贡献一次 |
@@ -68,8 +68,8 @@ AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；�
 ### 不同任务形状
 
 - **普通/SPMD：** 每个具有异步能力的物理执行结算自己的 G，每个 block 独立释放 B；分波执行不要求同时驻留。
-- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。group 完成不代替 coordinator 的 B 贡献，也不长期占用 MIX mailbox 或 cohort。执行前的消费准备须收齐实际 active lane 的 prepared ack，不能用原 arrived ack 代替。
-- **sync-start：** 启动许可只约束原计算 cohort；该 cohort 的全部实际 block/lane 完成消费准备后才能发放最终许可。条件等待发生在执行资源释放后；已取得执行许可的核不得夹入 CHECK/FINISH。
+- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。group 完成不代替 coordinator 的 B 贡献，也不长期占用 MIX mailbox 或 cohort。保留既有 active lane 汇合，不因延迟完成新增消费准备 ack。
+- **sync-start：** 启动许可继续约束原计算 cohort。条件等待发生在执行资源释放后；已取得执行许可的核不得夹入 CHECK/FINISH。若特定读取路径确需额外本核获取，按[消费者可见性](consumer-preparation.md)在最终许可前完成，不将其作为所有任务的固定阶段。
 - **predicate skip：** 合法 skip 走 runtime 的封口/结算尾部，即使业务 kernel 根本未调用，也要结算预分配 G 并释放 B。
 - **Graph：** 每个实例的 child 使用独立 group/join。child 的 TaskDone 通过原 body→EXIT 依赖推进，ENTER/EXIT 本身不分配执行 group。未激活 child 仍保留责任；不能把未执行当成取消。
 
@@ -93,7 +93,7 @@ FINISH 是无业务资源需求的控制记录，由一个 lease owner 推进。
 
 挂链成功后，原 FINISH 不再读写 waiter，因为下一 producer 可立即摘链并改写它。后续只读取自己保存的旧链引用。预算耗尽或队列暂时不可开始发布时，保存唯一责任后交权；不能重新扫描原 wake-list 重建进度。
 
-ready 只授予继续准备和 admission 的资格，不证明实际消费者核已经获取 payload。ENTER/EXIT 和 FINISH 不执行消费者的本核获取；同步消费者同样遵守[消费准备与 cohort 汇合](consumer-preparation.md)。
+ready 只授予 admission 的资格，不证明实际消费者核已经获取 payload。ENTER/EXIT 和 FINISH 不执行消费者的本核获取；同步消费者同样遵守[消费者数据可见性](consumer-preparation.md)。优先复用已有读取路径，不固定新增准备状态机。
 
 普通 ready 与 Graph control 的入队都必须提供可识别的“尚未预留、已预留待发布、已公开”状态。内部仍有无界 fanin/CAS 循环，或把未完成发布藏进观察核私有描述符的 helper，不满足此接口。依赖与 admission 判断继续由原调度规则执行，FINISH 不能直接强制消费者进入 kernel。
 
@@ -107,8 +107,8 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 退出/错误检查
   → 完成回收、Graph control、已有 ready 发布
   → 异步安全服务门
-  → 无私有发布积压时有界推进候选消费准备及 cohort 汇合
-  → 本核准备及适用的 cohort 准备完成后尝试最终业务 admission
+  → 无私有发布积压时推进既有候选与 cohort 汇合
+  → 按既有规则尝试最终业务 admission
   → 已获许可则直接执行 kernel；否则返回未获许可的服务循环
 ```
 
@@ -121,13 +121,13 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 | 目录字观察 | 4 |
 | 候选 lease 探测 | 2 |
 | 领取 CAS | 2 |
-| 条件观察、可见性步骤、消费准备/汇合或依赖路由步骤 | 合计 8 |
+| 条件观察或依赖路由步骤 | 合计 8 |
 
 上述额度不包含可省略的“免费尾部”。领取前必须为本次可能发生的进度发布、交权、目录终态更新、join 贡献、FINISH 激活和已预留批次发布保留独立最坏预算；目录更新按每次最多 128 个原子操作计价。达到工作预算后不再开始新工作，只完成必要尾部。不同类型操作的实际耗时由[性能验证](validation.md)校准。
 
 最后一个 CHECK 可能先清 CHECK 位，再因 G 递减成为最后贡献者而发布 FINISH 位。这一尾部仅两次目录更新就最多需要 `2 × (1 次原子读 + 127 次 CAS) = 256` 个原子操作；lease、join、数据发布和屏障另行计价。普通工作额度为 8 不限制这个已预留的固定尾部，也不允许省掉其中一次发布。该数值是协议上界，不是常态耗时或已测性能。
 
-消费准备与 CHECK/FINISH 共享本轮普通工作额度，不能各追加一份隐藏 slice；同时有工作时轮换服务，保证预备成员和异步记录都能推进。PREPARING/PREPARED 期间继续经过安全服务门，最终许可后不再插入服务。准备 ack 的发布、cohort start 及既有已预留 ready 批次也各自按实际操作数保留固定尾部预算。
+若后续因具体读取缺口增加分段获取，须纳入同一工作预算和公平性证明，不能各追加一份隐藏 slice。等待 cohort 的核继续经过安全服务门，最终许可后不再插入服务。cohort start 及既有已预留 ready 批次按实际操作数保留固定尾部预算。
 
 每核用独立 CHECK/FINISH 游标轮换选择一种服务；一个循环最多领取一条记录，普通工作总额度为 8。有业务可执行时，累计最多 4 次执行返回后在最终 admission 之前服务；没有可执行 slot 或仍有 ready 发布积压时，每轮经过一次服务门。最后一个不满 64 位的目录字扫描结束后，游标回到 bit 0；不能对总记录数取模后跳过前面的低位。
 

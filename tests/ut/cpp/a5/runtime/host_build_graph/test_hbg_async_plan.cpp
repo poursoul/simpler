@@ -61,7 +61,8 @@ TEST(HbgAsyncPlan, SdmaGuardsAreSharedByExecutionsAndIsolatedByCluster) {
     AsyncSdmaSubmissionGuard *first = nullptr;
     for (const auto &group : plan.groups) {
         AsyncWriter writer{
-            static_cast<uint8_t *>(image.base), plan.total_bytes, 1, group.offset, group.data.group_index
+            static_cast<uint8_t *>(image.base), plan.total_bytes, 1, group.offset,
+            static_cast<uint32_t>((group.offset - plan.layout.groups_offset) / sizeof(AsyncGroupData))
         };
         auto *guard = sdma_submission_guard(writer, 7);
         ASSERT_NE(guard, nullptr);
@@ -139,9 +140,9 @@ TEST(HbgAsyncPlan, HeadersDoNotStrideAcrossUnusedConditionCapacity) {
     EXPECT_LT(plan.initialized_bytes, plan.total_bytes);
     EXPECT_LT(headers_end - kPrefix, 64 * (sizeof(AsyncGroupData) + sizeof(SchedulerAsyncTaskJoin)) + 8192);
     for (const auto &group : plan.groups) {
-        EXPECT_EQ(group.data.capacity, MAX_COMPLETIONS_PER_TASK);
-        EXPECT_GE(group.data.entries_offset, plan.initialized_bytes);
-        EXPECT_LE(group.data.entries_offset + group.data.entries_bytes, plan.total_bytes);
+        EXPECT_EQ(group.capacity, MAX_COMPLETIONS_PER_TASK);
+        EXPECT_GE(group.entries_offset, plan.initialized_bytes);
+        EXPECT_LE(group.entries_offset + async_group_entry_bytes(group.capacity), plan.total_bytes);
     }
 }
 
@@ -171,10 +172,11 @@ TEST(HbgAsyncPlan, ExpandedTasksBlocksAndLanesHaveIndependentStableRecords) {
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 if (!input.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
                 const auto &group = plan.groups[group_index];
-                EXPECT_EQ(group.data.task_ref, input.task_ref);
-                EXPECT_EQ(group.data.block_index, block);
-                EXPECT_EQ(group.data.subtask_slot, lane);
-                EXPECT_EQ(group.data.group_index, group_index);
+                const auto *data = scheduler_state_at<AsyncGroupData>(image.base, group.offset);
+                EXPECT_EQ(data->task_ref, input.task_ref);
+                EXPECT_EQ(data->block_index, block);
+                EXPECT_EQ(data->subtask_slot, lane);
+                EXPECT_EQ(data->group_index, group_index);
                 EXPECT_EQ(group.offset % 128, 0u);
                 AsyncWriter writer{static_cast<uint8_t *>(image.base), plan.total_bytes, 19, group.offset, group_index};
                 EXPECT_TRUE(seal_conditions(writer));
@@ -214,6 +216,24 @@ TEST(HbgAsyncPlan, MixedCapabilityTaskCountsOnlyDeferredLanesAndAllBlocks) {
     EXPECT_EQ(join->word, 0u);
 }
 
+TEST(HbgAsyncPlan, NonmonotonicRefsRetainTheirMappingAndStillRejectDuplicates) {
+    std::vector<AsyncTaskPlanInput> inputs{task(2, 2, LaneMask::aic()), task(0, 1, LaneMask::both_aiv())};
+    AsyncCompletionHostPlan plan;
+    std::string error;
+    ASSERT_TRUE(plan_async_completion(kPrefix, 7, 3, inputs, &plan, &error)) << error;
+    Image image(plan.total_bytes);
+    ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
+    const auto *map = scheduler_state_at<uint32_t>(image.base, plan.layout.task_map_offset);
+    EXPECT_EQ(map[2], 0u);
+    EXPECT_EQ(map[0], 1u);
+    EXPECT_EQ(scheduler_state_at<AsyncGroupData>(image.base, plan.groups.front().offset)->task_ref, 2);
+    EXPECT_EQ(scheduler_state_at<AsyncGroupData>(image.base, plan.groups.back().offset)->task_ref, 0);
+    const uint64_t bytes = plan.total_bytes;
+    inputs[1].task_ref = 2;
+    EXPECT_FALSE(plan_async_completion(kPrefix, 7, 3, inputs, &plan, &error));
+    EXPECT_EQ(plan.total_bytes, bytes);
+}
+
 TEST(HbgAsyncPlan, EveryMixMaskIncludesOnlyItsActiveLanes) {
     for (uint32_t mask : {3u, 5u, 6u, 7u}) {
         const LaneMask lanes((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0);
@@ -223,7 +243,7 @@ TEST(HbgAsyncPlan, EveryMixMaskIncludesOnlyItsActiveLanes) {
         EXPECT_EQ(plan.groups.size(), 4u * static_cast<uint32_t>(lanes.count()));
         EXPECT_EQ(plan.tasks[0].async_mask, lanes);
         for (const auto &group : plan.groups)
-            EXPECT_TRUE(lanes.has(static_cast<SubtaskSlot>(group.data.subtask_slot)));
+            EXPECT_TRUE(lanes.has(static_cast<SubtaskSlot>(group.subtask_slot)));
     }
 }
 

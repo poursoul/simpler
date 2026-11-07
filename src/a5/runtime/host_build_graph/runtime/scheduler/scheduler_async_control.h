@@ -27,9 +27,27 @@ struct SchedulerAsyncLocalState {
     uint32_t business_returns{0};
     bool finish_first{false};
     bool work_activated{false};
+    uint8_t idle_probe_countdown{0};
 };
 
 static_assert(sizeof(SchedulerAsyncLocalState) == 56);
+
+inline constexpr uint8_t SCHEDULER_ASYNC_IDLE_PROBE_INTERVAL = 16;
+
+// Cold idle cores still discover remote work within a bounded number of service
+// opportunities. Business returns, active work and local errors are never delayed.
+inline __aicore__ bool scheduler_async_service_due(SchedulerAsyncLocalState &local) {
+    if (local.work_activated || local.error_code != 0) {
+        local.idle_probe_countdown = 0;
+        return true;
+    }
+    if (local.business_returns != 0 || local.idle_probe_countdown == 0) {
+        local.idle_probe_countdown = SCHEDULER_ASYNC_IDLE_PROBE_INTERVAL - 1;
+        return true;
+    }
+    --local.idle_probe_countdown;
+    return false;
+}
 
 inline __aicore__ SchedulerGraphResult scheduler_async_error_result(const SchedulerAsyncLocalState *local) {
     if (local == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;

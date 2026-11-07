@@ -305,6 +305,8 @@ TEST(HbgAsyncControl, NoActivityCannotMaskALocalRegistrationFailure) {
     AsyncFixture f(1);
     f.workers[0].failed_task_ref = 0;
     f.workers[0].error_code = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+    f.workers[0].idle_probe_countdown = SCHEDULER_ASYNC_IDLE_PROBE_INTERVAL - 1;
+    EXPECT_TRUE(scheduler_async_service_due(f.workers[0]));
     bool progress = true;
     EXPECT_FALSE(
         scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, progress)
@@ -312,6 +314,56 @@ TEST(HbgAsyncControl, NoActivityCannotMaskALocalRegistrationFailure) {
     EXPECT_FALSE(progress);
     EXPECT_NE(scheduler_read_error(f.storage.run_control), 0u);
     EXPECT_EQ(f.storage.run_control->resolved_task_count, 0u);
+}
+
+TEST(HbgAsyncControl, ColdIdleDiscoveryIsBoundedAndConsumerAcquisitionDoesNotWaitForIt) {
+    AsyncFixture f(1);
+    bool progress = false;
+    for (uint32_t worker : {1u, 2u}) {
+        ASSERT_TRUE(scheduler_async_service_due(f.workers[worker]));
+        ASSERT_TRUE(scheduler_service_async_slice(
+            f.graph.graph(), f.base(), f.local(worker), f.storage.run_control, 0, progress
+        ));
+        EXPECT_FALSE(progress);
+    }
+    const auto writer = f.start();
+    f.register_counter(writer, 0);
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
+    ASSERT_TRUE(f.close());
+    EXPECT_GT(f.workers[2].idle_probe_countdown, 0u);
+    EXPECT_TRUE(scheduler_async_work_activated(&f.workers[2]));
+    EXPECT_TRUE(scheduler_async_service_due(f.workers[2]));
+    uint32_t probes = 0;
+    for (uint32_t opportunity = 0; opportunity < SCHEDULER_ASYNC_IDLE_PROBE_INTERVAL; ++opportunity) {
+        if (!scheduler_async_service_due(f.workers[1])) continue;
+        ++probes;
+        ASSERT_TRUE(
+            scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, 0, progress)
+        );
+    }
+    EXPECT_EQ(probes, 1u);
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
+}
+
+TEST(HbgAsyncControl, BusinessReturnsBypassColdIdleDiscoveryDelay) {
+    AsyncFixture f(1);
+    bool progress = false;
+    ASSERT_TRUE(scheduler_async_service_due(f.workers[1]));
+    ASSERT_TRUE(
+        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, 0, progress)
+    );
+    const auto writer = f.start();
+    f.register_counter(writer, 0);
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
+    ASSERT_GT(f.workers[1].idle_probe_countdown, 0u);
+    f.workers[1].business_returns = 4;
+    EXPECT_TRUE(scheduler_async_service_due(f.workers[1]));
+    EXPECT_TRUE(
+        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, 0, progress)
+    );
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(f.workers[1].business_returns, 0u);
 }
 
 TEST(HbgAsyncControl, UnusedRecordsRemainUntouchedByInitializationAndZeroWaitExecution) {

@@ -11,7 +11,7 @@
 
 #include "async_completion_plan.h"
 
-#include <cstring>
+#include <algorithm>
 #include <limits>
 #include <unordered_set>
 #include <utility>
@@ -39,7 +39,7 @@ bool plan_async_completion(
     AsyncCompletionHostPlan *out, std::string *error, uint32_t sdma_guard_count
 ) {
     if (out == nullptr || run_epoch == 0 || begin_offset < sizeof(SchedulerRunControl) ||
-        begin_offset % ASYNC_RECORD_ALIGNMENT != 0 || task_count > INT32_MAX)
+        begin_offset % ASYNC_RECORD_ALIGNMENT != 0 || task_count > INT32_MAX || inputs.size() > task_count)
         return reject(error, "invalid async image identity or bounds");
     AsyncCompletionHostPlan next;
     next.begin_offset = begin_offset;
@@ -48,10 +48,15 @@ bool plan_async_completion(
     auto &layout = next.layout;
     layout.run_epoch = run_epoch;
     layout.task_count = task_count;
+    const bool increasing = std::adjacent_find(inputs.begin(), inputs.end(), [](const auto &left, const auto &right) {
+                                return left.task_ref >= right.task_ref;
+                            }) == inputs.end();
     std::unordered_set<int64_t> task_refs;
+    if (!increasing) task_refs.reserve(inputs.size());
+    next.tasks.reserve(inputs.size());
     for (const auto &input : inputs) {
         if (input.task_ref < 0 || static_cast<uint64_t>(input.task_ref) >= task_count ||
-            !task_refs.insert(input.task_ref).second || input.block_count == 0 ||
+            (!increasing && !task_refs.insert(input.task_ref).second) || input.block_count == 0 ||
             input.block_count > SCHEDULER_ASYNC_JOIN_COUNT_MAX || !input.active_mask.is_valid())
             return reject(error, "invalid or duplicate async task shape");
         LaneMask mask{};
@@ -104,27 +109,23 @@ bool plan_async_completion(
         !reserve_array<SchedulerAsyncLease>(&cursor, layout.async_task_count, &layout.finish_leases_offset) ||
         !reserve_array<SchedulerAsyncFinishProgress>(&cursor, layout.async_task_count, &layout.finish_progress_offset))
         return reject(error, "deferred control storage overflows");
+    next.groups.reserve(layout.group_count);
     uint32_t task_index = 0;
     for (const auto &input : inputs) {
         if (task_index == next.tasks.size() || input.task_ref != next.tasks[task_index].task_ref) continue;
-        const auto &task = next.tasks[task_index++];
+        const uint32_t planned_task = task_index++;
+        const auto &task = next.tasks[planned_task];
         for (uint32_t block = 0; block < input.block_count; ++block) {
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 if (!task.async_mask.has(static_cast<SubtaskSlot>(lane))) continue;
                 AsyncGroupHostPlan group{};
-                auto &data = group.data;
-                data.run_epoch = run_epoch;
-                data.task_ref = input.task_ref;
-                data.group_index = static_cast<uint32_t>(next.groups.size());
-                data.block_index = block;
-                data.subtask_slot = lane;
-                data.capacity = input.capacities[lane];
-                data.entries_bytes = async_group_entry_bytes(data.capacity);
-                data.sdma_guards_offset = layout.sdma_guards_offset;
-                data.sdma_guard_count = layout.sdma_guard_count;
-                group.offset = layout.groups_offset + data.group_index * sizeof(AsyncGroupData);
+                group.task_index = planned_task;
+                group.block_index = static_cast<uint16_t>(block);
+                group.subtask_slot = static_cast<uint8_t>(lane);
+                group.capacity = static_cast<uint8_t>(input.capacities[lane]);
+                group.offset = layout.groups_offset + next.groups.size() * sizeof(AsyncGroupData);
                 if (!scheduler_layout_reserve(
-                        &cursor, data.entries_bytes, ASYNC_RECORD_ALIGNMENT, &data.entries_offset
+                        &cursor, async_group_entry_bytes(group.capacity), ASYNC_RECORD_ALIGNMENT, &group.entries_offset
                     ))
                     return reject(error, "async publication storage overflows");
                 next.groups.push_back(group);
@@ -172,9 +173,20 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
         checks[word].bits = 0;
     for (uint64_t word = 0; word < (static_cast<uint64_t>(plan.layout.async_task_count) + 63) / 64; ++word)
         finishes[word].bits = 0;
+    AsyncGroupData header{};
+    header.run_epoch = plan.layout.run_epoch;
+    header.sdma_guards_offset = plan.layout.sdma_guards_offset;
+    header.sdma_guard_count = plan.layout.sdma_guard_count;
     for (uint32_t index = 0; index < plan.groups.size(); ++index) {
         const auto &group = plan.groups[index];
-        *scheduler_state_at<AsyncGroupData>(image, group.offset) = group.data;
+        header.task_ref = plan.tasks[group.task_index].task_ref;
+        header.group_index = index;
+        header.block_index = group.block_index;
+        header.subtask_slot = group.subtask_slot;
+        header.capacity = group.capacity;
+        header.entries_bytes = async_group_entry_bytes(group.capacity);
+        header.entries_offset = group.entries_offset;
+        *scheduler_state_at<AsyncGroupData>(image, group.offset) = header;
     }
     return true;
 }

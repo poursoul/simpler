@@ -367,6 +367,7 @@ __aicore__ bool run_ready_dispatch_loop(
     auto service_async = [&](bool &progress) __aicore__ {
         if (context->async == nullptr || async_serviced) return true;
         async_serviced = true;
+        if (!scheduler_async_service_due(*context->async)) return true;
         bool advanced = false;
         const bool ok = scheduler_service_async_slice(
             graph, scheduler_state_base, context, run_control, profiling_level, advanced,

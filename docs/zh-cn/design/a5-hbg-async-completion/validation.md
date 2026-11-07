@@ -21,7 +21,7 @@
 | 计算释放顺序 | SPMD 每 block 的 trace 发布与 slot 释放先于 completed_blocks；MIX 收齐 release 后贡献，不能提前关闭计算 |
 | 初始化前缀与预留后缀 | 保持 64 条容量；脏值填充后缀、只拷贝前缀、跨 run 复用仍正确；零登记不写后缀，首次 CHECK/FINISH 初始化完整，重复封口不能覆盖 OWNED |
 | 分离 header/token | 连续 header、token 对齐/范围/不重叠；旧合并长度被拒绝；真实 AsyncCtx 指针指向 token 区，登记和观察一致 |
-| run 活动门控 | 零登记跳过空扫描；异核首次发布后服务可见，实际消费者获取生效；未激活时仍传播错误，跨 run 重置 |
+| run 活动门控 | 零登记跳过空扫描；异核首次发布在最多 16 个冷空闲服务机会内可见，业务返回和本核错误绕过延迟，实际消费者获取不抽样；未激活时仍传播错误，跨 run 重置 |
 | 长 fanin/fanout | 每一步受预算约束；跨核续接不丢失、不重复 waiter 或 ready 发布 |
 | 责任移交 | waiter 挂到下一 producer 后立即被其改写，旧 FINISH 仍沿自己保存的旧链继续 |
 | resolve/退休 | TaskDone 可以早于 drain，run 完成及 backing 回收不能早于最后尾部 |
@@ -172,6 +172,10 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 共 19 项无 Graph 用例加 Qwen。使用 [collect.py](../../../../tools/benchmarks/a5_hbg_graph_task/collect.py) 核对实际 pytest case 的参数/config、golden 和产物身份，清单与当前代码不一致时先修正原因。19 项至少各采三批独立进程、每批 100 稳态轮；Qwen 预热 5 轮后采集 100 稳态轮。`spmd_paged_attention` 不加入该参考性能集，但 SPMD 功能验证仍是必需项。
 
 新增异步和多卡性能对照作为补充，不能替换上述原有性能集。完整 sweep 在同一设备 allocation 内串行安排同设备的基线/候选，保留所有原始数据，禁止选择历史不同产物的最佳结果拼成当前资格。
+
+SPMD/MIX 补充矩阵逐项覆盖单 block 的 chain/burst 与 mask 3/5/6/7、普通任务交错、多 block AIC/AIV、超核数分波、最后 block/lane 释放、SPMD 间依赖、高 fanin、混合波次及 sync-start。按实际 case、参数和代码版本分别报告，不能用一个混合波次用例的百分比代表全部 SPMD，或用一个 MIX 链代表全部 MIX。预期拒绝、故障注入和强制开启诊断的用例保留功能/协议结论；不得将其失败等待时间或诊断耗时混作 L1 吞吐。Qwen 单列完整模型结果，未采集时明确标为未测。
+
+性能归因须先列出同步执行路径上相对基线新增的操作，注明每 run、每 task、每 block/lane 或每调度循环的执行次数，及其内存读写、缓存维护、原子操作和上传成本，再用分段数据验证。Host 总耗时包含等待 Device；同时报告 bind、publish_image 和 runner_run，不能将 Device 等待误算为 Host CPU 开销，也不能因公共 Host 文件未改而忽略 A5 HBG 私有 Host 的准备成本。
 
 正式性能使用 L1；L3/L4 用于诊断归因，结果不混入 L1。相同机器、设备、输入、计算 kernel 和工作量，先采集 A/A 噪声，再采用 B/A/A/B 的成组对照；建议每组 5 次预热、100 次正式调用，并至少重复三组成对测量。保存所有样本及异常，不只报告最优值。
 

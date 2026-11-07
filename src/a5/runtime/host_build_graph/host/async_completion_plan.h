@@ -27,8 +27,14 @@ struct AsyncTaskPlanInput {
 
 struct AsyncGroupHostPlan {
     uint64_t offset;
-    pto2::resident::AsyncGroupData data;
+    uint64_t entries_offset;
+    uint32_t task_index;
+    uint16_t block_index;
+    uint8_t subtask_slot;
+    uint8_t capacity;
 };
+
+static_assert(sizeof(AsyncGroupHostPlan) == 24);
 
 struct AsyncCompletionHostPlan {
     uint64_t begin_offset{0};

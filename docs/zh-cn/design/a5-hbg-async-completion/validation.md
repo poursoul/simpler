@@ -173,7 +173,9 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 
 新增异步和多卡性能对照作为补充，不能替换上述原有性能集。完整 sweep 在同一设备 allocation 内串行安排同设备的基线/候选，保留所有原始数据，禁止选择历史不同产物的最佳结果拼成当前资格。
 
-SPMD/MIX 补充矩阵逐项覆盖单 block 的 chain/burst 与 mask 3/5/6/7、普通任务交错、多 block AIC/AIV、超核数分波、最后 block/lane 释放、SPMD 间依赖、高 fanin、混合波次及 sync-start。按实际 case、参数和代码版本分别报告，不能用一个混合波次用例的百分比代表全部 SPMD，或用一个 MIX 链代表全部 MIX。预期拒绝、故障注入和强制开启诊断的用例保留功能/协议结论；不得将其失败等待时间或诊断耗时混作 L1 吞吐。Qwen 单列完整模型结果，未采集时明确标为未测。
+[SPMD/MIX 补充清单](../../../../tools/benchmarks/a5_hbg_graph_task/spmd-mix-cases.json)逐项覆盖单 block 的 chain/burst 与 mask 3/5/6/7、普通任务交错、多 block AIC/AIV、超核数分波、最后 block/lane 释放、SPMD 间依赖、高 fanin、混合波次及 sync-start。按实际 case、参数和代码版本分别报告，不能用一个混合波次用例的百分比代表全部 SPMD，或用一个 MIX 链代表全部 MIX。预期拒绝、故障注入和强制开启诊断的用例保留功能/协议结论；不得将其失败等待时间或诊断耗时混作 L1 吞吐。Qwen 单列完整模型结果，未采集时明确标为未测。
+
+依赖输出验证来检查本次调度模式的场景，在性能清单中声明 `timing_requires_golden: true`，计时轮继续执行原有校验。两臂使用相同策略，仍从 STRACE 的调用区间提取 Host/Device 时间；不以关闭断言来适配统一的 `--skip-golden`。
 
 性能归因须先列出同步执行路径上相对基线新增的操作，注明每 run、每 task、每 block/lane 或每调度循环的执行次数，及其内存读写、缓存维护、原子操作和上传成本，再用分段数据验证。Host 总耗时包含等待 Device；同时报告 bind、publish_image 和 runner_run，不能将 Device 等待误算为 Host CPU 开销，也不能因公共 Host 文件未改而忽略 A5 HBG 私有 Host 的准备成本。
 

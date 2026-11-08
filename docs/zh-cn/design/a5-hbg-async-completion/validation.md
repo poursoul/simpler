@@ -56,6 +56,8 @@ CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于
 
 未观察到真实 PENDING 窗口只能证明普通正确性，不能获得异步重叠资格。通过手工提前改标志或跳过条件产生的结果不算真实 SDMA 证据。
 
+[默认队列复用用例](../../../../tests/st/a5/host_build_graph/sdma_queue_reuse/test_sdma_queue_reuse.py) 使用满 AIV 同步启动任务，让同一 cluster 的两个 AIV 各提交 33 次，在每条默认队列上累计 66 次；保留通信域后再各提交一次。必须确认每条实际完成记录的地址保持不变、postId 连续、两个 AIV 共享同一队列，并验证不同 epoch 的完整 payload、消费结果和保护区。覆盖两/四 rank、诊断关闭/开启；不能将累计跨 64 槽解释为 64 次同时在途或已经证明 SDK 背压。
+
 ### 通知与缓存
 
 使用真实 `remote_store → notify → waiter → consumer`。先让 waiter 达到实际 AIV 饱和压力，再提交 publisher，确认释放执行核后 publisher 能推进。保持原 workload 的依赖图，不通过给 waiter 增加不必要的 publisher 依赖来回避阻塞问题。

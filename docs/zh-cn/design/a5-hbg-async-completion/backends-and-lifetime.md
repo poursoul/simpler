@@ -18,6 +18,8 @@ A5 SDK 的 TPUT 使用同步 MTE 回退，搬运完成后合法返回 SDMA 类�
 
 SDK 默认以物理 `get_block_idx()` 选择 channel group，同一 cluster 的两个 AIV 共享该值。resident 为每个实际 cluster 保存一个独立 cache line 的提交互斥字；所有 task 和 Graph 实例共享这组 run 内状态。取得互斥权后才构造 session，完成提交、SDK postId/SQ 状态持久化及条件登记后交权。不同 cluster 可以并行，同 cluster 的不同 workspace 保守串行提交。
 
+基础 adapter 使用 SDK 默认的单队列 session；一次非空 TGET 导出一条公共完成记录，同一物理执行可通过多次请求登记多条记录。直接改变共享 workspace 的队列分组不属于该提交互斥保证：多队列 session 必须按实际物理队列的重叠范围保护提交，并保持 workspace 的分组一致，不能仅沿用每 cluster 一个互斥字就宣称支持。
+
 SDK 保存 SQ tail 时既写入 GM，也更新提交核的 scalar cache。交权前必须完成临时 pipeline，并写回这些元数据缓存行；否则旧 owner 的后续 session 缓存维护可能覆盖新 owner 已推进的 SQ 状态。基础 adapter 使用 SDK 同类的全 DCache 写回及设备屏障，随后原子释放互斥字；这不代表 DMA payload 已完成。
 
 互斥仅覆盖提交，不等待本次 DMA 完成。成功提交释放互斥字，异常退出将其置为失败，后续提交不得继续使用可能不一致的 session 状态。争用等待使用设备时钟限制为 5 秒，超时使当前登记失败，不抢占或清除其他核的所有权；核硬故障仍由既有 run 退出流程处理。跨 run 的同一 domain 使用继续依赖既有 worker 执行顺序和 fence，run 内互斥不能替代它们。
@@ -42,6 +44,8 @@ defer_wait 不会使提交队列满、上述提交争用、SyncAll 或 kernel �
 ## 4. 复用与可见性
 
 generation 只识别旧引用，不能阻止旧 DMA 写入已经复用的地址。资源保持分配也不自动保证 payload/signal 未被覆盖。复用必须等待旧访问和实际消费者结束：run 内由正确的 DAG/后端约束保证，跨 run/peer 由既有 fence 或明确的完成确认保证。
+
+COUNTER 的 `value >= expected` 不区分 payload 的版本，也不能阻止 peer 提前写入下一轮数据。生产者须等待上一轮实际消费者的完成确认，或使用独立缓冲槽；重置通知值也须发生在旧读写和检查都退休之后。这是业务通信协议的复用前提，run/domain 的持有只保证 backing 不被释放。验证重置时使用与通知值独立的 payload 标签，避免再次使用 expected=1 时把旧数据误认作本轮结果。
 
 依赖满足不等于所有核 cache 已更新。优先验证已有 backend 发布、实际消费者读取指令和缓存维护路径。若这些已提供获取保证，不增加多余准备协议；否则只为缺失的读取范围和核增加有界获取。观察核的 invalidate 不能代替消费核的获取。
 

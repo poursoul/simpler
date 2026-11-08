@@ -34,7 +34,7 @@ header 的前 64 B 包含本执行可变字段，后半部的 SDMA guard 和 tok
 
 ## 4. Host 预分配
 
-Host 已拥有展开后的普通任务和 Graph child 元数据，按 task/block/active lane 生成稳定索引。`AsyncTaskPlanInput` 只保存这些调度信息及内部容量，不携带额外资源身份。Host 每个 group 的临时规划项为 24 B，只保存 offset、task 索引、block/lane 与容量；初始化时复用一个 header 临时对象填充最终镜像，不为每个执行保存完整对齐 header 副本。输入 task ref 递增时不建立重复检查哈希表，其他顺序仍完整检查重复。Graph Definition、TensorData、task 参数和 callable 格式保持不变。
+Host 已拥有展开后的普通任务和 Graph child 元数据，按 task/block/active lane 生成稳定索引。`AsyncTaskPlanInput` 只保存这些调度信息及内部容量，不携带额外资源身份。Host 每个逻辑 task 保存一个 40 B 的 `AsyncTaskHostPlan`，包含设备任务描述、三个 lane 的容量、条件区起点及每 block 的条件区步长；初始化时展开 block/lane，并复用一个 header 临时对象填充最终镜像，不为每个物理执行保存临时规划项或完整对齐 header 副本。输入 task ref 递增时不建立重复检查哈希表，其他顺序仍完整检查重复。Graph Definition、TensorData、task 参数和 callable 格式保持不变。
 
 基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行封口后直接释放资源，不创建 CHECK 责任。预留容量与每轮初始化、上传范围分开：Host/Device backing 保留完整容量，但 `initialized_bytes` 只覆盖原调度状态及异步元数据、join、目录、SDMA guard、连续 header。token、CHECK/FINISH lease 与进度位于后缀，首次实际发布前由唯一写者初始化。Host 使用既有 pending metadata 路径上传此前缀，不清零或上传未使用后缀。空间、bind 和 H2D 成本分别计量，不将减少上传宣称为省掉全部预留内存。
 

@@ -145,11 +145,13 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 
 [跨 run 映射刷新用例](../../../../tests/st/a5/host_build_graph/async_completion/test_run_reuse.py) 在同一 Worker、callable 和保留域上交替使用不同任务数、block 数、AIC/AIV/MIX 掩码、0/1/4/64 条条件及合法的单 lane、单 block predicate skip，连续两轮重复这些形状并更换 payload epoch。每次校验完整执行记录、输出和 signal 邻接保护区，验证 run 入口获取足以刷新复用存储中的只读映射，不能只用相同图形状的重复运行证明这一点。
 
+[跨卡通知复用用例](../../../../tests/st/a5/host_build_graph/async_peer_counter/test_peer_counter.py) 在同一两卡通信域上执行通知值 `1 → 2 → 重置为 1`，使用独立的 payload 标签 `101/102/103`；重置只发生在前一轮全部消费者结束后。另测实际 AIV 容量 `C+1` 个 waiter。接收端完成全部条件登记后才向发送端确认就绪，publisher 再发布数据与通知；独立 AIC 上的有界登记 gate 不占用被测 AIV 资源池。诊断关闭和开启时均检查完整 payload、保护区、执行次数和握手，开启时再校验真实 native 完成与依赖记录。
+
 | 注入位置或输入 | 验收判据 |
 | -------------- | -------- |
 | 提交前容量或输入验证失败 | 该次请求没有设备副作用，未使用预留被归还 |
 | 已尝试提交后失败或登记异常 | 首错保留，相关 owner/backing 仍持有，没有成功 TaskDone 或自动重放 |
-| peer 提前写下一 epoch | 协议阻止复用或明确拒绝；allocation 存活不能被当作正确性证明 |
+| peer 提前写下一 epoch | 验证业务通信协议通过消费者完成确认或独立槽阻止提前覆盖；COUNTER 比较不提供 payload 版本检查，allocation 存活不能被当作正确性证明 |
 | 旧 token/旧窗口 | 旧操作未结束时不得复用资源，不能只靠 generation 检查 |
 | 长时间 PENDING | watchdog 不被纯轮询刷新，错误有具体 task/group/条件身份 |
 | owner 暂停在交权/清位/贡献边界 | 正常路径不提前退休；恢复后没有重复贡献 |

@@ -12,7 +12,9 @@ SDMA 使用当前 SDK 公共完成记录 API 返回的 post-done 地址和完整
 
 ## 2. 提交与登记
 
-SDMA adapter 保持现有调用接口。提交前检查形状、字节数和明确的零工作，并为可能产生的完成记录预留足够容量；提交后使用公共记录数量/索引 API 登记实际条件，归还未用预留。非零请求得到零 handle、未知完成类型、登记溢出或 helper 失败必须锁存错误，不把它们当成零登记成功。
+SDMA adapter 保持现有调用接口。提交前检查形状、字节数和明确的零工作，并为可能产生的完成记录预留足够容量；提交后使用公共记录数量/索引 API 登记实际条件，归还未用预留。非空 TGET 得到零 handle、未知完成类型、登记溢出或 helper 失败必须锁存错误，不把它们当成零登记成功。
+
+A5 SDK 的 TPUT 使用同步 MTE 回退，搬运完成后合法返回 SDMA 类型的零 handle。adapter 依据实际操作类型接受该结果，将本次预留按零条条件结束，不查询完成记录、不发布 CHECK。`postFailed`、错误引擎和既有首错仍必须失败；不能将 TPUT 的零 handle 规则推广到 TGET，也不能把同步回退表述为异步 SDMA PUT。
 
 SDK 默认以物理 `get_block_idx()` 选择 channel group，同一 cluster 的两个 AIV 共享该值。resident 为每个实际 cluster 保存一个独立 cache line 的提交互斥字；所有 task 和 Graph 实例共享这组 run 内状态。取得互斥权后才构造 session，完成提交、SDK postId/SQ 状态持久化及条件登记后交权。不同 cluster 可以并行，同 cluster 的不同 workspace 保守串行提交。
 

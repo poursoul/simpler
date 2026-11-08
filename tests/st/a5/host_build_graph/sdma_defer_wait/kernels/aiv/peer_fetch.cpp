@@ -25,6 +25,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         return;
     }
     const uint64_t count = static_cast<uint64_t>(args[3]);
+    const bool local_put = args[4] != 0;
     const uint64_t capacity = output->shapes[0];
     const uint32_t peer = (comm->rankId + 1) % comm->rankNum;
     auto *local_input = reinterpret_cast<__gm__ float *>(input->buffer.addr) + input->start_offset;
@@ -34,11 +35,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     using Shape = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
     using Stride = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, 1>;
     using Data = pto::GlobalTensor<float, Shape, Stride>;
-    Data source(remote, Shape(1, 1, 1, 1, count), Stride(count, count, count, count, 1));
+    Data source(local_put ? local_input : remote, Shape(1, 1, 1, 1, count), Stride(count, count, count, count, 1));
     Data target(destination, Shape(1, 1, 1, 1, capacity), Stride(capacity, capacity, capacity, capacity, 1));
     using Scratch = pto::Tile<pto::TileType::Vec, uint8_t, 1, SDMA_SCRATCH_ALIGNMENT>;
     Scratch scratch;
-    pto::TASSIGN(scratch, 0);
+    pto::TASSIGN(scratch, SDMA_SCRATCH_ALIGNMENT);
     auto *workspace = reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::SDMA>(*comm).addr);
-    (void)send_request_entry(ctx, SdmaTget(target, source, scratch, workspace));
+    if (local_put) {
+        (void)send_request_entry(ctx, SdmaTput(target, source, scratch, workspace));
+        // A5's synchronous MTE fallback must leave no deferred condition behind.
+        if (ctx.completion_count == nullptr || *ctx.completion_count != 0)
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    } else {
+        (void)send_request_entry(ctx, SdmaTget(target, source, scratch, workspace));
+    }
 }

@@ -41,6 +41,7 @@ def peer_fetch_orchestration(orch, callables, task_args, config):
             )
             args.add_scalar(domain.device_context(rank, workspace_engines=("sdma",)))
             args.add_scalar(int(task_args.transfer_elements))
+            args.add_scalar(int(task_args.local_put))
             orch.submit_next_level(callables.peer_fetch, args, config, worker=rank)
 
 
@@ -55,14 +56,14 @@ class _PeerFetchBase(SceneTestCase):
                 "orchestration": {
                     "source": "kernels/orchestration/peer_fetch.cpp",
                     "function_name": "aicpu_orchestration_entry",
-                    "signature": [D.IN, D.INOUT, D.OUT, D.SCALAR, D.SCALAR],
+                    "signature": [D.IN, D.INOUT, D.OUT, D.SCALAR, D.SCALAR, D.SCALAR],
                 },
                 "incores": [
                     {
                         "func_id": 0,
                         "source": "kernels/aiv/peer_fetch.cpp",
                         "core_type": "aiv",
-                        "signature": [D.IN, D.OUT, D.SCALAR, D.SCALAR],
+                        "signature": [D.IN, D.OUT, D.SCALAR, D.SCALAR, D.SCALAR],
                     },
                     {
                         "func_id": 1,
@@ -90,13 +91,15 @@ class _PeerFetchBase(SceneTestCase):
             Scalar("ranks", params["ranks"]),
             Scalar("elements", count),
             Scalar("transfer_elements", 0 if params.get("zero") else count),
+            Scalar("local_put", int(params.get("local_put", False))),
         )
 
     def compute_golden(self, args, params):
         for rank in range(params["ranks"]):
             target = getattr(args, f"out_{rank}")
             if not params.get("zero"):
-                target.copy_(getattr(args, f"in_{(rank + 1) % params['ranks']}"))
+                source_rank = rank if params.get("local_put") else (rank + 1) % params["ranks"]
+                target.copy_(getattr(args, f"in_{source_rank}"))
             getattr(args, f"result_{rank}").copy_(target + 1)
 
 
@@ -106,12 +109,17 @@ def cases(ranks):
             "name": name,
             "platforms": ["a5"],
             "config": {"device_count": ranks, "num_sub_workers": 0},
-            "params": {"ranks": ranks, "elements": elements, "zero": zero},
+            "params": {"ranks": ranks, "elements": elements, "zero": zero, "local_put": local_put},
         }
-        for name, elements, zero in [
-            ("peer_fetch", 16384, False),
-            ("zero_work", 16384, True),
-            ("large_peer_fetch", 1048576, False),
+        # Local GM-to-GM TPUT checks the SDK's MTE fallback and downstream
+        # visibility. These cases do not claim remote PUT/notification coverage.
+        for name, elements, zero, local_put in [
+            ("peer_fetch", 16384, False, False),
+            ("zero_work", 16384, True, False),
+            ("large_peer_fetch", 1048576, False, False),
+            ("local_put_fallback", 16384, False, True),
+            ("local_put_fallback_large", 1048576, False, True),
+            ("local_put_zero_work", 16384, True, True),
         ]
     ]
 

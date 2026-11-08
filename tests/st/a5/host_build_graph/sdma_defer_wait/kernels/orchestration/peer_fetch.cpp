@@ -13,7 +13,7 @@
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 5};
+    return OrchestrationConfig{.expected_arg_count = 6};
 }
 
 extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
@@ -23,7 +23,7 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     CoreTaskArgs producer;
     producer.add_input(input);
     producer.add_output(out);
-    producer.add_scalar(args.scalar<uint64_t>(0), args.scalar<uint64_t>(1));
+    producer.add_scalar(args.scalar<uint64_t>(0), args.scalar<uint64_t>(1), args.scalar<uint64_t>(2));
     rt_submit_aiv_task(0, producer);
     CoreTaskArgs consumer;
     consumer.add_input(out);

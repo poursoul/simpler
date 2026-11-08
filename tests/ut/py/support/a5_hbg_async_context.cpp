@@ -208,6 +208,37 @@ int main(int argc, char **argv) {
         assert(ctx.completion_entries == nullptr);
         assert(data->count == 0);
         assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+    } else if (scenario >= 28 && scenario <= 32) {
+        const bool legacy = scenario == 29;
+        DeferredCompletionSlab slab{};
+        if (legacy) {
+            global.async_present = 0;
+            payload.local_context.async_ctx = LegacyAsyncCtx::make(TaskId::make_global(1), &slab);
+        }
+        auto ctx = get_async_ctx(args);
+        const auto reservation =
+            legacy ? pto2::resident::AsyncReservation{} : pto2::resident::reserve_conditions(ctx.resident, 2);
+        Event event;
+        event.handle = 0;
+        event.count = UINT32_MAX;  // An already-completed event has no records to query.
+        if (scenario == 30) event.postFailed = true;
+        if (scenario == 31) event.engine = pto::comm::DmaEngine::URMA;
+        if (scenario == 32) pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        const bool registered =
+            pto2::detail::register_pto_async_event(ctx, event, Session{}, reservation, 2, SdmaOp::TPUT);
+        assert(registered == (scenario <= 29));
+        assert(*ctx.completion_count == 0);
+        if (scenario <= 29) {
+            assert(*ctx.completion_error_code == 0);
+            if (!legacy) {
+                assert(data->reservation_limit == 0);
+                assert(pto2::resident::seal_conditions(ctx.resident));
+            }
+        } else {
+            assert(*ctx.completion_error_code != 0);
+            assert(!pto2::resident::seal_conditions(ctx.resident));
+            if (scenario == 32) assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        }
     } else return 2;
     return 0;
 }

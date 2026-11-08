@@ -34,11 +34,6 @@
 // <pto/comm/async/sdma/sdma_types.hpp> just to spell their scratch tile.
 inline constexpr uint32_t SDMA_SCRATCH_ALIGNMENT = pto::comm::sdma::UB_ALIGN_SIZE;
 
-enum class SdmaOp : uint8_t {
-    TGET = 0,
-    TPUT = 1,
-};
-
 namespace pto2::detail {
 
 class SdmaSubmissionScope {
@@ -174,7 +169,8 @@ send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, Sc
     } else {
         event = pto::comm::TPUT_ASYNC(desc.dst, desc.src, session);
     }
-    const bool registered = pto2::detail::register_pto_async_event(ctx, event, session, reservation, record_limit);
+    const bool registered =
+        pto2::detail::register_pto_async_event(ctx, event, session, reservation, record_limit, desc.op);
     if (!submission.release(registered, desc.workspace)) {
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;

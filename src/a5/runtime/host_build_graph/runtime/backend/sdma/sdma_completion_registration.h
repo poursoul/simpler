@@ -16,6 +16,11 @@
 
 #include "async_kernel_api.h"
 
+enum class SdmaOp : uint8_t {
+    TGET = 0,
+    TPUT = 1,
+};
+
 namespace pto2::detail {
 
 template <typename GlobalData>
@@ -38,11 +43,23 @@ inline __aicore__ bool flat_transfer_bytes(GlobalData &tensor, uint64_t &bytes) 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ bool register_pto_async_event(
     AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session,
-    const pto2::resident::AsyncReservation &reservation, uint32_t record_limit
+    const pto2::resident::AsyncReservation &reservation, uint32_t record_limit, SdmaOp operation = SdmaOp::TGET
 ) {
-    if (event.postFailed || event.handle == 0 || event.engine != pto::comm::DmaEngine::SDMA) {
+    if (event.postFailed || event.engine != pto::comm::DmaEngine::SDMA ||
+        (operation != SdmaOp::TGET && operation != SdmaOp::TPUT)) {
         defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
+    }
+    if (event.handle == 0) {
+        // A5 TPUT completes through the SDK's synchronous MTE fallback. It
+        // owes no post-done record; nonempty TGET still requires one.
+        if (operation != SdmaOp::TPUT || !async_ctx_is_deferred(ctx) || ctx.completion_count == nullptr ||
+            ctx.completion_entries == nullptr) {
+            defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return false;
+        }
+        if (ctx.completion_error_code != nullptr && *ctx.completion_error_code != 0) return false;
+        return ctx.resident_enabled == 0 || pto2::resident::finish_reservation(ctx.resident, reservation, 0);
     }
     const uint32_t count = event.CompletionRecordCount(session);
     if (count == 0 || count > record_limit) {

@@ -118,6 +118,8 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 
 [sdma_shared_channel](../../../../tests/st/a5/host_build_graph/sdma_shared_channel/test_sdma_shared_channel.py) 使用同 cluster 的两个 AIV，各连续提交 16 次请求；校验 32 个 postId 不重复、每个执行的 16 条登记均保留，以及完整搬运与消费者结果。[notify_defer_wait](../../../../tests/st/a5/host_build_graph/notify_defer_wait/test_notify_defer_wait.py) 复用共享 A2/A3 场景的 remote-store、发布、notify 顺序，覆盖两/四 rank、全部其他 peer 的独立数据与 counter、C−1/C/C+1 个 waiter 后提交独立 publisher。
 
+[mixed_async_completion](../../../../tests/st/a5/host_build_graph/mixed_async_completion/test_mixed_async_completion.py) 在两/四 rank 上交错登记每个 peer 的真实 SDMA 记录与 COUNTER，覆盖普通 AIV、两 block SPMD/sync-start 和 MIX 3/5/6/7；MIX 的 AIC 成员只登记 COUNTER。延迟通知先等待全部登记和 peer 就绪握手，再发布独立的通知 payload。另以已满足的 COUNTER 配合 4 MiB SDMA 验证普通与 Graph AIV 路径。两个 Graph 实例复用同一 Definition、绑定不同 view；publisher 位于 Graph 外，消费者仅依赖 producer 或 Graph EXIT。诊断关闭/开启分别运行，校验全部搬运结果、通知数据、登记数、保护区及 domain 回读；真实 native 记录须确认实例身份与完成、EXIT 依赖顺序。
+
 优先复用 a2a3 已有多卡异步通信场景的 DAG、通信顺序和 golden，再适配 A5 HBG resident。以下入口提供可复用的业务语义，其原有 runtime 或平台测试结果不构成新 resident 路径资格：
 
 | 现有入口 | 可复用内容 | A5 HBG 适配要求 |

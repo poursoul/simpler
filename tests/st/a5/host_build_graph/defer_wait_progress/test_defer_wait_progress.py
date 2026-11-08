@@ -24,7 +24,7 @@ class TestDeferWaitProgress(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/defer_wait_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.INOUT, D.IN],
+            "signature": [D.INOUT, D.IN, D.IN],
         },
         "incores": [
             {
@@ -39,12 +39,19 @@ class TestDeferWaitProgress(SceneTestCase):
         {"name": "c_minus_one", "platforms": ["a5sim", "a5"], "params": {"delta": -1}},
         {"name": "c", "platforms": ["a5sim", "a5"], "params": {"delta": 0}},
         {"name": "c_plus_one", "platforms": ["a5sim", "a5"], "params": {"delta": 1}},
+        {"name": "negative_signal", "platforms": ["a5sim", "a5"], "params": {"delta": 1, "initial": -1}},
+        {
+            "name": "minimum_signal",
+            "platforms": ["a5sim", "a5"],
+            "params": {"delta": 1, "initial": -(2**31)},
+        },
     ]
 
     def generate_args(self, params):
         return TaskArgsBuilder(
             TensorArg("out", torch.zeros(96, dtype=torch.int32)),
             Scalar("delta", params["delta"]),
+            Scalar("initial", params.get("initial", 0)),
         )
 
     def compute_golden(self, args, params):

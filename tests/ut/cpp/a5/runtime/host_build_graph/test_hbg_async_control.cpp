@@ -518,15 +518,62 @@ TEST(HbgAsyncControl, FinishMigratesWithAnUnpublishedBatchAndCountsOnlyAfterDrai
     }
 }
 
+TEST(HbgAsyncControl, SignedCounterBoundariesRemainPendingBelowTheThreshold) {
+    alignas(128) std::array<uint32_t, 32> words{};
+    words[0] = 0x12345678;
+    words[2] = 0x87654321;
+    for (uint32_t value : {UINT32_C(0x80000000), UINT32_MAX, 0u, 1u, static_cast<uint32_t>(INT32_MAX)}) {
+        words[1] = value;
+        for (uint32_t expected : {0u, 1u, static_cast<uint32_t>(INT32_MAX)}) {
+            const CompletionToken token{
+                reinterpret_cast<uint64_t>(&words[1]), expected, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+            };
+            for (uint32_t observer_mask : {1u, 2u, 3u}) {
+                const auto observed = SchedulerAsyncCompletionObserver{}(token, observer_mask);
+                const bool ready = value <= INT32_MAX && value >= expected;
+                EXPECT_EQ(observed.state, ready ? CompletionPollState::READY : CompletionPollState::PENDING);
+                EXPECT_EQ(observed.error_code, 0);
+                EXPECT_EQ(words[1], value);
+                EXPECT_EQ(words[0], 0x12345678u);
+                EXPECT_EQ(words[2], 0x87654321u);
+            }
+        }
+    }
+}
+
+TEST(HbgAsyncControl, NegativeCounterHandsOffUntilPublicationWithoutFailingTheRun) {
+    AsyncFixture f(1);
+    f.signal[0] = UINT32_MAX;  // INT32 -1 is below the supported threshold zero.
+    const auto writer = f.start();
+    f.register_counter(writer, 0);
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
+    ASSERT_TRUE(f.close());
+    for (uint32_t worker : {1u, 2u, 0u}) {
+        bool progress = false;
+        ASSERT_TRUE(scheduler_async_check_step(f.workers[worker], 1, 8, SchedulerAsyncCompletionObserver{}, progress));
+        EXPECT_FALSE(progress);
+        EXPECT_EQ(f.workers[worker].error_code, 0);
+        EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::RUNNABLE);
+        EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
+        EXPECT_EQ(f.finish_lease().word, kUnused);
+    }
+    f.signal[0] = 0;
+    EXPECT_TRUE(f.check(2));
+    EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
+    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
+    EXPECT_EQ(f.signal[0], 0u);
+}
+
 TEST(HbgAsyncControl, InvalidCounterAndMalformedRecordFailWithoutNormalCompletion) {
     for (uint32_t mode = 0; mode < 2; ++mode) {
         AsyncFixture f(1);
         const auto writer = f.start();
         f.register_counter(writer);
-        if (mode == 0) f.signal[0] = UINT32_MAX;
-        else
-            scheduler_state_at<DeferredCompletionEntry>(f.base(), pto2::resident::detail::group(writer)->entries_offset)
-                ->backend_cookie = 1;
+        auto *entry = scheduler_state_at<DeferredCompletionEntry>(
+            f.base(), pto2::resident::detail::group(writer)->entries_offset
+        );
+        if (mode == 0) entry->expected_value = UINT32_MAX;
+        else entry->backend_cookie = 1;
         ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
         bool progress = false;
         EXPECT_FALSE(scheduler_async_check_step(f.workers[1], 2, 8, SchedulerAsyncCompletionObserver{}, progress));
@@ -592,7 +639,9 @@ TEST(HbgAsyncControl, ObserverFailureLatchesRunErrorAndOtherCoresCannotFinishNor
     f.register_counter(writer);
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0));
     ASSERT_TRUE(f.close());
-    f.signal[0] = UINT32_MAX;
+    auto *entry =
+        scheduler_state_at<DeferredCompletionEntry>(f.base(), pto2::resident::detail::group(writer)->entries_offset);
+    entry->expected_value = UINT32_MAX;
     bool progress = false;
     EXPECT_FALSE(
         scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, 0, progress)

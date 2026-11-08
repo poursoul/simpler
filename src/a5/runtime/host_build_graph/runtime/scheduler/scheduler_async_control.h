@@ -400,7 +400,9 @@ struct SchedulerAsyncCompletionObserver {
 #else
         const uint32_t value = __atomic_load_n(counter, __ATOMIC_ACQUIRE);
 #endif
-        if (value > INT32_MAX) return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+        // COUNTER is INT32. A negative sample is below every supported
+        // nonnegative threshold; it is neither completion nor malformed data.
+        if (value > INT32_MAX) return {CompletionPollState::PENDING, 0};
         return {value >= token.expected_value ? CompletionPollState::READY : CompletionPollState::PENDING, 0};
     }
 };

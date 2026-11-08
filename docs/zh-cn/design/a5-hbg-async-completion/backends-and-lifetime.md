@@ -4,7 +4,7 @@
 
 ## 1. 条件观察
 
-COUNTER 为 INT32 单调通知，expected 在 `[0, INT32_MAX]`。观察使用合法对齐的精确 32-bit device load，不清零通知，不用 atomic-add-zero 读取外部地址。一次检查返回 READY/PENDING/FAILED，内部不循环等待。
+COUNTER 为 INT32 单调通知，expected 在 `[0, INT32_MAX]`，比较遵循有符号 `value >= expected`。负的当前值（包括 `INT32_MIN`、`-1`）表示尚未满足，返回 PENDING；不得当作无符号大值提前完成，也不得把合法负初值当作坏记录。非法 expected、类型或对齐仍拒绝。观察使用合法对齐的精确 32-bit device load，不清零通知，不用 atomic-add-zero 读取外部地址。一次检查返回 READY/PENDING/FAILED，内部不循环等待。
 
 SDMA 使用当前 SDK 公共完成记录 API 返回的 post-done 地址和完整 post id。复用已有 session、postId 延续及内部槽复用保护，不解析私有 SQ 布局、不自行清零共享完成记录。workspace 完整范围采用公共 `kSdmaWorkspaceBytes`，但 allocation 范围不代表其中每个地址都是完成记录。
 

@@ -15,7 +15,7 @@
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 2};
+    return OrchestrationConfig{.expected_arg_count = 3};
 }
 
 extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
@@ -30,7 +30,7 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     CoreTaskArgs initialize;
     initialize.add_output(state_info);
     initialize.add_no_dep(out);
-    initialize.add_scalar(0, 0, waiters);
+    initialize.add_scalar(0, args.scalar<int64_t>(1), waiters);
     const auto initialized = rt_submit_aiv_task(0, initialize);
     const auto state = initialized.get_ref(0);
     const TaskId init = initialized.task_id();

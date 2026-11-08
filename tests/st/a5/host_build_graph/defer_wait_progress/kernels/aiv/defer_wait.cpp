@@ -71,6 +71,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     if (role == 0) {
         for (int32_t i = 0; i < 2 * waiters + 3 + chunks; ++i)
             write_word(state + i * kLineWords, 0);
+        write_word(state, index);
     } else if (role == 1) {
         auto ctx = get_async_ctx(args);
         write_word(state + (index + 1) * kLineWords, 1);

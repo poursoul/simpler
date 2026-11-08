@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> backing(plan.total_bytes + 127);
     auto *image = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(backing.data()) + 127) & ~uintptr_t(127));
     assert(initialize_async_completion(image, plan.total_bytes, plan));
-    auto *data = scheduler_state_at<pto2::resident::AsyncGroupData>(image, plan.groups[0].offset);
+    auto *data = scheduler_state_at<pto2::resident::AsyncGroupData>(image, plan.layout.groups_offset);
     DispatchPayload payload{};
     static_assert(sizeof(DispatchPayload) == 512 && offsetof(DispatchPayload, args) == 64);
     static_assert(offsetof(DispatchPayload, global_context) == 464 && sizeof(LocalContext) == 48);
@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
     global.async_image_address = reinterpret_cast<uint64_t>(image);
     global.async_image_bytes = plan.total_bytes;
     global.async_run_epoch = 9;
-    global.async_group_offset = plan.groups[0].offset;
+    global.async_group_offset = plan.layout.groups_offset;
     global.async_group_index = 0;
     auto *args = reinterpret_cast<int64_t *>(payload.args);
     const CompletionToken token{0x10000, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
@@ -202,7 +202,7 @@ int main(int argc, char **argv) {
         assert(!pto2::resident::seal_conditions(ctx.resident));
     } else if (scenario == 26 || scenario == 27) {
         if (scenario == 26) data->entries_bytes += sizeof(*data);
-        else data->entries_offset = plan.groups[0].offset;
+        else data->entries_offset = plan.layout.groups_offset;
         auto ctx = get_async_ctx(args);
         assert(!async_ctx_is_deferred(ctx));
         assert(ctx.completion_entries == nullptr);

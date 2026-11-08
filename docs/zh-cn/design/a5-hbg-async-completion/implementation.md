@@ -16,6 +16,8 @@
 
 公共 Host 注册、ChipWorker 参数传输、A2/A3、TMR、TensorData 和 Graph Definition 不因 resident defer_wait 增加新协议。共享问题只有在目标用例证明已有路径不足时才单独修复。
 
+Host 临时计划按逻辑 task 保存设备任务描述、条件区起点、每 block 的条件区步长和三个 lane 的容量。规划以 checked arithmetic 计算完整图像边界，初始化时才展开 block/lane，写入连续的固定 group header。临时描述数量随逻辑 task 数增长；设备记录数量仍随物理执行数增长，记录顺序、offset、容量、初始化前缀和上传范围保持既定布局。初始化不能触及尚未公开的 token/进度后缀。
+
 ## 2. 首个闭环
 
 1. waiter 通过既有 helper 登记 COUNTER 后正常返回。

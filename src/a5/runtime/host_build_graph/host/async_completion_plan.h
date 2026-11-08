@@ -25,16 +25,12 @@ struct AsyncTaskPlanInput {
     std::array<uint16_t, 3> capacities{MAX_COMPLETIONS_PER_TASK, MAX_COMPLETIONS_PER_TASK, MAX_COMPLETIONS_PER_TASK};
 };
 
-struct AsyncGroupHostPlan {
-    uint64_t offset;
-    uint64_t entries_offset;
-    uint32_t task_index;
-    uint16_t block_index;
-    uint8_t subtask_slot;
-    uint8_t capacity;
+struct AsyncTaskHostPlan {
+    SchedulerAsyncTaskData data;
+    uint64_t entries_offset{0};
+    uint32_t block_entry_bytes{0};
+    std::array<uint16_t, 3> capacities{};
 };
-
-static_assert(sizeof(AsyncGroupHostPlan) == 24);
 
 struct AsyncCompletionHostPlan {
     uint64_t begin_offset{0};
@@ -42,8 +38,7 @@ struct AsyncCompletionHostPlan {
     uint64_t total_bytes{0};
     uint64_t initialized_bytes{0};
     SchedulerAsyncLayout layout{};
-    std::vector<SchedulerAsyncTaskData> tasks;
-    std::vector<AsyncGroupHostPlan> groups;
+    std::vector<AsyncTaskHostPlan> tasks;
 };
 
 // Inputs already refer to the expanded resident task namespace. The run epoch

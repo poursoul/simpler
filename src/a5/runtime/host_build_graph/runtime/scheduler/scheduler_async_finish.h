@@ -92,10 +92,12 @@ inline __aicore__ bool scheduler_service_async_slice(
 ) {
     made_progress = false;
     if (local->async == nullptr) return true;
-    if (scheduler_read_error(run) != 0) return false;
     auto &async = *local->async;
     async.business_returns = 0;
+    // An inactive slice owns no shared work. The resident loop still polls
+    // run errors; an active slice checks them before claiming any responsibility.
     if (async.error_code == 0 && !scheduler_async_work_activated(&async)) return true;
+    if (scheduler_read_error(run) != 0) return false;
     const bool finish = async.finish_first;
     async.finish_first = !finish;
     const bool ok =

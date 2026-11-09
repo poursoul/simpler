@@ -289,12 +289,13 @@ scheduler_async_has_registered_groups(SchedulerAsyncLocalState *local, int64_t t
 }
 
 inline __aicore__ bool scheduler_async_begin_execution(
-    SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane, __gm__ GlobalContext &global
+    SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane, __gm__ GlobalContext &global,
+    pto2::resident::AsyncWriter &writer
 ) {
     using namespace scheduler_async_detail;
+    writer = AsyncWriter{};
     if (local == nullptr) return true;
     global.async_present = 0;
-    AsyncWriter writer{};
     if (!scheduler_async_map_execution(*local, task_ref, block, lane, writer)) return false;
     if (writer.image == nullptr) return true;
     global.async_image_address = reinterpret_cast<uint64_t>(writer.image);
@@ -307,14 +308,20 @@ inline __aicore__ bool scheduler_async_begin_execution(
     return true;
 }
 
-inline __aicore__ bool
-scheduler_async_seal_execution(SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane) {
+inline __aicore__ bool scheduler_async_seal_execution(
+    SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane,
+    const pto2::resident::AsyncWriter &writer
+) {
     using namespace scheduler_async_detail;
     if (local == nullptr) return true;
-    AsyncWriter writer{};
-    // The returning kernel owns dirty count/entry lines until this seal publishes them.
-    if (!scheduler_async_map_execution(*local, task_ref, block, lane, writer)) return false;
+    // The executing core keeps this binding across the kernel call. Mutable
+    // registration state and the group's identity are still checked on return.
     if (writer.image == nullptr) return true;
+    if (writer.image != local->base || writer.image_bytes != local->bytes ||
+        writer.run_epoch != local->layout->run_epoch || writer.group_index >= local->layout->group_count ||
+        writer.group_offset !=
+            local->layout->groups_offset + static_cast<uint64_t>(writer.group_index) * sizeof(AsyncGroupData))
+        return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     auto *data = pto2::resident::detail::group(writer);
     if (data == nullptr || data->task_ref != task_ref || data->block_index != block || data->subtask_slot != lane)
         return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);

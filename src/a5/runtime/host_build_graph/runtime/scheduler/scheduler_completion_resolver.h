@@ -42,7 +42,10 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
     const bool timing = scheduler_phase_timing_enabled(profiling_level);
     if (timing && local->profiling == nullptr) return fail();
     while (used < budget) {
-        if (scheduler_read_error(run) != 0) {
+        // Check at successor and publication boundaries; local cursor-only
+        // transitions retain the error observation made at this slice's entry.
+        if ((cursor.phase == SchedulerResolvePhase::SELECT || cursor.phase == SchedulerResolvePhase::PUBLISH) &&
+            scheduler_read_error(run) != 0) {
             cursor.phase = SchedulerResolvePhase::FAILED;
             return {SchedulerResolveResult::ERROR, used};
         }

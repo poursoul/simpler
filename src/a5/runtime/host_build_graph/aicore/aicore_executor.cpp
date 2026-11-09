@@ -545,8 +545,10 @@ __aicore__ bool run_ready_dispatch_loop(
             // another core's completion observation cannot invalidate this cache.
             if (payload->function_bin_addr != 0 && scheduler_async_work_activated(context->async))
                 scheduler_observe_data_cache(payload);
+            pto2::resident::AsyncWriter execution_writer{};
             if (!scheduler_async_begin_execution(
-                    context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, payload->global_context
+                    context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, payload->global_context,
+                    execution_writer
                 )) {
                 scheduler_record_error(
                     run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
@@ -574,8 +576,9 @@ __aicore__ bool run_ready_dispatch_loop(
             uint64_t kernel_end = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
             if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;
-            if (!scheduler_async_seal_execution(
-                    context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot
+            if (local_slot->generation != ready_generation ||
+                !scheduler_async_seal_execution(
+                    context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, execution_writer
                 )) {
                 scheduler_record_error(
                     run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,

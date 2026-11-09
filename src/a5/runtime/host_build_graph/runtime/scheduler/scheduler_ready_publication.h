@@ -91,9 +91,7 @@ inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
     const bool pool_backed = !control && local->config.ready_pool_offset != 0;
     const auto *pool =
         pool_backed ? scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset) : nullptr;
-    if (pool_backed &&
-        (publication.target >= pool->group_counts[publication.type] || pool->kind > SchedulerReadyPoolKind::CHUNK))
-        return fail();
+    if (pool_backed && publication.target >= pool->group_counts[publication.type]) return fail();
 
     if (!pool_backed) {
         const uint64_t expected_offset =
@@ -115,25 +113,14 @@ inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
             if (!scheduler_task_ref_valid(graph, publication.refs[index])) return fail();
         if (pool_backed) {
             const uint32_t queue_index = pool->queue_begins[publication.type] + publication.target;
-            if (pool->kind == SchedulerReadyPoolKind::TICKET) {
-                const auto queue = scheduler_ready_pool_queue(base, *pool, queue_index);
-                SchedulerTicketRange range{};
-                if (scheduler_ticket_reserve(queue, publication.count, &range) != SchedulerTicketResult::SUCCESS ||
-                    scheduler_ticket_publish(queue, range, publication.refs) != SchedulerTicketResult::SUCCESS)
-                    return fail();
-                publication.phase = SchedulerReadyPublishPhase::DONE;
-                if (stats != nullptr) ++stats->batch_count;
-                return SchedulerReadyPublishResult::DONE;
-            }
-            const auto queue = scheduler_ready_pool_linked_queue(base, *pool, queue_index);
-            const auto result =
-                pool->kind == SchedulerReadyPoolKind::CHUNK ?
-                    scheduler_chunk_prepare(
-                        scheduler_ready_pool_chunk_queue(base, *pool, queue_index), publication.refs, publication.count,
-                        &publication.pending
-                    ) :
-                    scheduler_linked_prepare(queue, publication.refs, publication.count, &publication.pending);
-            if (result != SchedulerLinkedResult::SUCCESS) return fail();
+            const auto queue = scheduler_ready_pool_queue(base, *pool, queue_index);
+            SchedulerTicketRange range{};
+            if (scheduler_ticket_reserve(queue, publication.count, &range) != SchedulerTicketResult::SUCCESS ||
+                scheduler_ticket_publish(queue, range, publication.refs) != SchedulerTicketResult::SUCCESS)
+                return fail();
+            publication.phase = SchedulerReadyPublishPhase::DONE;
+            if (stats != nullptr) ++stats->batch_count;
+            return SchedulerReadyPublishResult::DONE;
         } else {
             for (uint32_t index = 0; index < publication.count; ++index) {
                 auto *task = scheduler_task_control_at(base, local, publication.refs[index]);
@@ -148,21 +135,7 @@ inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
         return SchedulerReadyPublishResult::YIELD;
     }
     if (publication.phase == SchedulerReadyPublishPhase::PREPARED) {
-        if (pool_backed) {
-            if (pool->kind == SchedulerReadyPoolKind::TICKET) return fail();
-            const auto queue = scheduler_ready_pool_linked_queue(
-                base, *pool, pool->queue_begins[publication.type] + publication.target
-            );
-            const auto result = scheduler_linked_try_push(queue, &publication.pending, 1);
-            if (result == SchedulerLinkedResult::RETRY) {
-                if (stats != nullptr) ++stats->contention_giveup_count;
-                return SchedulerReadyPublishResult::YIELD;
-            }
-            if (result != SchedulerLinkedResult::SUCCESS) return fail();
-            publication.phase = SchedulerReadyPublishPhase::DONE;
-            if (stats != nullptr) ++stats->batch_count;
-            return SchedulerReadyPublishResult::DONE;
-        }
+        if (pool_backed) return fail();
         auto *inbox = scheduler_state_at<SchedulerReadyInbox>(base, publication.inbox_offset);
         const uint64_t packed = scheduler_gm_fetch_add(inbox->endpoints, UINT64_C(0));
         if (!scheduler_ready_endpoints_consistent(packed)) return fail();

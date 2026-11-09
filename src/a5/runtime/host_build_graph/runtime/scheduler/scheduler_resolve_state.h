@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "scheduler_linked_queue.h"
+#include "scheduler_types.h"
 
 enum class SchedulerRouteResult : uint64_t {
     READY_TO_ENQUEUE = 1,
@@ -51,11 +51,10 @@ enum class SchedulerReadyPublishResult : uint8_t { DONE, YIELD, ERROR };
 inline constexpr uint32_t SCHEDULER_READY_PUBLICATION_CAPACITY = 8;
 inline constexpr uint32_t SCHEDULER_CONTROL_PUBLICATION_QUEUE = SCHEDULER_READY_QUEUE_COUNT;
 
-// The resolver owns this entire record, including a linked pool's unpublished
-// batch. No part of its continuation belongs to SchedulerLocalState.
+// The resolver owns this entire record. No part of its continuation belongs
+// to SchedulerLocalState.
 struct SchedulerReadyPublication {
     int64_t refs[SCHEDULER_READY_PUBLICATION_CAPACITY]{};
-    SchedulerLinkedBatch pending{};
     uint64_t inbox_offset{0};
     uint32_t count{0};
     uint32_t type{UINT32_MAX};
@@ -63,11 +62,9 @@ struct SchedulerReadyPublication {
     SchedulerReadyPublishPhase phase{SchedulerReadyPublishPhase::COLLECTING};
 };
 
-static_assert(sizeof(SchedulerReadyPublication) == 112 && alignof(SchedulerReadyPublication) == 8);
-static_assert(
-    offsetof(SchedulerReadyPublication, pending) == 64 && offsetof(SchedulerReadyPublication, inbox_offset) == 88
-);
-static_assert(offsetof(SchedulerReadyPublication, count) == 96 && offsetof(SchedulerReadyPublication, phase) == 108);
+static_assert(sizeof(SchedulerReadyPublication) == 88 && alignof(SchedulerReadyPublication) == 8);
+static_assert(offsetof(SchedulerReadyPublication, inbox_offset) == 64);
+static_assert(offsetof(SchedulerReadyPublication, count) == 72 && offsetof(SchedulerReadyPublication, phase) == 84);
 static_assert(
     std::is_standard_layout_v<SchedulerReadyPublication> && std::is_trivially_copyable_v<SchedulerReadyPublication>
 );
@@ -91,9 +88,9 @@ struct SchedulerResolveProgress {
     uint32_t work_units;
 };
 
-static_assert(sizeof(SchedulerResolveCursor) == 184 && alignof(SchedulerResolveCursor) == 8);
+static_assert(sizeof(SchedulerResolveCursor) == 160 && alignof(SchedulerResolveCursor) == 8);
 static_assert(offsetof(SchedulerResolveCursor, route) == 32 && offsetof(SchedulerResolveCursor, publication) == 64);
-static_assert(offsetof(SchedulerResolveCursor, phase) == 176);
+static_assert(offsetof(SchedulerResolveCursor, phase) == 152);
 static_assert(
     std::is_standard_layout_v<SchedulerResolveCursor> && std::is_trivially_copyable_v<SchedulerResolveCursor>
 );

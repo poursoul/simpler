@@ -67,9 +67,7 @@ inline __aicore__ bool scheduler_async_finish_step(
     made_progress = cursor.phase != before.phase || cursor.visited_count != before.visited_count ||
                     cursor.route.next_fanin != before.route.next_fanin ||
                     cursor.publication.phase != before.publication.phase ||
-                    cursor.publication.count != before.publication.count ||
-                    cursor.publication.pending.first != before.publication.pending.first ||
-                    cursor.publication.pending.last != before.publication.pending.last;
+                    cursor.publication.count != before.publication.count;
     if (result.result == SchedulerResolveResult::YIELD)
         return scheduler_async_lease_release(leases[index], owned).result == SchedulerAsyncLeaseResult::SUCCESS ||
                failed();

@@ -75,9 +75,6 @@ inline __aicore__ void scheduler_async_copy_resolver(Destination &destination, c
     destination.route.next_fanin = source.route.next_fanin;
     destination.route.fanin_count = source.route.fanin_count;
     destination.route.result = source.route.result;
-    destination.publication.pending.first = source.publication.pending.first;
-    destination.publication.pending.last = source.publication.pending.last;
-    destination.publication.pending.count = source.publication.pending.count;
     destination.publication.inbox_offset = source.publication.inbox_offset;
     destination.publication.count = source.publication.count;
     destination.publication.type = source.publication.type;

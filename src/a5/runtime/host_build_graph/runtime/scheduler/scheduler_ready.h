@@ -377,7 +377,6 @@ struct SchedulerLocalState {
     uint8_t local_ready_mask{0};
     uint8_t owner_ready_queue_mask{0};
     uint8_t pool_poll_counts[SCHEDULER_READY_QUEUE_COUNT]{};
-    SchedulerLinkedBatch pending_publications[SCHEDULER_READY_QUEUE_COUNT]{};
 };
 
 static_assert(SCHEDULER_WORKER_CAPACITY < UINT16_MAX, "worker IDs must fit the local config");
@@ -388,7 +387,7 @@ static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 144, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 808, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 712, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 248, "64-bit local profiling size changed"
 );
@@ -1267,47 +1266,6 @@ inline __aicore__ bool scheduler_ready_batch_push_queue(
     return false;
 }
 
-inline __aicore__ bool scheduler_ready_pool_has_pending(const SchedulerLocalState *local) {
-    for (const auto &pending : local->pending_publications)
-        if (pending.count != 0) return true;
-    return false;
-}
-
-inline __aicore__ bool scheduler_ready_pool_flush_pending(
-    __gm__ void *base, SchedulerLocalState *local, uint32_t type, SchedulerReadyStats *stats, uint32_t retry_budget = 2
-) {
-    auto &pending = local->pending_publications[type];
-    if (pending.count == 0) return true;
-    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
-    const auto queue = scheduler_ready_pool_linked_queue(base, pool, pool.queue_begins[type]);
-    const auto result = scheduler_linked_try_push(queue, &pending, retry_budget);
-    if (result == SchedulerLinkedResult::SUCCESS) {
-        if (stats != nullptr) ++stats->batch_count;
-        return true;
-    }
-    if (result == SchedulerLinkedResult::RETRY) {
-        if (stats != nullptr) ++stats->contention_giveup_count;
-        return true;
-    }
-    return false;
-}
-
-// Private publications survive bootstrap and completion calls in local state.
-// A run error leaves them private until the existing exit fence retires backing.
-inline __aicore__ bool scheduler_ready_pool_service_pending(
-    __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, SchedulerReadyStats *stats,
-    bool *progress, uint32_t retry_budget = 2
-) {
-    if (progress != nullptr) *progress = false;
-    if (!scheduler_ready_pool_has_pending(local) || scheduler_read_error(run) != 0) return true;
-    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
-        const uint32_t before = local->pending_publications[type].count;
-        if (!scheduler_ready_pool_flush_pending(base, local, type, stats, retry_budget)) return false;
-        if (progress != nullptr && before != local->pending_publications[type].count) *progress = true;
-    }
-    return true;
-}
-
 inline __aicore__ bool scheduler_ready_pool_push_batch(
     __gm__ void *base, SchedulerLocalState *local, uint32_t type, SchedulerReadyBatch *batch, SchedulerReadyStats *stats
 ) {
@@ -1334,30 +1292,15 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
             current = next;
         } while (remaining != 0 && count < 8 && current >= 0 &&
                  scheduler_ready_pool_ref_group(current, pool.group_counts[type]) == group);
-        if (pool.kind != SchedulerReadyPoolKind::TICKET) {
-            const auto queue = scheduler_ready_pool_linked_queue(base, pool, pool.queue_begins[type]);
-            SchedulerLinkedBatch prepared{};
-            const auto result =
-                pool.kind == SchedulerReadyPoolKind::CHUNK ?
-                    scheduler_chunk_prepare(
-                        scheduler_ready_pool_chunk_queue(base, pool, pool.queue_begins[type]), refs, count, &prepared
-                    ) :
-                    scheduler_linked_prepare(queue, refs, count, &prepared);
-            if (result != SchedulerLinkedResult::SUCCESS ||
-                scheduler_linked_append_private(queue, &local->pending_publications[type], &prepared) !=
-                    SchedulerLinkedResult::SUCCESS)
-                return false;
-        } else {
-            const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
-            SchedulerTicketRange range{};
-            if (scheduler_ticket_reserve(queue, count, &range) != SchedulerTicketResult::SUCCESS ||
-                scheduler_ticket_publish(queue, range, refs) != SchedulerTicketResult::SUCCESS)
-                return false;
-            if (stats != nullptr) ++stats->batch_count;
-        }
+        const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
+        SchedulerTicketRange range{};
+        if (scheduler_ticket_reserve(queue, count, &range) != SchedulerTicketResult::SUCCESS ||
+            scheduler_ticket_publish(queue, range, refs) != SchedulerTicketResult::SUCCESS)
+            return false;
+        if (stats != nullptr) ++stats->batch_count;
     }
     scheduler_ready_batch_reset(batch);
-    return pool.kind == SchedulerReadyPoolKind::TICKET || scheduler_ready_pool_flush_pending(base, local, type, stats);
+    return true;
 }
 
 inline __aicore__ bool scheduler_ready_batch_push(
@@ -1589,98 +1532,14 @@ inline __aicore__ bool scheduler_steal_ready_from_shard(
     return true;
 }
 
-inline __aicore__ bool scheduler_ready_pool_claim_linked(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    const __gm__ SchedulerReadyPoolHeader &pool, uint32_t type, SchedulerReadyStats *stats, SchedulerReadyClaim *claim,
-    SchedulerMixPlacement *placement
-) {
-    *claim = {};
-    const auto queue = scheduler_ready_pool_linked_queue(base, pool, pool.queue_begins[type]);
-    for (uint32_t attempt = 0; attempt < 2; ++attempt) {
-        const int64_t head = scheduler_gm_query(queue.control->head);
-        if (!scheduler_linked_cursor_valid(queue, head)) break;
-        const int64_t ref = scheduler_gm_query(queue.links[head]);
-        if (ref == SCHEDULER_TASK_REF_INVALID) return true;
-        if (!scheduler_task_ref_valid(graph, ref) || ref == head) break;
-        if (placement != nullptr && !scheduler_plan_mix_placement(base, local, ref, placement)) return true;
-        if (scheduler_gm_compare_exchange(queue.control->head, head, ref) == head) {
-            scheduler_cache_barrier();
-            claim->task_ref = ref;
-            claim->inbox_index = 0;
-            if (stats != nullptr) ++stats->pop_count;
-            return true;
-        }
-        if (stats != nullptr) ++stats->cas_retry_count;
-        if (attempt == 1) {
-            if (stats != nullptr) ++stats->contention_giveup_count;
-            return true;
-        }
-    }
-    scheduler_record_error(
-        run, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
-        SchedulerErrorSite::READY_POP_INVALID_HEAD
-    );
-    return false;
-}
-
-inline __aicore__ bool scheduler_ready_pool_claim_chunk(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    const __gm__ SchedulerReadyPoolHeader &pool, uint32_t type, SchedulerReadyStats *stats, SchedulerReadyClaim *claim,
-    SchedulerMixPlacement *placement
-) {
-    *claim = {};
-    const auto queue = scheduler_ready_pool_chunk_queue(base, pool, pool.queue_begins[type]);
-    int64_t window[4]{};
-    uint32_t visible = 0;
-    auto result = scheduler_chunk_window(queue, window, &visible, 8, pool.chunk_window);
-    if (result == SchedulerLinkedResult::INVALID) {
-        scheduler_record_error(
-            run, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
-            SchedulerErrorSite::READY_POP_INVALID_HEAD
-        );
-        return false;
-    }
-    if (result != SchedulerLinkedResult::SUCCESS) return true;
-    const uint32_t poll = ++local->pool_poll_counts[type];
-    const uint32_t preferred = (poll & 3U) == 0 ? 0 : static_cast<uint32_t>((local->self_type_rank() + poll) % visible);
-    for (uint32_t step = 0; step < visible; ++step) {
-        SchedulerChunkCandidate candidate{};
-        result = scheduler_chunk_peek(queue, window[(preferred + step) % visible], &candidate);
-        if (result == SchedulerLinkedResult::INVALID) break;
-        if (result != SchedulerLinkedResult::SUCCESS) continue;
-        if (placement != nullptr && !scheduler_plan_mix_placement(base, local, candidate.task_ref, placement)) continue;
-        int64_t refs[1]{};
-        uint32_t count = 0;
-        result = scheduler_chunk_try_claim(queue, candidate, 1, refs, &count);
-        if (result == SchedulerLinkedResult::INVALID) break;
-        if (result == SchedulerLinkedResult::SUCCESS) {
-            claim->task_ref = refs[0];
-            claim->inbox_index = 0;
-            if (stats != nullptr) ++stats->pop_count;
-            return true;
-        }
-        if (stats != nullptr && result == SchedulerLinkedResult::RETRY) ++stats->cas_retry_count;
-    }
-    if (result != SchedulerLinkedResult::INVALID) return true;
-    scheduler_record_error(
-        run, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
-        SchedulerErrorSite::READY_POP_INVALID_HEAD
-    );
-    return false;
-}
-
 inline __aicore__ bool scheduler_ready_pool_claim(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t type, uint64_t *cursor, SchedulerReadyStats *stats, SchedulerReadyClaim *claim,
     SchedulerMixPlacement *placement
 ) {
     const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
-    if (pool.kind == SchedulerReadyPoolKind::CHUNK)
-        return scheduler_ready_pool_claim_chunk(graph, base, local, run, pool, type, stats, claim, placement);
-    if (pool.kind == SchedulerReadyPoolKind::LINKED)
-        return scheduler_ready_pool_claim_linked(graph, base, local, run, pool, type, stats, claim, placement);
     const uint32_t groups = pool.group_counts[type];
-    const uint32_t own = pool.group_width == 0 ? 0 : static_cast<uint32_t>(local->self_type_rank()) / pool.group_width;
+    const uint32_t own = static_cast<uint32_t>(local->self_type_rank()) / SCHEDULER_READY_POOL_GROUP_WIDTH;
     if (own >= groups) return false;
     *claim = {};
     // Every fourth search starts remotely even when local work stays ready.
@@ -1756,23 +1615,6 @@ inline __aicore__ bool scheduler_ready_pool_claim(
 inline __aicore__ bool
 scheduler_ready_pool_may_have_work(__gm__ void *base, const SchedulerLocalState *local, uint32_t type) {
     const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
-    if (pool.kind == SchedulerReadyPoolKind::CHUNK) {
-        const auto queue = scheduler_ready_pool_chunk_queue(base, pool, pool.queue_begins[type]);
-        const int64_t head = scheduler_gm_query(queue.chain.control->head);
-        if (!scheduler_linked_cursor_valid(queue.chain, head)) return true;
-        if (head != queue.chain.sentinel) {
-            const auto size = scheduler_gm_query(queue.chunks[head].count);
-            const auto position = scheduler_gm_query(queue.chunks[head].cursor);
-            if (size > 8 || position != size) return true;
-        }
-        return scheduler_gm_query(queue.chain.links[head]) != SCHEDULER_TASK_REF_INVALID;
-    }
-    if (pool.kind == SchedulerReadyPoolKind::LINKED) {
-        const auto queue = scheduler_ready_pool_linked_queue(base, pool, pool.queue_begins[type]);
-        const int64_t head = scheduler_gm_query(queue.control->head);
-        return !scheduler_linked_cursor_valid(queue, head) ||
-               scheduler_gm_query(queue.links[head]) != SCHEDULER_TASK_REF_INVALID;
-    }
     for (uint32_t group = 0; group < pool.group_counts[type]; ++group) {
         const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
         const uint64_t head = scheduler_gm_query(queue.control->head);

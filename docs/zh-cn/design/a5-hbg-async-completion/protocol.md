@@ -111,7 +111,7 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 退出/错误检查
   → 完成回收、Graph control、已有 ready 发布
   → 异步安全服务门
-  → 无私有发布积压时推进既有候选与 cohort 汇合
+  → 推进既有候选与 cohort 汇合
   → 按既有规则尝试最终业务 admission
   → 已获许可则直接执行 kernel；否则返回未获许可的服务循环
 ```

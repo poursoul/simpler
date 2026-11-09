@@ -1566,13 +1566,9 @@ bool create_scheduler_state(
     }
     // Zero gives one queue per type; four and eight bound the preferred
     // consumer group while retaining global visibility of all ready tasks.
-    constexpr uint32_t kReadyPoolGroupWidth = 8;
-    constexpr auto kReadyPoolKind = SchedulerReadyPoolKind::TICKET;
-    constexpr uint32_t kReadyChunkWindow = 0;
     SchedulerReadyPoolPlan ready_pool_plan;
     if (!scheduler_plan_ready_pool(
-            task_metadata, static_cast<uint32_t>(spmd.cluster_count), kReadyPoolGroupWidth, layout.total_size,
-            &ready_pool_plan, kReadyPoolKind, kReadyChunkWindow
+            task_metadata, static_cast<uint32_t>(spmd.cluster_count), layout.total_size, &ready_pool_plan
         )) {
         LOG_ERROR("A5 HBG: ready pool layout overflow or invalid topology");
         return false;

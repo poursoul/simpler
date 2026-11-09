@@ -307,10 +307,6 @@ __aicore__ bool bootstrap_ready_graph(
             ))
             return false;
     }
-    if (!scheduler_ready_pool_service_pending(
-            scheduler_state_base, scheduler, run_control, phase_timing_enabled ? &stats->ready : nullptr, nullptr
-        ))
-        return false;
     (void)scheduler_fill_own_slots<WithProfiling, WithNativeGraph>(
         graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors,
         phase_timing_enabled ? &stats->ready : nullptr, profiling_level, 0, &fill_failed, nullptr,
@@ -430,18 +426,6 @@ __aicore__ bool run_ready_dispatch_loop(
                     }
                 }
             }
-            bool publication_progress = false;
-            if (!scheduler_ready_pool_service_pending(
-                    scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->ready : nullptr,
-                    &publication_progress
-                )) {
-                scheduler_record_error(
-                    run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                    SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED
-                );
-                return false;
-            }
-            scheduler_progress = scheduler_progress || publication_progress;
             bool fill_failed = false;
             const bool dispatch_progress = scheduler_fill_own_slots<WithProfiling, WithNativeGraph>(
                 graph, scheduler_state_base, context, run_control, ready_victim_cursors,
@@ -456,14 +440,6 @@ __aicore__ bool run_ready_dispatch_loop(
         if (phase_timing_enabled && scheduler_progress && idle_active) {
             scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, idle_candidate_start);
             idle_active = false;
-        }
-
-        // Publication never waits for kernel capacity or peer participation.
-        // Completion/admission/exit service remains live while this core owns
-        // unpublished work; a long kernel cannot strand that private backlog.
-        if (scheduler_ready_pool_has_pending(context)) {
-            if (!service_async(scheduler_progress)) return false;
-            continue;
         }
 
         int32_t ready_slot = -1;

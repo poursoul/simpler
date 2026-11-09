@@ -357,8 +357,9 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     if (ordered_block) {
         // Every block publishes its final trace and frees its slot before the
         // shared join can authorize another core to finish the logical task.
-        const auto result =
-            scheduler_finish_ordered_block<RecordProtocol>(graph, scheduler_state_base, scheduler, run_control, pending_slot);
+        const auto result = scheduler_finish_ordered_block<RecordProtocol>(
+            graph, scheduler_state_base, scheduler, run_control, pending_slot
+        );
         if (result == SchedulerBlockFinishResult::ERROR) return false;
         task_complete = result == SchedulerBlockFinishResult::TASK_LAST;
     }

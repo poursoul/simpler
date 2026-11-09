@@ -918,8 +918,13 @@ def test_counts_and_complete_sequences_cannot_hide_protocol_corruption(mutation)
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2))
-def test_deferred_finish_can_move_to_another_worker_after_execution_release(mask, blocks):
-    raw, identities = ProtocolBuilder([(mask, blocks, ())], deferred_tasks=(0,)).run()
+@pytest.mark.parametrize("resource_scoped", (False, True))
+def test_deferred_finish_can_move_to_another_worker_after_execution_release(mask, blocks, resource_scoped):
+    raw, identities = ProtocolBuilder([(mask, blocks, ())], deferred_tasks=(0,), resource_scoped=resource_scoped).run()
+    if resource_scoped:
+        _add_claim_seal_certificates(raw, identities)
+        _isolated_close_seals(raw)
+        raw["schema"] = "hbg-native-protocol-v8"
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_events"][0]["completion"]["flags"] &= ~(1 << 31)
     with pytest.raises(ValueError, match="TaskDone"):

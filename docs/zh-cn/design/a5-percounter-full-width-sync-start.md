@@ -163,4 +163,4 @@ Host 用例检查拓扑、列表、布局、剩余 fanin 和唯一派发归属�
 
 保留运行时 revision、实际加载产物、PTO-ISA/CANN、bundle、卡号和逐轮数据。以套件定义的 L0 AICore wall 为主指标，单卡对十轮取均值，双卡每轮先做 Device 会合再取较慢 rank 的时长，随后取十轮均值。六个回放用例校验输出。原生 MoE 按套件要求验证实际执行、Host 控制读取和完整 L0 端点。取回放的 `l0-timing.json` 与原生 MoE 的 L0 `result.json`，按未舍入的七例均值求和。完整口径见 [性能统计说明](../../../tests/fdwic/dsv41_scheduler/README.md#performance-presentation-contract)。
 
-后续阶段在同卡、同输入和同一套 Percounter 业务 kernel 上逐阶段对照第 1 阶段和上一阶段。报告各例及七例总和，最终总和需改善。使用重复基线判断波动，超出波动的退化需解释并复测。Host bind、入口等待、kernel 间隙和 AIV0 的 MIX 发布间隙用于定位。L1/L3 另轮采集领取、fanin 和 START，辅以摘表任务数和裁剪边数。
+后续阶段在同卡、同输入和同一套 Percounter 业务 kernel 上逐阶段对照第 1 阶段和上一阶段。逐例报告 L0 均值、绝对差和变化百分比，按该用例的复测波动判断改善、退化或无明确变化。超出波动的退化需解释并复测。七例总和作为补充指标，最终总和需改善。Host bind、入口等待、kernel 间隙和 AIV0 的 MIX 发布间隙用于定位。L1/L3 另轮采集领取、fanin 和 START，辅以摘表任务数和裁剪边数。

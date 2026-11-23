@@ -1000,7 +1000,9 @@ TEST(PercounterAcquire, StartupTableDispatchesReadyOwnersAndLeavesDependentTaskI
     for (uint32_t lane = 0; lane < f.cfg.size(); ++lane) {
         f.running_lane = lane;
         percounter_bind_sim_context(&f.signals[lane / 3].contexts[lane % 3].value);
-        ASSERT_TRUE(percounter_run_predispatch(f.cfg[lane], &f.state[lane], f.control->startup_pre_dispatch));
+        ASSERT_TRUE(
+            percounter_dispatch_from_table<false>(f.cfg[lane], &f.state[lane], f.control->startup_pre_dispatch)
+        );
     }
     ASSERT_EQ(f.calls.size(), 2U);
     EXPECT_EQ(f.calls[0], (std::array<int64_t, 3>{2, 0, 0}));

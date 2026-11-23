@@ -1543,17 +1543,11 @@ inline __aicore__ bool percounter_predispatch_roles_ready(const LaneConfig &cfg,
     return true;
 }
 
-template <bool Tail = false>
-__attribute__((noinline)) inline __aicore__ bool
-percounter_run_predispatch(const LaneConfig &cfg, PercounterLaneState *state, uint64_t ref, uint32_t anchor = 0) {
-    const bool type_layout = !Tail && (ref & PERCOUNTER_PREDISPATCH_TYPE_LAYOUT) != 0;
-    const uint64_t offset = Tail ? ref : ref & ~PERCOUNTER_PREDISPATCH_TYPE_LAYOUT;
-    const auto *entries = scheduler_state_at<uint64_t>(cfg.control, offset);
-    const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
-    const uint32_t index = type_layout ? (lane == 0 ? 0 : 1) : cfg.cluster_index * PLATFORM_CORES_PER_BLOCKDIM + lane;
-    const uint64_t saved = percounter_gm_read_immutable_word(entries + index);
+template <bool Tail>
+__attribute__((noinline)) inline __aicore__ bool percounter_run_predispatch(
+    const LaneConfig &cfg, PercounterLaneState *state, uint64_t saved, bool type_layout, uint32_t anchor
+) {
     const uint32_t id = static_cast<uint32_t>(percounter_order_task_id(saved));
-    if (id == UINT32_MAX) return true;
     if constexpr (Tail) {
         if (!percounter_poll_wait(cfg, state, 0)) return false;
     }
@@ -1561,9 +1555,12 @@ percounter_run_predispatch(const LaneConfig &cfg, PercounterLaneState *state, ui
     const uint32_t mask = metadata.active_mask;
     const bool pure_vector = mask == 2;
     const bool mix = __builtin_popcount(mask) > 1;
+    const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
     const uint32_t role = pure_vector ? 1 : lane;
     uint32_t block = static_cast<uint32_t>(percounter_order_block_idx(saved));
-    if (type_layout) block = pure_vector ? cfg.cluster_index * cfg.aiv_per_cluster + lane - 1 : cfg.cluster_index;
+    if constexpr (!Tail) {
+        if (type_layout) block = pure_vector ? cfg.cluster_index * cfg.aiv_per_cluster + lane - 1 : cfg.cluster_index;
+    }
     const uint32_t blocks = metadata.block_num;
     const uint64_t entry = percounter_order_entry(id, block, blocks);
     const bool leader = !mix || lane == static_cast<uint32_t>(__builtin_ctz(mask));
@@ -1623,10 +1620,23 @@ percounter_run_predispatch(const LaneConfig &cfg, PercounterLaneState *state, ui
     return true;
 }
 
+template <bool Tail>
+inline __aicore__ bool
+percounter_dispatch_from_table(const LaneConfig &cfg, PercounterLaneState *state, uint64_t ref, uint32_t anchor = 0) {
+    const bool type_layout = !Tail && (ref & PERCOUNTER_PREDISPATCH_TYPE_LAYOUT) != 0;
+    const uint64_t offset = Tail ? ref : ref & ~PERCOUNTER_PREDISPATCH_TYPE_LAYOUT;
+    const auto *entries = scheduler_state_at<uint64_t>(cfg.control, offset);
+    const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
+    const uint32_t index = type_layout ? (lane == 0 ? 0 : 1) : cfg.cluster_index * PLATFORM_CORES_PER_BLOCKDIM + lane;
+    const uint64_t saved = percounter_gm_read_immutable_word(entries + index);
+    return percounter_order_task_id(saved) == UINT32_MAX ||
+           percounter_run_predispatch<Tail>(cfg, state, saved, type_layout, anchor);
+}
+
 inline __aicore__ bool percounter_run_tail(const LaneConfig &cfg, PercounterLaneState *state, uint32_t anchor) {
     const uint64_t ref = percounter_gm_read(cfg.counters[anchor].per_core_pre_dispatch_tasks);
     if (ref == 0) return true;
-    return percounter_run_predispatch<true>(cfg, state, ref, anchor);
+    return percounter_dispatch_from_table<true>(cfg, state, ref, anchor);
 }
 
 inline __aicore__ bool
@@ -2050,11 +2060,12 @@ inline __aicore__ void percounter_lane_loop(LaneConfig &cfg) {
     cfg.cluster_lane = ClusterLane;
     if (percounter_should_stop(cfg)) return;
     PercounterLaneState state{};
-    percounter_initialize_boundaries(cfg, &state.source);
     if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
         const uint64_t startup = cfg.control->startup_pre_dispatch;
-        if (startup != 0 && !percounter_run_predispatch(cfg, &state, startup)) return;
+        if (startup != 0 && !percounter_dispatch_from_table<false>(cfg, &state, startup)) return;
     }
+    // Static startup and its continuation do not read the ordinary order lists.
+    percounter_initialize_boundaries(cfg, &state.source);
     for (uint64_t iterations = 0;; ++iterations) {
         bool executed;
         if (!percounter_step(cfg, &state, &executed)) break;

@@ -101,7 +101,7 @@ Host 逐条处理原有 fanin，仅用全宽 SPMD 区间的 barrier 裁掉已覆
 | ---- | ---------- |
 | `PercounterCounter` 的 36 字节预留区 | 32 位派发标志区分入口和区间成员，两项 32 位 `next_aic`、`next_aiv` 使用 `UINT32_MAX` 表示结束。一个 64 位 `per_core_pre_dispatch_tasks` 表引用挂共同末端批，两个 64 位入口截止位置分别对应 AIC、AIV/MIX。保持 counter 128 字节及对齐。 |
 | 入口截止位置 | 每项包含 32 位 segment 索引和 32 位排他 order position。定位到最终普通列表，`UINT64_MAX` 表示本核型无截止位置。 |
-| `PercounterControl` | 只读启动表引用和规划时的集群数。使用静态链接、fanin 裁剪或预派发时，AICPU 在 READY 前确认实测集群数完全匹配。保持全局 async 计数所在扇区的隔离。 |
+| `PercounterControl` | 只读启动表引用、规划时的集群数，以及是否存在 MIX 预派发和尾部批。AICPU 在 READY 前确认规划集群数与实测完全匹配。只有 MIX 预派发需要初始化角色 token，存在尾部批时区间收尾才查逐核表。保持全局 async 计数所在扇区的隔离。 |
 | GM 预派发表 | 表引用为 8 字节对齐的镜像相对 offset，0 表示无表。低位表示启动按核型布局。该布局用两项 64 位字分别表达 AIC 和 AIV，block 按全宽映射推导。逐核布局按 `3 * cluster_idx + cluster_lane` 索引，使用现有 `percounter_order_entry(task_id, block_idx, block_num)` 编码。尾部固定使用逐核布局。task ID 为 `UINT32_MAX` 表示 `invalid`。 |
 | 簇 SSBUF | 增加三项 32 位到达 token 和一项 32 位放行 token，放在 `PercounterSsbufRegion` 尾部预留区。参与角色只写自己的到达 token，最低活动角色写放行 token。0 表示未到达，启动批使用 1，尾部批使用尾任务的 `global_order_id + 2`。每轮在 READY 后、本簇首次派发前清零并发布初始化完成。 |
 
@@ -126,7 +126,7 @@ AIV0 照常领取并发布 MIX，参与核可提前发现并准备记录。对�
 通过现有 dispatch helper 执行 kernel，沿用 argument context、错误传播、结果内存屏障及每个 block/role 的完成发布。
 
 - **区间内。** 每核返回后先发布当前 block/role 的 completion credit。沿对应类型的链接准备下一项。用现有 meta 读取原角色 callable，按缓存的 `cluster_idx` 或展平 AIV block index 生成 context。读取设备 fanin 行，等待剩余边，再调用 kernel。参与核的下一步已固定，跳过 normal claim、候选选择、scheduler START 和普通 MIX 握手。
-- **启动。** 每核完成运行初始化且观察到 READY 后，在普通调度循环前检查启动表。由此派发真实区间入口时，继续执行该入口的 START 和后续静态链。
+- **启动。** 每核完成运行初始化且观察到 READY 后，在普通调度循环前检查启动表。Host 已证明启动条目的 fanin 行为空，设备可直接解析 task table 中的 callable 和参数。由此派发真实区间入口时，继续执行该入口的 START 和后续静态链。
 - **收尾。** 每个角色从共同尾任务返回并发布自身 credit 后，检查该 tail 的逐核表。空表或 `invalid` 直接进入普通调度。有效条目使用裁剪后的 fanin 行，依赖尾任务自身就等待整组 DONE。尾任务握手已经覆盖的边可按计划裁掉，空行直接派发。每个锚点只消耗一次本核条目。
 - **窄 MIX 与非全核 SPMD。** 每个 block 使用表中的物理 owner。MIX 活动角色在各自 fanin 满足、资源可用后发布本代到达 token。最低活动角色收齐本簇的到达，按需为该 block 计一次 START 并等待全局放行，再发布本簇的放行 token。不参与该 block 的 AIV0 可以继续普通调度。纯核的跨 block START 复用原按 block 计数。token 以 release/acquire 发布和观察，等待匹配本代或更新的 token。更新的代次证明写入者已履行旧代在本核的派发义务。同步失败与正常调度使用同一退出和错误路径。
 

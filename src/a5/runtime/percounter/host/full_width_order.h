@@ -29,17 +29,20 @@ inline uint8_t percounter_task_types(uint32_t mask) {
     return static_cast<uint8_t>((mask & 1U) | ((mask & 6U) ? PERCOUNTER_TYPE_AIV : 0U));
 }
 
+inline uint8_t percounter_full_width_shape(uint32_t mask, uint32_t blocks, uint32_t clusters) {
+    if (mask == 2 && blocks == 2 * clusters) return PERCOUNTER_TYPE_AIV;
+    if (blocks != clusters) return 0;
+    if (mask == 1) return PERCOUNTER_TYPE_AIC;
+    if (mask == 7) return PERCOUNTER_TYPES_BOTH;
+    return 0;
+}
+
 template <typename Task>
 inline uint8_t percounter_full_width_type(const Task &task, uint32_t clusters) {
     if (!task.sync_start || task.has_predicate || task.graph_invocation >= 0 || task.inline_completed ||
         task.published_off_lane)
         return 0;
-    const uint32_t blocks = static_cast<uint32_t>(task.block_num);
-    if (task.active_mask == 2 && blocks == 2 * clusters) return PERCOUNTER_TYPE_AIV;
-    if (blocks != clusters) return 0;
-    if (task.active_mask == 1) return PERCOUNTER_TYPE_AIC;
-    if (task.active_mask == 7) return PERCOUNTER_TYPES_BOTH;
-    return 0;
+    return percounter_full_width_shape(task.active_mask, static_cast<uint32_t>(task.block_num), clusters);
 }
 
 struct FullWidthSpan {

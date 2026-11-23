@@ -258,7 +258,8 @@ inline StateSelection select_percounter_state(
         }
         return false;
     };
-    const auto dispatch = plan_host_dispatch(inputs.data(), task_count, clusters, graph_plan, true, may_defer, true);
+    const auto dispatch =
+        plan_host_dispatch(inputs.data(), task_count, clusters, graph_plan, true, may_defer, true, true);
     if (!dispatch) {
         LOG_ERROR("A5 percounter: cannot plan a dispatch order");
         return StateSelection::FAILED;

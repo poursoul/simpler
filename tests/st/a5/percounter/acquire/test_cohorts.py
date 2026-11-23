@@ -25,7 +25,7 @@ STRIDE = 16
 MAX_LANES = 320
 
 
-def build_callable(platform, masks=False):
+def build_callable(platform, masks=False, tail=False):
     kernels = Path(__file__).resolve().parents[2] / "host_build_graph/spmd_cohort_saturation/kernels"
     spec = {
         "orchestration": {
@@ -39,6 +39,12 @@ def build_callable(platform, masks=False):
                 "source": str(kernels / name),
                 "core_type": "aic" if i == 0 else "aiv",
                 "signature": [D.INOUT, D.IN, D.IN, D.IN, D.IN],
+                "async_capability": {
+                    "version": 1,
+                    "mode": "SYNCHRONOUS",
+                    "max_conditions": 0,
+                    "condition_types": 0,
+                },
             }
             for i, name in enumerate(
                 (
@@ -55,7 +61,12 @@ def build_callable(platform, masks=False):
             Path(__file__).resolve().parent / "kernels/orchestration/mask_cohorts.cpp"
         )
         spec["orchestration"]["signature"] = [D.INOUT, D.INOUT, D.INOUT, D.IN, D.IN, D.IN]
-    return compile_chip_callable_spec(spec, platform, "percounter", (__file__, platform, "percounter", masks))
+    if tail:
+        spec["orchestration"]["source"] = str(
+            Path(__file__).resolve().parent / "kernels/orchestration/tail_cohorts.cpp"
+        )
+        spec["orchestration"]["signature"] = [D.INOUT, D.IN]
+    return compile_chip_callable_spec(spec, platform, "percounter", (__file__, platform, "percounter", masks, tail))
 
 
 @pytest.mark.parametrize("cohorts", [3, 12])
@@ -157,3 +168,54 @@ def test_mask_cohorts(st_platform, st_device_ids, tmp_path, mask, partial, asser
                 worker.free(buffer)
         finally:
             worker.close()
+
+
+def test_narrow_mix_tail_predispatch(st_platform, st_device_ids, tmp_path, assert_cohorts_were_coresident):
+    worker = Worker(level=2, platform=st_platform, runtime="percounter", device_id=int(st_device_ids[0]))
+    try:
+        handle = worker.register(build_callable(st_platform, tail=True))
+        worker.init()
+        host = torch.full((6 * 2 * MAX_LANES * STRIDE,), -1.0)
+        buffer = worker.malloc(host.nbytes)
+        try:
+            args = TaskArgs()
+            args.add_tensor(buffer.tensor(shapes=tuple(host.shape), dtype=DataType.FLOAT32), TensorArgType.INOUT)
+            args.add_scalar(1000)
+            for repeat in range(3):
+                host.fill_(-1)
+                worker.copy_to(buffer, host)
+                output = tmp_path / f"repeat{repeat}"
+                output.mkdir()
+                config = CallConfig()
+                config.enable_chip_swimlane = 3
+                config.output_prefix = str(output)
+                worker.run(handle, args, config)
+                assert worker.scheduler_runtime_mode == 5
+                worker.copy_from(host, buffer)
+                (capture,) = output.rglob("chip_swimlane_records.json")
+                raw = json.loads(capture.read_text())
+                clusters = raw["metadata"]["core_types"].count("aic")
+                widths = [(clusters, 3), (clusters, 3), (clusters // 2, 2)] * 2
+                for i, (blocks, roles) in enumerate(widths):
+                    start = i * 2 * MAX_LANES
+                    entries = blocks * roles
+                    arrived = host[start * STRIDE : (start + entries) * STRIDE : STRIDE]
+                    result_start = start + MAX_LANES
+                    results = host[result_start * STRIDE : (result_start + entries) * STRIDE : STRIDE]
+                    assert torch.equal(arrived, torch.ones_like(arrived))
+                    assert torch.equal(results, torch.arange(blocks, dtype=host.dtype).repeat_interleave(roles))
+                claims = [
+                    event
+                    for event in raw["percounter_task_events"]["records"]
+                    if event["kind"] == "claim" and event["block_count"] == clusters // 2
+                ]
+                assert len(claims) == 2 * (clusters // 2)
+                assert len({event["task_id"] for event in claims}) == 2
+                assert all(event["claim_start_cycles"] == event["cycles"] for event in claims)
+                assert_cohorts_were_coresident(
+                    output, [blocks * roles for blocks, roles in widths], f"predispatched tail, run {repeat}"
+                )
+        finally:
+            worker.free(buffer)
+    finally:
+        worker.close()

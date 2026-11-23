@@ -97,7 +97,7 @@ struct Fixture {
     explicit Fixture(
         std::vector<TaskInput> in = {task(1), task(1), task(1)}, uint32_t clusters = 2,
         const ExternalAddresses &external = {}, bool fold_dependencies = false, bool enable_terminal = false,
-        const std::function<bool(uint32_t)> &may_defer = {}, bool enable_startup = false
+        const std::function<bool(uint32_t)> &may_defer = {}, bool enable_startup = false, bool enable_tail = false
     ) :
         inputs(std::move(in)),
         storage(inputs.size()),
@@ -121,8 +121,9 @@ struct Fixture {
             for (int lane = 0; lane < 3; ++lane)
                 storage[i].task.kernel_id[lane] = (t.active_mask & (1U << lane)) ? 1 : -1;
         }
-        const auto dispatch =
-            plan_host_dispatch(inputs.data(), inputs.size(), clusters, {}, enable_terminal, may_defer, enable_startup);
+        const auto dispatch = plan_host_dispatch(
+            inputs.data(), inputs.size(), clusters, {}, enable_terminal, may_defer, enable_startup, enable_tail
+        );
         EXPECT_TRUE(dispatch.has_value());
         EXPECT_TRUE(plan_layout(
             inputs.size(), blocks, dispatch->fanin_ids.size(), dispatch->order_count, &layout, dispatch->mix_task_count,
@@ -999,7 +1000,7 @@ TEST(PercounterAcquire, StartupTableDispatchesReadyOwnersAndLeavesDependentTaskI
     for (uint32_t lane = 0; lane < f.cfg.size(); ++lane) {
         f.running_lane = lane;
         percounter_bind_sim_context(&f.signals[lane / 3].contexts[lane % 3].value);
-        ASSERT_TRUE(percounter_run_predispatch(f.cfg[lane], &f.state[lane], f.control->startup_pre_dispatch, 1));
+        ASSERT_TRUE(percounter_run_predispatch(f.cfg[lane], &f.state[lane], f.control->startup_pre_dispatch));
     }
     ASSERT_EQ(f.calls.size(), 2U);
     EXPECT_EQ(f.calls[0], (std::array<int64_t, 3>{2, 0, 0}));
@@ -1052,6 +1053,125 @@ TEST(PercounterAcquire, TerminalOnlyImageReservesClusterSignals) {
     ASSERT_EQ(f.control->terminal.step_count, 3U);
     EXPECT_EQ(f.layout.mix_task_count, 0U);
     EXPECT_NE(f.control->mix_signal_ready_offset, 0U);
+}
+
+TEST(PercounterAcquire, TailTablePlacesNarrowMixAndKeepsTheAnchorFanin) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Tail dispatch requires a single pending slot.";
+    const int32_t predecessors[]{0, 1, 2};
+    auto tail = task(7, 2, true);
+    tail.fanin_ids = &predecessors[0];
+    tail.fanin_count = 1;
+    auto vector = task(2);
+    vector.fanin_ids = &predecessors[0];
+    vector.fanin_count = 1;
+    auto cube = task(1);
+    cube.fanin_ids = &predecessors[1];
+    cube.fanin_count = 1;
+    auto mix = task(5);
+    mix.fanin_ids = &predecessors[1];
+    mix.fanin_count = 1;
+    auto next_wave = task(2);
+    next_wave.fanin_ids = &predecessors[2];
+    next_wave.fanin_count = 1;
+    auto full_vectors = task(2, 4);
+    full_vectors.fanin_ids = &predecessors[1];
+    full_vectors.fanin_count = 1;
+    Fixture f(
+        {task(7, 2, true), tail, vector, cube, mix, next_wave, full_vectors}, 2, {}, false, false, synchronous_task,
+        false, true
+    );
+    ASSERT_NE(f.counters[1].per_core_pre_dispatch_tasks, 0U);
+    EXPECT_EQ(f.control->startup_pre_dispatch, 0U);
+    EXPECT_EQ(f.control->predispatch_has_mix, 1U);
+    EXPECT_EQ(f.layout.pre_dispatch_words, 6U);
+    EXPECT_EQ(f.cfg[0].fanin[2].count, 0);
+    ASSERT_EQ(f.cfg[0].fanin[3].count, 1);
+    EXPECT_EQ(f.cfg[0].fanin_addresses[f.cfg[0].fanin[3].begin], reinterpret_cast<uint64_t>(&f.counters[1].value));
+    for (const uint32_t id : {2U, 3U, 4U})
+        EXPECT_NE(f.counters[id].dispatch_flags & PERCOUNTER_DISPATCH_PREDISPATCHED, 0U);
+    for (const uint32_t id : {5U, 6U})
+        EXPECT_EQ(f.counters[id].dispatch_flags & PERCOUNTER_DISPATCH_PREDISPATCHED, 0U);
+}
+
+TEST(PercounterResourceOrder, TailStopsAtGraphAndRequiresActualDeferredCompletion) {
+    const int32_t old = 0;
+    auto vector = task(2);
+    vector.fanin_ids = &old;
+    vector.fanin_count = 1;
+    auto invocation = task(0);
+    invocation.graph_invocation = 0;
+    const TaskInput tasks[]{task(2), task(7, 2, true), vector, task(1), invocation, task(1)};
+    HostDispatchPlan plan;
+    plan.order = {0, 1, 2, 3, 4, 5};
+    plan.interval_spans = {{1, 2, 0, PERCOUNTER_TYPES_BOTH, true}};
+    const auto tails = plan_tail_waves(tasks, plan, {0, 3, 0, 0, 0, 0}, {0, 1, 1, 1, 0, 1}, {1, 2, 3, 4, 5, 6}, 2);
+    ASSERT_EQ(tails.size(), 1U);
+    EXPECT_EQ(tails[0].tasks, (std::vector<uint32_t>{3}));
+}
+
+TEST(PercounterAcquire, TailDispatchPollsLocalDeferAndWaitsForAnchorOnlyWhenRequired) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Tail dispatch requires a single pending slot.";
+    const int32_t predecessors[]{0, 1};
+    auto tail = task(7, 2, true);
+    tail.fanin_ids = &predecessors[0];
+    tail.fanin_count = 1;
+    auto early = task(2);
+    early.fanin_ids = &predecessors[0];
+    early.fanin_count = 1;
+    auto late = task(1);
+    late.fanin_ids = &predecessors[1];
+    late.fanin_count = 1;
+    Fixture f(
+        {task(7, 2, true), tail, early, late, task(2)}, 2, {}, false, false,
+        [](uint32_t id) {
+            return id == 4;
+        },
+        false, true
+    );
+    ASSERT_NE(f.counters[1].per_core_pre_dispatch_tasks, 0U);
+    const auto *table = scheduler_state_at<uint64_t>(f.control, f.counters[1].per_core_pre_dispatch_tasks);
+    ASSERT_EQ(percounter_order_task_id(table[2]), 2);
+    ASSERT_EQ(percounter_order_task_id(table[0]), 3);
+    ASSERT_EQ(f.cfg[2].fanin[2].count, 0);
+    ASSERT_EQ(f.cfg[0].fanin[3].count, 1);
+    int32_t signal = 0;
+    const auto original = execute;
+    execute = [&](int64_t *args) {
+        original(args);
+        if (args[0] == 4) {
+            f.async_entries[2][0] = {
+                reinterpret_cast<uint64_t>(&signal), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+            };
+            f.async_groups[2].count = 1;
+        }
+        if (args[0] == 2) EXPECT_TRUE(f.completed(4));
+        if (args[0] == 3) EXPECT_TRUE(f.completed(1));
+    };
+    ASSERT_TRUE(f.run(2, f.resolve(4)));
+    EXPECT_FALSE(f.completed(4));
+    signal = 1;
+    f.counters[0].value = PERCOUNTER_COUNTER_PUBLISHED;
+    const auto dispatch = [&](uint32_t lane) {
+        f.running_lane = lane;
+        percounter_bind_sim_context(&f.signals[lane / 3].contexts[lane % 3].value);
+        return percounter_run_tail(f.cfg[lane], &f.state[lane], 1);
+    };
+    ASSERT_TRUE(dispatch(2));
+    EXPECT_TRUE(f.completed(2));
+    EXPECT_FALSE(f.completed(1));
+    EXPECT_FALSE(f.completed(3));
+    uint32_t checks = 0;
+    on_poll = [&] {
+        if (++checks != 2) return;
+        EXPECT_FALSE(f.completed(3));
+        f.counters[1].value = PERCOUNTER_COUNTER_PUBLISHED;
+    };
+    const bool finished = dispatch(0);
+    on_poll = {};
+    EXPECT_TRUE(finished);
+    EXPECT_GE(checks, 2U);
+    f.expect_completed(3);
+    EXPECT_EQ(f.calls.size(), 3U);
 }
 
 TEST(PercounterAcquire, CompletedEvenBlocksDoNotReleaseConsumerBeforeOddBlock) {

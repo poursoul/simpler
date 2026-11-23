@@ -4,7 +4,7 @@
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
@@ -132,8 +132,8 @@ inline std::optional<StartupPredispatch> plan_startup_wave(const Task *tasks, co
         // A pruned fanin can still require the normal entry prefix to run.
         // Startup is allowed only for tasks already ready in the logical DAG.
         bool ready = true;
-        for (int32_t i = 0; i < task.fanin_count; ++i)
-            if (!tasks[task.fanin_ids[i]].inline_completed) ready = false;
+        for (int32_t i = 0; ready && i < task.fanin_count; ++i)
+            ready = tasks[task.fanin_ids[i]].inline_completed;
         if (!ready || !startup.wave.place(id, static_cast<uint32_t>(task.block_num), task.active_mask)) continue;
         startup.tasks.push_back(id);
         if (startup.wave.full()) break;

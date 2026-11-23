@@ -36,6 +36,7 @@
 #include "full_width_order.h"
 #include "pre_dispatch.h"
 #include "resource_order.h"
+#include "tail_dispatch.h"
 #include "terminal_pipeline.h"
 #include "scheduler/wire_types.h"
 #include "scheduler/profiling_types.h"
@@ -528,6 +529,7 @@ struct HostDispatchPlan {
     std::vector<uint32_t> order;
     std::optional<TerminalPipeline> terminal;
     std::optional<StartupPredispatch> startup;
+    std::vector<TailPredispatch> tails;
     std::vector<IntervalTask> intervals;
     std::vector<FullWidthSpan> interval_spans;
     std::vector<uint32_t> fanin_offsets;
@@ -543,7 +545,8 @@ struct HostDispatchPlan {
     }
 
     bool is_interior(uint32_t id) const {
-        return !intervals.empty() && intervals[id].flags == PERCOUNTER_DISPATCH_INTERVAL_MEMBER;
+        constexpr uint32_t path = PERCOUNTER_DISPATCH_INTERVAL_MEMBER | PERCOUNTER_DISPATCH_INTERVAL_ENTRY;
+        return !intervals.empty() && (intervals[id].flags & path) == PERCOUNTER_DISPATCH_INTERVAL_MEMBER;
     }
 
     bool is_interval_entry(uint32_t id) const {
@@ -555,24 +558,25 @@ struct HostDispatchPlan {
     }
 
     uint64_t pre_dispatch_words() const {
-        if (!startup) return 0;
-        const auto &wave = startup->wave;
-        return wave.uses_type_layout() ? wave.types().size() : wave.lanes().size();
+        uint64_t words = 0;
+        if (startup) {
+            const auto &wave = startup->wave;
+            words = wave.uses_type_layout() ? wave.types().size() : wave.lanes().size();
+        }
+        for (const auto &tail : tails)
+            words += tail.wave.lanes().size();
+        return words;
     }
 };
 
 inline bool plan_device_fanin(
     const TaskInput *tasks, HostDispatchPlan &plan, const std::vector<uint8_t> &width,
-    const std::vector<uint8_t> &synchronous, uint32_t clusters
+    const std::vector<uint8_t> &synchronous, const std::vector<uint32_t> &rank, uint32_t clusters
 ) {
     const size_t count = plan.order.size();
-    std::vector<uint32_t> rank;
     std::vector<uint32_t> common_barrier;
-    if (!plan.interval_spans.empty()) {
-        rank.resize(count);
+    if (!rank.empty()) {
         common_barrier.resize(count);
-        for (uint32_t p = 0; p < count; ++p)
-            rank[plan.order[p]] = p + 1;
         for (const auto &span : plan.interval_spans) {
             uint32_t full = 0;
             for (uint32_t p = span.begin; p < span.end; ++p) {
@@ -584,13 +588,24 @@ inline bool plan_device_fanin(
             }
         }
     }
+    std::vector<uint32_t> tail_anchor;
+    if (!plan.tails.empty()) {
+        tail_anchor.resize(count, UINT32_MAX);
+        for (const auto &tail : plan.tails)
+            for (const uint32_t id : tail.tasks)
+                tail_anchor[id] = tail.anchor;
+    }
     plan.fanin_offsets.reserve(count + 1);
     for (uint32_t id = 0; id < count; ++id) {
         plan.fanin_offsets.push_back(static_cast<uint32_t>(plan.fanin_ids.size()));
         const uint8_t consumer = rank.empty() ? 0 : width[id];
+        const uint32_t anchor = tail_anchor.empty() ? UINT32_MAX : tail_anchor[id];
         for (int32_t e = 0; e < tasks[id].fanin_count; ++e) {
             const uint32_t producer = static_cast<uint32_t>(tasks[id].fanin_ids[e]);
             if (tasks[producer].inline_completed) continue;
+            if (anchor != UINT32_MAX && synchronous[producer] && tasks[producer].active_mask != 0 &&
+                rank[producer] < rank[anchor])
+                continue;
             if (consumer != 0 && synchronous[producer]) {
                 const uint8_t roles = percounter_task_types(tasks[producer].active_mask);
                 // The target's own barrier covers its participating types.
@@ -611,7 +626,7 @@ inline bool plan_device_fanin(
 
 inline std::optional<HostDispatchPlan> plan_host_dispatch(
     const TaskInput *tasks, size_t task_count, uint32_t clusters, const GraphPlanInput &graph, bool enable_terminal,
-    const std::function<bool(uint32_t)> &may_defer, bool enable_startup = false
+    const std::function<bool(uint32_t)> &may_defer, bool enable_startup = false, bool enable_tail = false
 ) {
     if ((tasks == nullptr && task_count != 0) || task_count > UINT32_MAX) return std::nullopt;
     std::vector<ResourceOrderTask> nodes(task_count);
@@ -736,7 +751,12 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
             }
         }
     }
-    if (!plan_device_fanin(tasks, plan, width, synchronous, clusters)) return std::nullopt;
+    std::vector<uint32_t> rank;
+    if (!plan.interval_spans.empty()) {
+        rank.resize(task_count);
+        for (uint32_t p = 0; p < task_count; ++p)
+            rank[plan.order[p]] = p + 1;
+    }
     if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
         if (enable_startup) plan.startup = plan_startup_wave(tasks, plan, clusters);
         if (plan.startup) {
@@ -745,7 +765,17 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
             for (const uint32_t id : plan.startup->tasks)
                 plan.intervals[id].flags |= PERCOUNTER_DISPATCH_PREDISPATCHED;
         }
+        if (enable_tail) plan.tails = plan_tail_waves(tasks, plan, width, synchronous, rank, clusters);
+        if (!plan.tails.empty()) {
+            plan.planned_clusters = clusters;
+            for (const auto &tail : plan.tails) {
+                plan.intervals[tail.anchor].flags |= PERCOUNTER_DISPATCH_HAS_TAIL;
+                for (const uint32_t id : tail.tasks)
+                    plan.intervals[id].flags |= PERCOUNTER_DISPATCH_PREDISPATCHED;
+            }
+        }
     }
+    if (!plan_device_fanin(tasks, plan, width, synchronous, rank, clusters)) return std::nullopt;
     for (uint32_t id = 0; id < task_count; ++id) {
         const auto &task = tasks[id];
         if (task.inline_completed || task.published_off_lane || plan.is_interior(id)) continue;
@@ -803,23 +833,26 @@ inline bool build_tables(
     if (dispatch.fanin_offsets.size() != task_count + 1 || dispatch.fanin_ids.size() != layout.edge_count)
         return fail(BuildStatus::EDGE_COUNT_MISMATCH, -1, -1);
     if (dispatch.pre_dispatch_words() != layout.pre_dispatch_words ||
-        ((dispatch.startup || dispatch.terminal) && layout.mix_signal_ready_offset == 0))
+        ((dispatch.startup || dispatch.terminal || !dispatch.tails.empty()) && layout.mix_signal_ready_offset == 0))
         return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
 
     std::memset(base, 0, static_cast<size_t>(layout.upload_size));
 
     auto *control = region_at<PercounterControl>(base, layout.control_offset);
     control->planned_clusters = dispatch.planned_clusters;
+    uint64_t pre_dispatch_at = layout.pre_dispatch_offset;
     if (dispatch.startup) {
         const auto &wave = dispatch.startup->wave;
         control->predispatch_has_mix = wave.has_mix();
-        auto *table = region_at<uint64_t>(base, layout.pre_dispatch_offset);
-        control->startup_pre_dispatch = layout.pre_dispatch_offset;
+        auto *table = region_at<uint64_t>(base, pre_dispatch_at);
+        control->startup_pre_dispatch = pre_dispatch_at;
         if (wave.uses_type_layout()) {
             std::copy(wave.types().begin(), wave.types().end(), table);
             control->startup_pre_dispatch |= PERCOUNTER_PREDISPATCH_TYPE_LAYOUT;
+            pre_dispatch_at += wave.types().size() * sizeof(uint64_t);
         } else {
             std::copy(wave.lanes().begin(), wave.lanes().end(), table);
+            pre_dispatch_at += wave.lanes().size() * sizeof(uint64_t);
         }
     }
     for (auto &head : control->first_boundary_segment)
@@ -827,6 +860,14 @@ inline bool build_tables(
     auto *fanin = region_at<PercounterFanin>(base, layout.fanin_offset);
     auto *fanin_addr = region_at<uint64_t>(base, layout.fanin_addr_offset);
     auto *counters = region_at<PercounterCounter>(base, layout.counters_offset);
+    control->has_tail_dispatch = !dispatch.tails.empty();
+    for (const auto &tail : dispatch.tails) {
+        const auto &entries = tail.wave.lanes();
+        counters[tail.anchor].per_core_pre_dispatch_tasks = pre_dispatch_at;
+        std::copy(entries.begin(), entries.end(), region_at<uint64_t>(base, pre_dispatch_at));
+        pre_dispatch_at += entries.size() * sizeof(uint64_t);
+        control->predispatch_has_mix |= tail.wave.has_mix();
+    }
     if (external.completion_plan != nullptr && external.completion_notify != nullptr) {
         const auto &plan = *external.completion_plan;
         for (uint64_t id = 0; id < task_count; ++id) {
@@ -1029,6 +1070,8 @@ inline bool build_tables(
             }
             if (!dispatch.intervals.empty()) {
                 const auto &link = dispatch.intervals[id];
+                if ((link.flags & PERCOUNTER_DISPATCH_HAS_TAIL) != 0 && metadata[id].global_order_id > UINT32_MAX - 2)
+                    return fail(BuildStatus::INVALID_ARGUMENT, id, -1);
                 counters[id].dispatch_flags = link.flags;
                 std::copy(std::begin(link.next), std::end(link.next), counters[id].next_task);
             }

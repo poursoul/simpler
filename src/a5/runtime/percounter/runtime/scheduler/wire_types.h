@@ -54,6 +54,7 @@ inline constexpr uint32_t PERCOUNTER_NO_SYNC = UINT32_MAX;
 inline constexpr uint32_t PERCOUNTER_DISPATCH_INTERVAL_ENTRY = 1U << 0;
 inline constexpr uint32_t PERCOUNTER_DISPATCH_INTERVAL_MEMBER = 1U << 1;
 inline constexpr uint32_t PERCOUNTER_DISPATCH_PREDISPATCHED = 1U << 2;
+inline constexpr uint32_t PERCOUNTER_DISPATCH_HAS_TAIL = 1U << 3;
 inline constexpr uint64_t PERCOUNTER_PREDISPATCH_TYPE_LAYOUT = 1U;
 
 // Payload and publication generation have one writer: the cluster's AIV0.
@@ -149,7 +150,7 @@ struct alignas(128) PercounterCounter {
     uint32_t completion_notify_target;  // cumulative credits in the chain
     uint32_t dispatch_flags;
     uint32_t next_task[PERCOUNTER_CORE_TYPE_COUNT];
-    uint8_t reserved[8];
+    uint64_t per_core_pre_dispatch_tasks;
     // Per list: local segment in the high word, exclusive order position in the low word.
     uint64_t entry_prefix_end[PERCOUNTER_CORE_TYPE_COUNT];
 };
@@ -535,6 +536,7 @@ struct alignas(128) PercounterControl {
     uint32_t planned_clusters;  // exact topology for static dispatch and barrier proofs
     uint64_t startup_pre_dispatch;
     uint32_t predispatch_has_mix;
+    uint32_t has_tail_dispatch;
 
     // Allocation precedes the corresponding block's completed publication.
     // Both counters are monotone; equality after all blocks ran permits exit.

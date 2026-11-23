@@ -148,7 +148,7 @@ AIV0 照常领取并发布 MIX，参与核可提前发现并准备记录。对�
 
 | 阶段 | 交付边界 | 通过条件 |
 | ---- | -------- | -------- |
-| 1. DSV4.1 性能基线 | 从无本方案改动的主线 `798fea3fb` 构建 HBG 和 Percounter，运行套件的七个原生用例。 | 每例按套件要求通过运行与输出校验，双卡用例具有 Device 会合证据。保存两个运行时的逐轮 L0 数据、七例均值及总和，重复 Percounter 基线估计噪声。 |
+| 1. DSV4.1 性能基线 | 从无本方案改动的主线 `798fea3fb` 构建 Percounter，运行套件的七个原生用例。 | 每例按套件要求通过运行与输出校验，双卡用例具有 Device 会合证据。保存逐轮 L0 数据、七例均值及总和，并对每例复测以估计波动。 |
 | 2. 入口 rank 检查 | 对 `1c`、`2v`、`1c2v` 的每个参与核检查较早普通任务和共享 MIX，继续使用现有列表和派发路径。 | 用显式门控覆盖较早任务未领取、已占槽但未就绪、MIX 延迟发布、描述符已回收但本核 MIX 尚未返回，以及 `X=2/4`。验证入口先等待较早任务，依赖入口的较晚持票任务可在入口后接续一次。以第 1 阶段为对照测入场检查开销。 |
 | 3. 首次排序与区间接续 | 在 Graph 分段内生成候选序并线性检查换位，固定最终区间后生成链接及 order list，保留现有设备 fanin 检查。 | 覆盖跨深度前移与后移、DAG 边阻止换位、无依赖时仍保留 Graph 边界、连续合并多段及 `1c2v` 收尾。检查无边图的待查间隔数，以及连续合并时原始右段的边访问次数上界。验证 `C0,V0,M` 与 `C0,C1,M` 的入口可达性、唯一 owner 和退出行为。持票任务在本核链结束后才运行，区间内省去 scheduler START。 |
 | 4. Barrier 裁剪 | 用入口及 kernel barrier 裁剪设备 fanin，保留逻辑 DAG。 | 覆盖直接 `1c2v → 2v` 保留边、后一个 `1c2v` 覆盖前一个 barrier、同步前缀与 deferred 前缀差异。以显式事件拖住一个角色，验证进入后继可以更早，跨核读取仍在实际同步之后。GM 和 CntNotify 两路径均校验数据与 DONE。 |
@@ -159,7 +159,7 @@ Host 用例检查拓扑、列表、布局、剩余 fanin 和唯一派发归属�
 
 ### DSV4.1 性能基线与回归
 
-使用套件默认的 `pypto_lib_latest` 七个用例。`swa`、`c2a_full`、`c1a_reindex`、`c1a_reuse` 和 `engram` 各用一张 A5 卡，`moe` 和 `layers_19_21` 各用两张卡。按 [构建、准备和运行说明](../../../tests/fdwic/dsv41_scheduler/README.md#build-from-source) 构建匹配的生产运行时及两套 ABI 对应的 kernel 和 bundle，为双卡计时准备 Device start gate。用 `production/list_cases.py` 枚举七例，以 `run.sh` 的 `0 1 10` 参数运行 L0。Percounter 构建及准备时选择 `--runtime percounter`，执行时传 `--runtime=percounter`。每个运行时版本的单个用例独立通过 `task-submit` 申请其拓扑所需卡数，构建和结果汇总在锁外。
+使用套件默认的 `pypto_lib_latest` 七个用例。`swa`、`c2a_full`、`c1a_reindex`、`c1a_reuse` 和 `engram` 各用一张 A5 卡，`moe` 和 `layers_19_21` 各用两张卡。按 [构建、准备和运行说明](../../../tests/fdwic/dsv41_scheduler/README.md#build-from-source) 构建 Percounter 运行时及其 ABI 对应的 kernel 和 bundle，为双卡计时准备 Device start gate。用 `production/list_cases.py` 枚举七例，以 `run.sh` 的 `0 1 10` 参数运行 L0。构建及准备时选择 `--runtime percounter`，执行时传 `--runtime=percounter`。每个 Percounter 版本的单个用例独立通过 `task-submit` 申请其拓扑所需卡数，构建和结果汇总在锁外。
 
 保留运行时 revision、实际加载产物、PTO-ISA/CANN、bundle、卡号和逐轮数据。以套件定义的 L0 AICore wall 为主指标，单卡对十轮取均值，双卡每轮先做 Device 会合再取较慢 rank 的时长，随后取十轮均值。六个回放用例校验输出。原生 MoE 按套件要求验证实际执行、Host 控制读取和完整 L0 端点。取回放的 `l0-timing.json` 与原生 MoE 的 L0 `result.json`，按未舍入的七例均值求和。完整口径见 [性能统计说明](../../../tests/fdwic/dsv41_scheduler/README.md#performance-presentation-contract)。
 

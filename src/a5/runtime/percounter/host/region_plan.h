@@ -872,6 +872,41 @@ inline bool build_tables(
     if (segment_cursor != boundary_tasks + PERCOUNTER_LIST_COUNT || ticket_interval > layout.ticket_interval_count)
         return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
 
+    if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
+        uint32_t prefix[PERCOUNTER_LIST_COUNT]{};
+        uint32_t segment[PERCOUNTER_LIST_COUNT]{};
+        for (const int64_t id : global_order) {
+            const auto &task = tasks[id];
+            if (!task.sync_start || task.has_predicate || task.graph_invocation >= 0 || !may_defer) continue;
+            const uint32_t mask = task.active_mask;
+            const uint32_t blocks = static_cast<uint32_t>(task.block_num);
+            if (!(mask == 1 && blocks == clusters) &&
+                !(mask == 2 && blocks == clusters * PLATFORM_AIV_CORES_PER_BLOCKDIM) &&
+                !(mask == 7 && blocks == clusters))
+                continue;
+            // Both lists are projections of global rank, including expanded Graph bodies.
+            const uint32_t rank = metadata[id].global_order_id;
+            for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
+                while (prefix[l] < list_count[l] &&
+                       metadata[percounter_order_task_id(orders[l][prefix[l]])].global_order_id < rank)
+                    ++prefix[l];
+            }
+            const uint32_t domain = mask == 1 ? 0 : 1;
+            if (prefix[domain] == list_count[domain] ||
+                percounter_order_task_id(orders[domain][prefix[domain]]) != id || may_defer(static_cast<uint32_t>(id)))
+                continue;
+            auto &counter = counters[id];
+            counter.dispatch_flags = PERCOUNTER_DISPATCH_INTERVAL_ENTRY;
+            for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
+                counter.entry_prefix_end[l] = UINT64_MAX;
+                if ((mask & (l == 0 ? 1U : 6U)) == 0 || prefix[l] == 0) continue;
+                while (segments[control->segment_begin[l] + segment[l]].end < prefix[l])
+                    ++segment[l];
+                counter.entry_prefix_end[l] = (uint64_t{segment[l]} << 32) | prefix[l];
+            }
+        }
+    }
+
     // Templates, back to back, then one record per invocation pointing at its own.
     std::vector<uint64_t> template_offset(graph.template_count, 0);
     uint64_t template_cursor = 0;

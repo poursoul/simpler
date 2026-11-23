@@ -637,6 +637,89 @@ TEST(PercounterAcquire, CommittedCohortRunsWhenGoEvenIfEarlierOrdinaryBecomesRea
     EXPECT_EQ(f.calls.size(), 4U);
 }
 
+TEST(PercounterAcquire, FullWidthMixWaitsForEarlierLocalClaims) {
+    auto producer = task(2);
+    producer.published_off_lane = true;
+    const int32_t root = 0;
+    auto earlier = task(1);
+    earlier.fanin_ids = &root;
+    earlier.fanin_count = 1;
+    const int32_t predecessors[] = {1, 2};
+    auto later = task(1);
+    later.fanin_ids = predecessors;
+    later.fanin_count = 2;
+    Fixture f({producer, earlier, task(7, 2, true), later}, 2, {}, false, false, synchronous_task);
+    const uint32_t rank = f.cfg[0].metadata[2].global_order_id;
+    ASSERT_LT(f.cfg[0].metadata[1].global_order_id, rank);
+    ASSERT_GT(f.cfg[0].metadata[3].global_order_id, rank);
+    f.step(1);
+    f.step(4);
+    if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
+        ASSERT_EQ(f.counters[2].dispatch_flags, PERCOUNTER_DISPATCH_INTERVAL_ENTRY);
+        EXPECT_EQ(f.counters[2].entry_prefix_end[0], 1U);
+        PercounterCandidate entry;
+        ASSERT_TRUE(percounter_shared_candidate(f.cfg[0], 0, &entry));
+        EXPECT_FALSE(percounter_entry_prefix_drained(f.cfg[0], f.state[0], entry));
+        for (int i = 0; i < 4; ++i)
+            f.step(0);
+        ASSERT_NE(f.state[0].occupied, 0U);
+        ASSERT_EQ(percounter_order_task_id(f.state[0].slots[0].entry), 1);
+        EXPECT_FALSE(f.state[0].slots[0].ready);
+        EXPECT_EQ(f.signals[0].mix[0].enter_ready[0], 0U);
+        for (int i = 0; i < 4; ++i)
+            f.step(3);
+        ASSERT_NE(f.state[3].occupied, 0U);
+        ASSERT_EQ(percounter_order_task_id(f.state[3].slots[0].entry), 3);
+        EXPECT_FALSE(f.state[3].slots[0].ready);
+        ASSERT_NE(f.signals[1].mix[0].enter_ready[0], 0U);
+    } else {
+        EXPECT_EQ(f.counters[2].dispatch_flags, 0U);
+        for (int i = 0; i < 4; ++i)
+            f.step(0);
+        EXPECT_NE(f.signals[0].mix[0].enter_ready[0], 0U);
+    }
+    f.counters[0].value = PERCOUNTER_COUNTER_PUBLISHED;
+    f.drain();
+    ASSERT_EQ(f.calls.size(), 8U);
+    if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) EXPECT_EQ(f.calls.front()[0], 1);
+    f.expect_completed(2);
+    f.expect_completed(3);
+}
+
+TEST(PercounterAcquire, FullWidthPureEntryWaitsForTheLocalMixKernel) {
+    for (const uint32_t mask : {1U, 2U}) {
+        Fixture f({task(7), task(mask, mask == 1 ? 2 : 4, true)}, 2, {}, false, false, synchronous_task);
+        const int peer = mask == 1 ? 0 : 2;
+        ASSERT_LT(f.cfg[peer].metadata[0].global_order_id, f.cfg[peer].metadata[1].global_order_id);
+        if constexpr (PERCOUNTER_PENDING_CAPACITY == 1)
+            EXPECT_EQ(f.counters[1].dispatch_flags, PERCOUNTER_DISPATCH_INTERVAL_ENTRY);
+        f.step(peer);
+        EXPECT_EQ(f.state[peer].committed, -1);
+        bool returned_mixes_can_release_record = false;
+        const auto original = execute;
+        execute = [&](int64_t *args) {
+            original(args);
+            if (args[0] != 0 || f.running_lane != peer) return;
+            for (int i = 0; i < 6; ++i)
+                for (int lane = 0; lane < 6; ++lane)
+                    if (lane != peer) f.step(lane);
+            EXPECT_FALSE(f.completed(0));
+            EXPECT_NE(f.signals[0].mix[0].generation, f.state[peer].committed_generation);
+            EXPECT_TRUE(std::none_of(f.calls.begin(), f.calls.end(), [](const auto &call) {
+                return call[0] == 1;
+            }));
+            returned_mixes_can_release_record = true;
+            f.running_lane = peer;
+            percounter_bind_sim_context(&f.signals[0].contexts[peer].value);
+        };
+        f.drain();
+        EXPECT_TRUE(returned_mixes_can_release_record);
+        EXPECT_EQ(f.calls.size(), mask == 1 ? 5U : 7U);
+        f.expect_completed(0);
+        f.expect_completed(1);
+    }
+}
+
 TEST(PercounterAcquire, CompletedEvenBlocksDoNotReleaseConsumerBeforeOddBlock) {
     int32_t producer = 0;
     auto consumer = task(2);
@@ -2108,6 +2191,28 @@ TEST(PercounterAcquire, CommittedSyncWaitingForOtherBlockDoesNotDelayReadyOrdina
     EXPECT_EQ(f.calls.front()[0], 1);
     f.drain();
     EXPECT_EQ(f.calls.size(), 7U);
+}
+
+TEST(PercounterAcquire, CommittedFullWidthEntryKeepsLaterReadyClaim) {
+    Fixture f({task(7, 2, true), task(2)}, 2, {}, false, false, synchronous_task);
+    percounter_claim(f.cfg[2], &f.state[2]);
+    ASSERT_NE(f.state[2].occupied, 0U);
+    ASSERT_EQ(percounter_order_task_id(f.state[2].slots[0].entry), 1);
+    for (int lane : {1, 0, 1, 2})
+        f.step(lane);
+    if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
+        ASSERT_GE(f.state[2].committed, 0);
+        EXPECT_TRUE(f.state[2].committed_interval_entry);
+        EXPECT_TRUE(f.state[2].slots[0].ready);
+        EXPECT_TRUE(f.calls.empty());
+    } else {
+        ASSERT_EQ(f.calls.size(), 1U);
+        EXPECT_EQ(f.calls.front()[0], 1);
+    }
+    f.drain();
+    EXPECT_EQ(f.calls.size(), 7U);
+    f.expect_completed(0);
+    f.expect_completed(1);
 }
 
 TEST(PercounterAcquire, OrdinaryClaimLeavesNextPositionForAnotherLane) {

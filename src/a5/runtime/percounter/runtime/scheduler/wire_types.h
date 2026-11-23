@@ -51,6 +51,7 @@ inline constexpr uint32_t PERCOUNTER_PENDING_CAPACITY = 1;
 static_assert(PERCOUNTER_PENDING_CAPACITY == 1 || PERCOUNTER_PENDING_CAPACITY == 2 || PERCOUNTER_PENDING_CAPACITY == 4);
 inline constexpr uint32_t PERCOUNTER_SLOT_MASK = (1U << PERCOUNTER_PENDING_CAPACITY) - 1;
 inline constexpr uint32_t PERCOUNTER_NO_SYNC = UINT32_MAX;
+inline constexpr uint32_t PERCOUNTER_DISPATCH_INTERVAL_ENTRY = 1U << 0;
 
 // Payload and publication generation have one writer: the cluster's AIV0.
 // Each participant exclusively writes its own entry and idle tokens.
@@ -140,7 +141,10 @@ struct alignas(128) PercounterCounter {
     uint64_t arguments_address;
     uint64_t completion_notify_address;
     uint32_t completion_notify_target;  // cumulative credits in the chain
-    uint8_t reserved[36];
+    uint32_t dispatch_flags;
+    uint8_t reserved[16];
+    // Per list: local segment in the high word, exclusive order position in the low word.
+    uint64_t entry_prefix_end[PERCOUNTER_CORE_TYPE_COUNT];
 };
 static_assert(sizeof(PercounterCounter) == 128, "a counter owns one GM sector");
 static_assert(std::is_trivially_copyable_v<PercounterCounter> && std::is_standard_layout_v<PercounterCounter>);

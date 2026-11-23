@@ -482,6 +482,7 @@ struct PercounterLaneState {
     uint64_t committed_entry{0};
     uint64_t committed_function_address{0};
     uint32_t committed_generation{0};
+    bool committed_interval_entry{false};
     // A nonzero mask pins the local launch snapshot across SSBUF reuse.
     uint32_t entering_mix_mask{0};
 #if defined(__CCE_AICORE__)
@@ -1493,6 +1494,26 @@ inline __aicore__ bool percounter_execute_ready(
     return true;
 }
 
+inline __aicore__ bool percounter_entry_prefix_drained(
+    const LaneConfig &cfg, const PercounterLaneState &state, const PercounterCandidate &entry
+) {
+    // An unready ordinary claim or a MIX coordinator still owes its lane a turn.
+    if ((state.occupied | state.revisit) != 0 && state.slots[0].metadata.global_order_id < entry.rank) return false;
+
+    const uint32_t list = cfg.cluster_lane == 0 ? 0 : 1;
+    const uint64_t prefix =
+        percounter_gm_read_immutable_word(&cfg.counters[percounter_order_task_id(entry.entry)].entry_prefix_end[list]);
+    if (prefix == UINT64_MAX) return true;
+
+    const uint32_t segment = static_cast<uint32_t>(prefix >> 32);
+    const auto &source = state.source;
+    if (source.segment != segment) return source.segment > segment;
+    if (source.loaded_segment != segment) return false;
+    const uint32_t end = static_cast<uint32_t>(prefix);
+    return end == source.begin || source.interval_spent ||
+           percounter_gm_read(cfg.tickets[source.ticket_begin].next) >= end - source.begin;
+}
+
 inline __aicore__ bool percounter_select_ready(
     const LaneConfig &cfg, PercounterLaneState *state, PercounterCandidate *selected, bool *executed
 ) {
@@ -1502,7 +1523,9 @@ inline __aicore__ bool percounter_select_ready(
     // Publication, entry and new claims are serviced on every scheduling pass.
     const bool probe_dependencies = state->idle_passes < 16 || (state->idle_passes & 3U) == 0;
     const bool mix_coordinator = cfg.cluster_lane == 1 && cfg.mix_task_count != 0 && !state->mix_closed;
-    const bool claimed = state->occupied == 0;
+    const bool waiting_entry =
+        PERCOUNTER_PENDING_CAPACITY == 1 && state->committed >= 0 && state->committed_interval_entry;
+    const bool claimed = state->occupied == 0 && !waiting_entry;
     if (claimed) percounter_claim(cfg, state);
     if (mix_coordinator) percounter_publish_mix_floor(cfg, state);
     // An acquired lower bound remains valid for every later scan. Refresh
@@ -1574,11 +1597,26 @@ inline __aicore__ bool percounter_select_ready(
         state->committed = -1;
     }
     state->required_mix_floor = cohort.index >= 0 ? cohort.rank : 0;
-    const bool ordinary_first = ordinary.index >= 0 && percounter_candidate_before(ordinary, cohort) &&
-                                !percounter_commit_matches(*state, cohort);
+    const bool committed = percounter_commit_matches(*state, cohort);
+    const bool ordinary_first = ordinary.index >= 0 && percounter_candidate_before(ordinary, cohort) && !committed;
+    bool can_enter = cohort.index >= 0 && cohort.ready && !ordinary_first && state->observed_mix_floor >= cohort.rank &&
+                     percounter_source_floor(cfg, state->source, false) >= cohort.rank;
+    bool interval_entry = false;
+    if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
+        if (can_enter && !committed && cohort.sync_index != PERCOUNTER_NO_SYNC) {
+            const uint32_t list = cfg.cluster_lane == 0 ? 0 : 1;
+            const uint32_t blocks = static_cast<uint32_t>(percounter_order_block_num(cohort.entry));
+            const uint64_t id = percounter_order_task_id(cohort.entry);
+            if (id < cfg.table_task_count && (cohort.mask == 1 || cohort.mask == 2 || cohort.mask == 7) &&
+                percounter_claim_is_static(cfg, list, cohort.shared, true, blocks)) {
+                const uint32_t flags = percounter_gm_read(cfg.counters[id].dispatch_flags);
+                interval_entry = (flags & PERCOUNTER_DISPATCH_INTERVAL_ENTRY) != 0;
+                if (interval_entry) can_enter = percounter_entry_prefix_drained(cfg, *state, cohort);
+            }
+        }
+    }
     bool cohort_go = false;
-    if (cohort.index >= 0 && cohort.ready && !ordinary_first && state->observed_mix_floor >= cohort.rank &&
-        percounter_source_floor(cfg, state->source, false) >= cohort.rank) {
+    if (can_enter) {
         ProfileScope entry_scope(cfg.scalar, ProfilePhase::Entry);
         const int32_t identity = cohort.shared ? PERCOUNTER_PENDING_CAPACITY + cohort.index : cohort.index;
         if (state->committed >= 0 && state->committed != identity) {
@@ -1590,7 +1628,7 @@ inline __aicore__ bool percounter_select_ready(
         const bool prefetched_mix = cohort.shared && state->prefetched_mix_entry == cohort.entry &&
                                     state->prefetched_mix_generation == cohort.generation;
 #endif
-        if (cohort.mask != 0 && !percounter_commit_matches(*state, cohort)) {
+        if (cohort.mask != 0 && !committed) {
             const uint32_t role = cohort.shared ? cfg.cluster_lane : __builtin_ctz(cohort.mask);
             const int64_t id = percounter_order_task_id(cohort.entry);
             uint64_t function;
@@ -1615,6 +1653,9 @@ inline __aicore__ bool percounter_select_ready(
         state->committed = identity;
         state->committed_entry = cohort.entry;
         state->committed_generation = cohort.generation;
+        if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
+            if (!committed) state->committed_interval_entry = interval_entry;
+        }
         if (cohort.shared) {
             if (percounter_ssbuf_load_acquire(&record->enter_ready[cfg.cluster_lane]) != cohort.generation) {
                 percounter_schedule_checkpoint(cfg, PercounterTaskEventKind::EntryCommitted, cohort.entry);
@@ -1671,11 +1712,13 @@ inline __aicore__ bool percounter_select_ready(
             if (!percounter_mix_launch_ready(cfg, cohort)) return true;
         }
     }
-    if (cohort_go || ordinary.index >= 0) {
+    const bool entered_interval =
+        PERCOUNTER_PENDING_CAPACITY == 1 && state->committed >= 0 && state->committed_interval_entry;
+    if (cohort_go || (ordinary.index >= 0 && !entered_interval)) {
         *selected = cohort_go ? cohort : ordinary;
         return true;
     }
-    if (!claimed) {
+    if (!claimed && !entered_interval) {
         percounter_claim(cfg, state);
         if (mix_coordinator) percounter_publish_mix_floor(cfg, state);
     }

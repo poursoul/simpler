@@ -352,13 +352,17 @@ int run(int argc, char **argv) {
     if (rank < 0 || rank >= ranks) throw std::runtime_error("Rank outside original workload");
     ChipWorker worker;
     CallConfig config;
-    const uint64_t heaps[] = {2ULL << 30, 2ULL << 30, 1ULL << 30, 512ULL << 20};
+    // The captured full forward keeps intermediates for the entire host-built graph.
+    const uint64_t primary_heap = (runtime_name == "tensormap_and_ringbuffer" ? 2ULL : 4ULL) << 30;
+    const uint64_t heaps[] = {primary_heap, 2ULL << 30, 1ULL << 30, 512ULL << 20};
     for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
         config.runtime_env.ring_task_window[i] = 262144;
         config.runtime_env.ring_heap[i] = heaps[i];
         config.runtime_env.ring_dep_pool[i] = 131072;
     }
-    const auto host_runtime = libraries / runtime_name / "libhost_runtime.so";
+    const auto runtime_dir = libraries / runtime_name;
+    const bool wrapped = fs::is_regular_file(runtime_dir / "device_start_gate.o");
+    const auto host_runtime = runtime_dir / (ranks == 1 && wrapped ? "libhost_runtime_impl.so" : "libhost_runtime.so");
     worker.init(
         host_runtime.string(), (libraries / runtime_name / "libaicpu_kernel.so").string(),
         (libraries / runtime_name / "aicore_kernel.o").string(),

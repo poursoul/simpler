@@ -97,7 +97,7 @@ struct Fixture {
     explicit Fixture(
         std::vector<TaskInput> in = {task(1), task(1), task(1)}, uint32_t clusters = 2,
         const ExternalAddresses &external = {}, bool fold_dependencies = false, bool enable_terminal = false,
-        const std::function<bool(uint32_t)> &may_defer = {}
+        const std::function<bool(uint32_t)> &may_defer = {}, bool enable_startup = false
     ) :
         inputs(std::move(in)),
         storage(inputs.size()),
@@ -122,11 +122,12 @@ struct Fixture {
                 storage[i].task.kernel_id[lane] = (t.active_mask & (1U << lane)) ? 1 : -1;
         }
         const auto dispatch =
-            plan_host_dispatch(inputs.data(), inputs.size(), clusters, {}, enable_terminal, may_defer);
+            plan_host_dispatch(inputs.data(), inputs.size(), clusters, {}, enable_terminal, may_defer, enable_startup);
         EXPECT_TRUE(dispatch.has_value());
         EXPECT_TRUE(plan_layout(
             inputs.size(), blocks, dispatch->fanin_ids.size(), dispatch->order_count, &layout, dispatch->mix_task_count,
-            dispatch->boundary_task_count, dispatch->sync_cohort_count
+            dispatch->boundary_task_count, dispatch->sync_cohort_count, {}, 0, 0, dispatch->pre_dispatch_words(),
+            dispatch->terminal.has_value()
         ));
         region.resize(layout.total_size + 128);
         auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(region.data()) + 127) & ~uintptr_t{127});
@@ -965,6 +966,92 @@ TEST(PercounterResourceOrder, MultipleMergedSpansKeepEarlierGapsBeforeTheInterva
     EXPECT_EQ(merged.tasks, (std::vector<uint32_t>{1, 3, 0, 2, 4}));
     ASSERT_EQ(merged.spans.size(), 3U);
     EXPECT_EQ(merged.spans.back().end - merged.spans.back().begin, 3U);
+}
+
+TEST(PercounterAcquire, PredispatchPlacementIsAtomicAndPrefersAiv1) {
+    PredispatchWave wave(2);
+    ASSERT_TRUE(wave.place(0, 1, 2));
+    EXPECT_EQ(wave.lanes()[2], percounter_order_entry(0, 0, 1));
+    EXPECT_EQ(wave.lanes()[1], PredispatchWave::invalid_entry());
+    const auto before = wave.lanes();
+    EXPECT_FALSE(wave.place(1, 2, 5));
+    EXPECT_EQ(wave.lanes(), before);
+    ASSERT_TRUE(wave.place(1, 1, 5));
+    EXPECT_EQ(wave.lanes()[3], percounter_order_entry(1, 0, 1));
+    EXPECT_EQ(wave.lanes()[5], percounter_order_entry(1, 0, 1));
+    EXPECT_EQ(wave.lanes()[4], PredispatchWave::invalid_entry());
+    EXPECT_FALSE(wave.uses_type_layout());
+}
+
+TEST(PercounterAcquire, StartupTableDispatchesReadyOwnersAndLeavesDependentTaskInOrderList) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Startup dispatch requires a single pending slot.";
+    const int32_t producer = 0;
+    auto consumer = task(2);
+    consumer.fanin_count = 1;
+    consumer.fanin_ids = &producer;
+    Fixture f({task(2), consumer, task(1)}, 2, {}, false, false, synchronous_task, true);
+    ASSERT_NE(f.control->startup_pre_dispatch, 0U);
+    EXPECT_EQ(f.control->startup_pre_dispatch & PERCOUNTER_PREDISPATCH_TYPE_LAYOUT, 0U);
+    EXPECT_EQ(f.control->predispatch_has_mix, 0U);
+    EXPECT_EQ(f.layout.order_count[0], 0U);
+    EXPECT_EQ(f.layout.order_count[1], 1U);
+    EXPECT_EQ(f.cfg[2].fanin[1].count, 1);
+    for (uint32_t lane = 0; lane < f.cfg.size(); ++lane) {
+        f.running_lane = lane;
+        percounter_bind_sim_context(&f.signals[lane / 3].contexts[lane % 3].value);
+        ASSERT_TRUE(percounter_run_predispatch(f.cfg[lane], &f.state[lane], f.control->startup_pre_dispatch, 1));
+    }
+    ASSERT_EQ(f.calls.size(), 2U);
+    EXPECT_EQ(f.calls[0], (std::array<int64_t, 3>{2, 0, 0}));
+    EXPECT_EQ(f.calls[1], (std::array<int64_t, 3>{0, 0, 2}));
+    f.drain();
+    EXPECT_EQ(f.calls.size(), 3U);
+    f.expect_completed(1);
+}
+
+TEST(PercounterAcquire, StartupFullWidthEntryUsesTheTwoTypeTableAndRetainsStart) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Startup dispatch requires a single pending slot.";
+    const int32_t producer = 0;
+    auto follower = task(1, 2, true);
+    follower.fanin_ids = &producer;
+    follower.fanin_count = 1;
+    Fixture f({task(1, 2, true), follower}, 2, {}, false, false, synchronous_task, true);
+    ASSERT_NE(f.control->startup_pre_dispatch & PERCOUNTER_PREDISPATCH_TYPE_LAYOUT, 0U);
+    const auto *table =
+        scheduler_state_at<uint64_t>(f.control, f.control->startup_pre_dispatch & ~PERCOUNTER_PREDISPATCH_TYPE_LAYOUT);
+    EXPECT_EQ(f.layout.pre_dispatch_words, 2U);
+    EXPECT_EQ(table[0], percounter_order_entry(0, PERCOUNTER_ORDER_BLOCK_IDX_SPMD, 2));
+    EXPECT_EQ(table[1], PredispatchWave::invalid_entry());
+    EXPECT_EQ(f.layout.order_count[0], 0U);
+    EXPECT_EQ(f.layout.sync_cohort_count, 1U);
+    EXPECT_EQ(f.cfg[0].metadata[0].sync_index, 0U);
+    EXPECT_EQ(f.counters[0].next_task[0], 1U);
+}
+
+TEST(PercounterResourceOrder, StartupWaveStopsAtTheGraphInvocation) {
+    const auto group = task(1);
+    auto graph = task(0);
+    graph.graph_invocation = 0;
+    const TaskInput inputs[]{group, graph, task(2)};
+    HostDispatchPlan plan;
+    plan.order = {0, 1, 2};
+    const auto start = plan_startup_wave(inputs, plan, 2);
+    ASSERT_TRUE(start.has_value());
+    EXPECT_EQ(start->tasks, (std::vector<uint32_t>{0}));
+}
+
+TEST(PercounterAcquire, TerminalOnlyImageReservesClusterSignals) {
+    const int32_t producers[]{0, 1};
+    auto projection = task(7, 2);
+    projection.fanin_ids = &producers[0];
+    projection.fanin_count = 1;
+    auto sink = task(7, 2);
+    sink.fanin_ids = &producers[1];
+    sink.fanin_count = 1;
+    Fixture f({task(2, 4), projection, sink}, 2, {}, false, true, synchronous_task);
+    ASSERT_EQ(f.control->terminal.step_count, 3U);
+    EXPECT_EQ(f.layout.mix_task_count, 0U);
+    EXPECT_NE(f.control->mix_signal_ready_offset, 0U);
 }
 
 TEST(PercounterAcquire, CompletedEvenBlocksDoNotReleaseConsumerBeforeOddBlock) {

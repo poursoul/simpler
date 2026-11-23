@@ -258,7 +258,7 @@ inline StateSelection select_percounter_state(
         }
         return false;
     };
-    const auto dispatch = plan_host_dispatch(inputs.data(), task_count, clusters, graph_plan, true, may_defer);
+    const auto dispatch = plan_host_dispatch(inputs.data(), task_count, clusters, graph_plan, true, may_defer, true);
     if (!dispatch) {
         LOG_ERROR("A5 percounter: cannot plan a dispatch order");
         return StateSelection::FAILED;
@@ -268,7 +268,7 @@ inline StateSelection select_percounter_state(
     if (!plan_layout(
             task_count, block_total, dispatch->fanin_ids.size(), dispatch->order_count, &layout,
             dispatch->mix_task_count, dispatch->boundary_task_count, sync_cohort_count, graph.layout, execution_count,
-            runtime->dev.chip_swimlane_level
+            runtime->dev.chip_swimlane_level, dispatch->pre_dispatch_words(), dispatch->terminal.has_value()
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
         return StateSelection::FAILED;

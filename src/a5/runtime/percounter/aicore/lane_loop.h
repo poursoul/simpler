@@ -275,14 +275,15 @@ inline __aicore__ SchedulerGraphView percounter_task_graph(const PercounterTask 
  * held of it from an earlier run. Its counter word changes under other cores'
  * atomics, but nothing here reads it.
  */
-inline __aicore__ bool percounter_resolve(const LaneConfig &cfg, int64_t id, PercounterTask *task) {
+inline __aicore__ bool
+percounter_resolve(const LaneConfig &cfg, int64_t id, PercounterTask *task, bool load_fanin = true) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Resolve);
     if (id < 0 || static_cast<uint64_t>(id) >= cfg.task_count) {
         percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
         return false;
     }
     if (static_cast<uint64_t>(id) < cfg.table_task_count) {
-        const PercounterFaninView view = percounter_fanin_view(cfg, id);
+        const PercounterFaninView view = load_fanin ? percounter_fanin_view(cfg, id) : PercounterFaninView{};
         *task = PercounterTask{
             id,
             id,
@@ -348,9 +349,10 @@ inline __aicore__ void percounter_prefetch_arguments(uint64_t address, __gm__ Pe
 }
 #endif
 
-inline __aicore__ bool
-percounter_resolve_dispatch(const LaneConfig &cfg, int64_t id, uint32_t mask, PercounterTask *task) {
-    if (!percounter_resolve(cfg, id, task)) return false;
+inline __aicore__ bool percounter_resolve_dispatch(
+    const LaneConfig &cfg, int64_t id, uint32_t mask, PercounterTask *task, bool load_fanin = true
+) {
+    if (!percounter_resolve(cfg, id, task, load_fanin)) return false;
     if (mask != 0) {
         auto &counter = cfg.counters[id];
         task->function_address = percounter_gm_read(counter.function_addresses[__builtin_ctz(mask)]);
@@ -729,7 +731,8 @@ struct PercounterCandidate {
 };
 
 inline __aicore__ bool percounter_clear_mix_signal(const LaneConfig &cfg, uint64_t timeout_cycles) {
-    if (cfg.mix_task_count == 0 && !cfg.control->terminal.step_count != 0) return true;
+    if (cfg.mix_task_count == 0 && cfg.control->terminal.step_count == 0 && cfg.control->predispatch_has_mix == 0)
+        return true;
     auto *ready = cfg.mix_signal_ready + cfg.cluster_index;
     if (cfg.cluster_lane == 1) {
         for (uint32_t i = 0; i < PERCOUNTER_PENDING_CAPACITY; ++i)
@@ -743,6 +746,11 @@ inline __aicore__ bool percounter_clear_mix_signal(const LaneConfig &cfg, uint64
             for (uint32_t role = 0; role < PLATFORM_CORES_PER_BLOCKDIM; ++role)
                 percounter_ssbuf_store_field(&cfg.ssbuf->terminal_ready[role], uint32_t{0});
             percounter_memory_barrier();
+        }
+        if (cfg.control->predispatch_has_mix != 0) {
+            for (uint32_t role = 0; role < PLATFORM_CORES_PER_BLOCKDIM; ++role)
+                percounter_ssbuf_store_field(&cfg.ssbuf->predispatch_ready[role], uint32_t{0});
+            percounter_ssbuf_store_release(&cfg.ssbuf->predispatch_grant, uint32_t{0});
         }
         percounter_gm_store(*ready, uint64_t{1});
     }
@@ -1482,6 +1490,80 @@ percounter_run_interval(const LaneConfig &cfg, PercounterLaneState *state, uint3
     return true;
 }
 
+inline __aicore__ bool percounter_predispatch_roles_ready(const LaneConfig &cfg, uint32_t mask, uint32_t token) {
+    for (uint32_t role = 0; role < PLATFORM_CORES_PER_BLOCKDIM; ++role) {
+        if ((mask & (1U << role)) != 0 && percounter_ssbuf_load_field(&cfg.ssbuf->predispatch_ready[role]) < token)
+            return false;
+    }
+    percounter_memory_barrier();
+    return true;
+}
+
+__attribute__((noinline)) inline __aicore__ bool
+percounter_run_predispatch(const LaneConfig &cfg, PercounterLaneState *state, uint64_t ref, uint32_t token) {
+    const bool type_layout = (ref & PERCOUNTER_PREDISPATCH_TYPE_LAYOUT) != 0;
+    const auto *entries = scheduler_state_at<uint64_t>(cfg.control, ref & ~PERCOUNTER_PREDISPATCH_TYPE_LAYOUT);
+    const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
+    const uint32_t index = type_layout ? (lane == 0 ? 0 : 1) : cfg.cluster_index * PLATFORM_CORES_PER_BLOCKDIM + lane;
+    const uint64_t saved = percounter_gm_read_immutable_word(entries + index);
+    const uint32_t id = static_cast<uint32_t>(percounter_order_task_id(saved));
+    if (id == UINT32_MAX) return true;
+    if (!percounter_poll_wait(cfg, state, 0)) return false;
+    const auto metadata = percounter_metadata(cfg, id);
+    const uint32_t mask = metadata.active_mask;
+    const bool pure_vector = mask == 2;
+    const bool mix = __builtin_popcount(mask) > 1;
+    const uint32_t role = pure_vector ? 1 : lane;
+    uint32_t block = static_cast<uint32_t>(percounter_order_block_idx(saved));
+    if (type_layout) block = pure_vector ? cfg.cluster_index * cfg.aiv_per_cluster + lane - 1 : cfg.cluster_index;
+    const uint32_t blocks = metadata.block_num;
+    const uint64_t entry = percounter_order_entry(id, block, blocks);
+    const bool leader = !mix || lane == static_cast<uint32_t>(__builtin_ctz(mask));
+    if (leader) {
+        const uint64_t assigned = percounter_task_event_clock(cfg);
+        percounter_record_task_event(cfg, PercounterTaskEventKind::Claim, entry, assigned, assigned, 0, mask, mix);
+    }
+    PercounterTask task;
+    if (!percounter_resolve_dispatch(cfg, id, 1U << role, &task, false)) return false;
+    percounter_schedule_checkpoint(cfg, PercounterTaskEventKind::InputsReady, entry);
+
+    if (mix) {
+        percounter_ssbuf_store_release(&cfg.ssbuf->predispatch_ready[lane], token);
+        if (leader) {
+            for (uint32_t iteration = 0; !percounter_predispatch_roles_ready(cfg, mask, token); ++iteration)
+                if (!percounter_poll_wait(cfg, state, iteration)) return false;
+        }
+    }
+    if (leader && metadata.sync_index != PERCOUNTER_NO_SYNC) {
+        percounter_schedule_checkpoint(cfg, PercounterTaskEventKind::EntryCommitted, entry);
+        const auto notify = percounter_sync_notify(cfg, state, metadata.sync_index);
+        percounter_start_arrive(cfg, notify, metadata.sync_index, block);
+        for (uint32_t iteration = 0; !percounter_start_ready(cfg, notify, metadata.sync_index, blocks, block);
+             ++iteration)
+            if (!percounter_poll_wait(cfg, state, iteration)) return false;
+    }
+    if (mix) {
+        if (leader) {
+            percounter_ssbuf_store_release(&cfg.ssbuf->predispatch_grant, token);
+        } else {
+            for (uint32_t iteration = 0; percounter_ssbuf_load_field(&cfg.ssbuf->predispatch_grant) < token;
+                 ++iteration)
+                if (!percounter_poll_wait(cfg, state, iteration)) return false;
+            percounter_memory_barrier();
+        }
+    }
+
+    percounter_record_task_event(cfg, PercounterTaskEventKind::Ready, entry, percounter_task_event_clock(cfg));
+    const uint64_t completion = percounter_completion_address(cfg, id);
+    bool deferred = false;
+    if (!percounter_run_task(cfg, state, task, block, blocks, role, completion, &deferred, entry)) return false;
+    if (!deferred) percounter_publish_completion(cfg, task, completion, 1, entry);
+    percounter_commit_task_timing(cfg);
+    if (metadata.sync_index == PERCOUNTER_NO_SYNC) return true;
+    const uint32_t flags = percounter_gm_read(cfg.counters[id].dispatch_flags);
+    return (flags & PERCOUNTER_DISPATCH_INTERVAL_MEMBER) == 0 || percounter_run_interval(cfg, state, id);
+}
+
 inline __aicore__ bool percounter_execute_ready(
     const LaneConfig &cfg, PercounterLaneState *state, const PercounterCandidate &selected, bool *executed
 ) {
@@ -1897,6 +1979,10 @@ inline __aicore__ void percounter_lane_loop(LaneConfig &cfg) {
     if (percounter_should_stop(cfg)) return;
     PercounterLaneState state{};
     percounter_initialize_boundaries(cfg, &state.source);
+    if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
+        const uint64_t startup = cfg.control->startup_pre_dispatch;
+        if (startup != 0 && !percounter_run_predispatch(cfg, &state, startup, 1)) return;
+    }
     for (uint64_t iterations = 0;; ++iterations) {
         bool executed;
         if (!percounter_step(cfg, &state, &executed)) break;
@@ -2034,7 +2120,7 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
         return {};
     }
 #endif
-    if (cfg.mix_task_count != 0 || control->terminal.step_count != 0) {
+    if (cfg.mix_task_count != 0 || control->terminal.step_count != 0 || control->predispatch_has_mix != 0) {
         cfg.mix_signal_ready = scheduler_state_at<uint64_t>(control, control->mix_signal_ready_offset);
         if (!percounter_clear_mix_signal(cfg, timeout_cycles)) return {};
     }

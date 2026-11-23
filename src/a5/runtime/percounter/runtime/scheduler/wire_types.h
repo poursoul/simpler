@@ -53,6 +53,8 @@ inline constexpr uint32_t PERCOUNTER_SLOT_MASK = (1U << PERCOUNTER_PENDING_CAPAC
 inline constexpr uint32_t PERCOUNTER_NO_SYNC = UINT32_MAX;
 inline constexpr uint32_t PERCOUNTER_DISPATCH_INTERVAL_ENTRY = 1U << 0;
 inline constexpr uint32_t PERCOUNTER_DISPATCH_INTERVAL_MEMBER = 1U << 1;
+inline constexpr uint32_t PERCOUNTER_DISPATCH_PREDISPATCHED = 1U << 2;
+inline constexpr uint64_t PERCOUNTER_PREDISPATCH_TYPE_LAYOUT = 1U;
 
 // Payload and publication generation have one writer: the cluster's AIV0.
 // Each participant exclusively writes its own entry and idle tokens.
@@ -94,7 +96,10 @@ struct alignas(64) PercounterSsbufRegion {
     PercounterInvocationContextSlot contexts[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t terminal_ready[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t terminal_grant[PERCOUNTER_TERMINAL_MAX_STEPS];
-    uint8_t tail_reserved[64 - sizeof(terminal_ready) - sizeof(terminal_grant)];
+    volatile uint32_t predispatch_ready[PLATFORM_CORES_PER_BLOCKDIM];
+    volatile uint32_t predispatch_grant;
+    uint8_t tail_reserved
+        [64 - sizeof(terminal_ready) - sizeof(terminal_grant) - sizeof(predispatch_ready) - sizeof(predispatch_grant)];
 };
 static_assert(sizeof(PercounterSsbufRegion) == PERCOUNTER_SSBUF_REGION_SIZE);
 static_assert(
@@ -527,7 +532,9 @@ struct alignas(128) PercounterControl {
     uint64_t lane_error_task;
     uint64_t lane_error_detail;
     uint32_t first_boundary_segment[PERCOUNTER_SYNC_DOMAIN_COUNT];
-    uint32_t planned_clusters;  // nonzero when static links require this exact topology
+    uint32_t planned_clusters;  // exact topology for static dispatch and barrier proofs
+    uint64_t startup_pre_dispatch;
+    uint32_t predispatch_has_mix;
 
     // Allocation precedes the corresponding block's completed publication.
     // Both counters are monotone; equality after all blocks ran permits exit.

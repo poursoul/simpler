@@ -34,6 +34,7 @@
 #include "host_build_graph/host/control_folding.h"
 #include "host_build_graph/runtime_types.h"
 #include "full_width_order.h"
+#include "pre_dispatch.h"
 #include "resource_order.h"
 #include "terminal_pipeline.h"
 #include "scheduler/wire_types.h"
@@ -74,6 +75,8 @@ struct PercounterLayout {
     // MIX tasks share the vector list and publish records through cluster SSBUF.
     uint64_t mix_task_count;
     uint64_t mix_signal_ready_offset;
+    uint64_t pre_dispatch_offset;
+    uint64_t pre_dispatch_words;
     uint64_t boundary_task_count;
     uint64_t task_claims_offset;
     uint64_t claim_summary_offset;
@@ -200,7 +203,8 @@ inline bool plan_layout(
     uint64_t task_count, uint64_t block_total, uint64_t edge_count,
     const uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT], PercounterLayout *layout, uint64_t mix_task_count = 0,
     uint64_t boundary_task_count = 0, uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {},
-    uint64_t execution_count = 0, uint32_t profiling_level = 0
+    uint64_t execution_count = 0, uint32_t profiling_level = 0, uint64_t pre_dispatch_words = 0,
+    bool has_terminal = false
 ) {
     if (layout == nullptr || order_count == nullptr) return false;
     const uint64_t table_task_count = task_count;
@@ -221,6 +225,7 @@ inline bool plan_layout(
 
     PercounterLayout next{};
     next.profiling_level = profiling_level;
+    next.pre_dispatch_words = pre_dispatch_words;
     next.task_record_capacity = static_cast<uint32_t>(std::min(block_total, uint64_t{65536}));
     if (profiling_level >= 2) {
         // L2 adds at most four one-shot checkpoints per block on a lane.
@@ -253,7 +258,9 @@ inline bool plan_layout(
         !PERCOUNTER_RESERVE(next.ticket_interval_count, PercounterTicket, tickets_offset) ||
         !PERCOUNTER_RESERVE(order_count[0], uint64_t, orders_offset[0]) ||
         !PERCOUNTER_RESERVE(order_count[1], uint64_t, orders_offset[1]) ||
-        (mix_task_count != 0 && !PERCOUNTER_RESERVE(SCHEDULER_CLUSTER_CAPACITY, uint64_t, mix_signal_ready_offset)) ||
+        ((mix_task_count != 0 || pre_dispatch_words != 0 || has_terminal) &&
+         !PERCOUNTER_RESERVE(SCHEDULER_CLUSTER_CAPACITY, uint64_t, mix_signal_ready_offset)) ||
+        (pre_dispatch_words != 0 && !PERCOUNTER_RESERVE(pre_dispatch_words, uint64_t, pre_dispatch_offset)) ||
         !PERCOUNTER_RESERVE(
             (boundary_task_count + PERCOUNTER_LIST_COUNT + 63) / 64, PercounterClaimSummary, claim_summary_offset
         ) ||
@@ -520,6 +527,7 @@ struct HostDispatchPlan {
 
     std::vector<uint32_t> order;
     std::optional<TerminalPipeline> terminal;
+    std::optional<StartupPredispatch> startup;
     std::vector<IntervalTask> intervals;
     std::vector<FullWidthSpan> interval_spans;
     std::vector<uint32_t> fanin_offsets;
@@ -536,6 +544,20 @@ struct HostDispatchPlan {
 
     bool is_interior(uint32_t id) const {
         return !intervals.empty() && intervals[id].flags == PERCOUNTER_DISPATCH_INTERVAL_MEMBER;
+    }
+
+    bool is_interval_entry(uint32_t id) const {
+        return !intervals.empty() && (intervals[id].flags & PERCOUNTER_DISPATCH_INTERVAL_ENTRY) != 0;
+    }
+
+    bool is_predispatched(uint32_t id) const {
+        return !intervals.empty() && (intervals[id].flags & PERCOUNTER_DISPATCH_PREDISPATCHED) != 0;
+    }
+
+    uint64_t pre_dispatch_words() const {
+        if (!startup) return 0;
+        const auto &wave = startup->wave;
+        return wave.uses_type_layout() ? wave.types().size() : wave.lanes().size();
     }
 };
 
@@ -589,7 +611,7 @@ inline bool plan_device_fanin(
 
 inline std::optional<HostDispatchPlan> plan_host_dispatch(
     const TaskInput *tasks, size_t task_count, uint32_t clusters, const GraphPlanInput &graph, bool enable_terminal,
-    const std::function<bool(uint32_t)> &may_defer
+    const std::function<bool(uint32_t)> &may_defer, bool enable_startup = false
 ) {
     if ((tasks == nullptr && task_count != 0) || task_count > UINT32_MAX) return std::nullopt;
     std::vector<ResourceOrderTask> nodes(task_count);
@@ -715,6 +737,15 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
         }
     }
     if (!plan_device_fanin(tasks, plan, width, synchronous, clusters)) return std::nullopt;
+    if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
+        if (enable_startup) plan.startup = plan_startup_wave(tasks, plan, clusters);
+        if (plan.startup) {
+            plan.planned_clusters = clusters;
+            if (plan.intervals.empty()) plan.intervals.resize(task_count);
+            for (const uint32_t id : plan.startup->tasks)
+                plan.intervals[id].flags |= PERCOUNTER_DISPATCH_PREDISPATCHED;
+        }
+    }
     for (uint32_t id = 0; id < task_count; ++id) {
         const auto &task = tasks[id];
         if (task.inline_completed || task.published_off_lane || plan.is_interior(id)) continue;
@@ -727,7 +758,7 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
             plan.sync_cohort_count += body.sync_cohort_count;
         } else {
             plan.sync_cohort_count += task.sync_start;
-            if (plan.is_terminal(id)) continue;
+            if (plan.is_terminal(id) || plan.is_predispatched(id)) continue;
             if (task.core_type_index >= PERCOUNTER_LIST_COUNT) return std::nullopt;
             ++plan.order_count[task.is_mix ? 1 : task.core_type_index];
             plan.mix_task_count += task.is_mix;
@@ -771,11 +802,26 @@ inline bool build_tables(
         return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
     if (dispatch.fanin_offsets.size() != task_count + 1 || dispatch.fanin_ids.size() != layout.edge_count)
         return fail(BuildStatus::EDGE_COUNT_MISMATCH, -1, -1);
+    if (dispatch.pre_dispatch_words() != layout.pre_dispatch_words ||
+        ((dispatch.startup || dispatch.terminal) && layout.mix_signal_ready_offset == 0))
+        return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
 
     std::memset(base, 0, static_cast<size_t>(layout.upload_size));
 
     auto *control = region_at<PercounterControl>(base, layout.control_offset);
     control->planned_clusters = dispatch.planned_clusters;
+    if (dispatch.startup) {
+        const auto &wave = dispatch.startup->wave;
+        control->predispatch_has_mix = wave.has_mix();
+        auto *table = region_at<uint64_t>(base, layout.pre_dispatch_offset);
+        control->startup_pre_dispatch = layout.pre_dispatch_offset;
+        if (wave.uses_type_layout()) {
+            std::copy(wave.types().begin(), wave.types().end(), table);
+            control->startup_pre_dispatch |= PERCOUNTER_PREDISPATCH_TYPE_LAYOUT;
+        } else {
+            std::copy(wave.lanes().begin(), wave.lanes().end(), table);
+        }
+    }
     for (auto &head : control->first_boundary_segment)
         head = PERCOUNTER_NO_BOUNDARY;
     auto *fanin = region_at<PercounterFanin>(base, layout.fanin_offset);
@@ -918,7 +964,7 @@ inline bool build_tables(
             return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
         if (dispatch.is_interior(id)) continue;
         if (task.sync_start) ++sync_cohorts;
-        if (dispatch.is_terminal(id)) continue;
+        if (dispatch.is_terminal(id) || dispatch.is_predispatched(id)) continue;
         if (task.block_num > 1 || task.is_mix) ++boundary_tasks;
         if (task.is_mix) ++mix_tasks;
         if (!accept(task.is_mix ? 1 : task.core_type_index, 1, id))
@@ -977,6 +1023,10 @@ inline bool build_tables(
                 global_rank++, static_cast<uint16_t>(task.active_mask), static_cast<uint16_t>(task.block_num),
                 needs_start ? sync_index++ : PERCOUNTER_NO_SYNC, PERCOUNTER_NO_BOUNDARY
             };
+            if (needs_start && (dispatch.is_predispatched(id) || dispatch.is_terminal(id))) {
+                const uint32_t domain = task.is_mix ? 2 : task.core_type_index;
+                control->max_sync_blocks[domain] = std::max(control->max_sync_blocks[domain], uint64_t(task.block_num));
+            }
             if (!dispatch.intervals.empty()) {
                 const auto &link = dispatch.intervals[id];
                 counters[id].dispatch_flags = link.flags;

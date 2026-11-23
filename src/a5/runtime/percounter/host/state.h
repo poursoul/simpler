@@ -181,10 +181,6 @@ inline StateSelection select_percounter_state(
     }
     std::vector<int32_t> edges;
     std::vector<size_t> edge_begin(task_count, 0);
-    uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
-    uint64_t mix_task_count = 0;
-    uint64_t boundary_task_count = 0;
-    uint64_t sync_cohort_count = 0;
     uint64_t completion_notify_count = 0;
     // Each GRAPH task places its body's blocks, and holds one of its own that
     // no list carries.
@@ -198,11 +194,6 @@ inline StateSelection select_percounter_state(
         if (input.graph_invocation >= 0) {
             const HostGraphTemplate &tmpl =
                 graph.templates[graph.invocations[static_cast<size_t>(input.graph_invocation)].template_index];
-            order_count[0] += tmpl.orders[0].size();
-            order_count[1] += tmpl.orders[1].size();
-            mix_task_count += tmpl.mix_task_count;
-            boundary_task_count += tmpl.boundary_task_count;
-            sync_cohort_count += tmpl.sync_cohort_count;
             ++block_total;
             for (const auto &body_task : tmpl.tasks)
                 execution_count += body_task.subtask_total;
@@ -225,13 +216,7 @@ inline StateSelection select_percounter_state(
             input.is_mix = placement == TaskPlacement::MIX;
             input.subtask_count = __builtin_popcount(active_mask);
             execution_count += static_cast<uint64_t>(input.block_num) * input.subtask_count;
-            // SPMD tasks allocate blocks through a task-private counter.
-            const uint64_t entries = 1;
-            if (input.block_num > 1 || input.is_mix) ++boundary_task_count;
-            if (input.sync_start) ++sync_cohort_count;
             if (percounter_completion_notify_eligible(input)) ++completion_notify_count;
-            if (input.is_mix) mix_task_count += entries;
-            order_count[input.is_mix ? 1 : input.core_type_index] += entries;
             block_total += static_cast<uint64_t>(input.block_num);
         } else {
             ++block_total;
@@ -256,16 +241,38 @@ inline StateSelection select_percounter_state(
         edge_count = 0;
         for (const auto &input : inputs)
             edge_count += static_cast<uint64_t>(input.fanin_count);
-        for (const int64_t id : folded)
-            --order_count[inputs[id].core_type_index];
         execution_count -= folded.size();
         LOG_TIMING("A5 percounter: folded %zu dependency-only tasks", folded.size());
     }
 
+    const uint32_t clusters = static_cast<uint32_t>(runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM);
+    const GraphPlanInput graph_plan{
+        graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
+    };
+    const auto may_defer = [&](uint32_t id) {
+        const auto &input = inputs[id];
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            if ((input.active_mask & (1U << lane)) == 0) continue;
+            try {
+                const auto capability = runtime->get_function_async_capability(task_metadata[id].kernel_ids[lane]);
+                if (capability.mode != CoreAsyncMode::SYNCHRONOUS) return true;
+            } catch (const std::exception &) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto dispatch = plan_host_dispatch(inputs.data(), task_count, clusters, graph_plan, true, may_defer);
+    if (!dispatch) {
+        LOG_ERROR("A5 percounter: cannot plan a dispatch order");
+        return StateSelection::FAILED;
+    }
+    const uint64_t sync_cohort_count = dispatch->sync_cohort_count;
     PercounterLayout layout{};
     if (!plan_layout(
-            task_count, block_total, edge_count, order_count, &layout, mix_task_count, boundary_task_count,
-            sync_cohort_count, graph.layout, execution_count, runtime->dev.chip_swimlane_level
+            task_count, block_total, edge_count, dispatch->order_count, &layout, dispatch->mix_task_count,
+            dispatch->boundary_task_count, sync_cohort_count, graph.layout, execution_count,
+            runtime->dev.chip_swimlane_level
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
         return StateSelection::FAILED;
@@ -336,26 +343,8 @@ inline StateSelection select_percounter_state(
         external.completion_notify_count = notify_addresses.size() - sync_cohort_count;
     }
     BuildResult build{};
-    const GraphPlanInput graph_plan{
-        graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
-    };
-    const auto may_defer = [&](uint32_t id) {
-        const auto &input = inputs[id];
-        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-            if ((input.active_mask & (1U << lane)) == 0) continue;
-            try {
-                const auto capability = runtime->get_function_async_capability(task_metadata[id].kernel_ids[lane]);
-                if (capability.mode != CoreAsyncMode::SYNCHRONOUS) return true;
-            } catch (const std::exception &) {
-                return true;
-            }
-        }
-        return false;
-    };
     if (!build_tables(
-            inputs.data(), task_count, layout, host_base, device_base,
-            static_cast<uint32_t>(runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM), external, &build,
-            graph_plan, true, may_defer
+            inputs.data(), task_count, *dispatch, layout, host_base, device_base, external, &build, graph_plan
         )) {
         LOG_ERROR(
             "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status), build.task_id,

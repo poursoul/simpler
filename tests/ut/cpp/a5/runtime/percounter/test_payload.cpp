@@ -61,6 +61,19 @@ TaskInput task(uint32_t mask, int blocks = 1, bool sync = false) {
     return result;
 }
 
+bool build_test_tables(
+    const TaskInput *tasks, uint64_t task_count, const PercounterLayout &layout, void *base, uint64_t device_base,
+    uint32_t clusters, const ExternalAddresses &external = {}, BuildResult *result = nullptr,
+    const GraphPlanInput &graph = {}, bool enable_terminal = false, const std::function<bool(uint32_t)> &may_defer = {}
+) {
+    const auto dispatch = plan_host_dispatch(tasks, task_count, clusters, graph, enable_terminal, may_defer);
+    if (!dispatch) {
+        if (result) *result = BuildResult{BuildStatus::INVALID_ARGUMENT};
+        return false;
+    }
+    return build_tables(tasks, task_count, *dispatch, layout, base, device_base, external, result, graph);
+}
+
 struct Fixture {
     std::vector<TaskInput> inputs;
     std::vector<std::vector<int32_t>> folded_rows;
@@ -97,18 +110,11 @@ struct Fixture {
             std::vector<int64_t> folded;
             EXPECT_TRUE(percounter_fold_dependency_tasks(inputs, folded_rows, folded));
         }
-        uint64_t counts[2]{};
-        uint64_t mix = 0, spmd = 0, sync = 0, blocks = 0, edges = 0;
+        uint64_t blocks = 0, edges = 0;
         for (size_t i = 0; i < inputs.size(); ++i) {
             const auto &t = inputs[i];
             blocks += t.block_num;
             edges += t.fanin_count;
-            if (!t.inline_completed && !t.published_off_lane) {
-                if (t.is_mix) ++mix;
-                ++counts[t.is_mix ? 1 : t.core_type_index];
-                spmd += t.block_num > 1 || t.is_mix;
-                sync += t.sync_start;
-            }
             scalars[i] = i;
             storage[i].task.task_id = TaskId::make_global(i);
             storage[i].payload.scalar_count = 1;
@@ -116,12 +122,17 @@ struct Fixture {
             for (int lane = 0; lane < 3; ++lane)
                 storage[i].task.kernel_id[lane] = (t.active_mask & (1U << lane)) ? 1 : -1;
         }
-        EXPECT_TRUE(plan_layout(inputs.size(), blocks, edges, counts, &layout, mix, spmd, sync));
+        const auto dispatch =
+            plan_host_dispatch(inputs.data(), inputs.size(), clusters, {}, enable_terminal, may_defer);
+        EXPECT_TRUE(dispatch.has_value());
+        EXPECT_TRUE(plan_layout(
+            inputs.size(), blocks, edges, dispatch->order_count, &layout, dispatch->mix_task_count,
+            dispatch->boundary_task_count, dispatch->sync_cohort_count
+        ));
         region.resize(layout.total_size + 128);
         auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(region.data()) + 127) & ~uintptr_t{127});
         EXPECT_TRUE(build_tables(
-            inputs.data(), inputs.size(), layout, base, reinterpret_cast<uint64_t>(base), clusters, external, nullptr,
-            {}, enable_terminal, may_defer
+            inputs.data(), inputs.size(), *dispatch, layout, base, reinterpret_cast<uint64_t>(base), external
         ));
         control = reinterpret_cast<PercounterControl *>(base);
         counters = region_at<PercounterCounter>(base, layout.counters_offset);
@@ -720,6 +731,114 @@ TEST(PercounterAcquire, FullWidthPureEntryWaitsForTheLocalMixKernel) {
     }
 }
 
+TEST(PercounterAcquire, IndependentPureEntriesShareTheFullWidthMixSuccessor) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Static links require a single pending slot.";
+    Fixture f({task(7, 2, true), task(1, 2, true), task(2, 4, true)}, 2, {}, false, false, synchronous_task);
+    EXPECT_EQ(f.layout.order_count[0], 1U);
+    EXPECT_EQ(f.layout.order_count[1], 1U);
+    EXPECT_EQ(f.layout.sync_cohort_count, 2U);
+    EXPECT_EQ(f.counters[1].next_task[0], 0U);
+    EXPECT_EQ(f.counters[2].next_task[1], 0U);
+    EXPECT_EQ(f.cfg[0].metadata[0].sync_index, PERCOUNTER_NO_SYNC);
+    EXPECT_EQ(f.control->planned_clusters, 2U);
+    f.drain();
+    ASSERT_EQ(f.calls.size(), 12U);
+    for (int lane = 0; lane < 6; ++lane) {
+        const int expected_first = lane % 3 == 0 ? 1 : 2;
+        std::vector<int> executed;
+        for (const auto &call : f.calls)
+            if (call[2] == lane) executed.push_back(static_cast<int>(call[0]));
+        EXPECT_EQ(executed, (std::vector<int>{expected_first, 0})) << lane;
+    }
+    f.expect_completed(0);
+}
+
+TEST(PercounterResourceOrder, FullWidthMixNeedsAnEntryForEachType) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Static links require a single pending slot.";
+    const int32_t producers[]{0, 1};
+    auto second = task(1, 2, true);
+    second.fanin_ids = &producers[0];
+    second.fanin_count = 1;
+    auto mix = task(7, 2, true);
+    mix.fanin_ids = &producers[1];
+    mix.fanin_count = 1;
+    const TaskInput tasks[]{task(1, 2, true), second, mix};
+    const auto plan = plan_host_dispatch(tasks, std::size(tasks), 2, {}, false, synchronous_task);
+    ASSERT_TRUE(plan.has_value());
+    EXPECT_EQ(plan->intervals[0].next[0], 1U);
+    EXPECT_TRUE(plan->is_interior(1));
+    EXPECT_FALSE(plan->is_interior(2));
+    EXPECT_EQ(plan->intervals[1].next[0], UINT32_MAX);
+    EXPECT_EQ(plan->intervals[2].flags, PERCOUNTER_DISPATCH_INTERVAL_ENTRY);
+}
+
+TEST(PercounterAcquire, StaticSuccessorKeepsFaninAndDropsStart) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Static links require a single pending slot.";
+    const int32_t producer = 0;
+    auto vectors = task(2, 4, true);
+    vectors.fanin_ids = &producer;
+    vectors.fanin_count = 1;
+    Fixture f({task(7, 2, true), vectors}, 2, {}, false, false, synchronous_task);
+    EXPECT_EQ(f.layout.sync_cohort_count, 1U);
+    EXPECT_EQ(f.counters[0].next_task[0], UINT32_MAX);
+    EXPECT_EQ(f.counters[0].next_task[1], 1U);
+    EXPECT_EQ(f.cfg[2].metadata[1].sync_index, PERCOUNTER_NO_SYNC);
+    EXPECT_EQ(f.cfg[2].fanin[1].count, 1);
+    EXPECT_EQ(f.cfg[2].fanin_addresses[f.cfg[2].fanin[1].begin], reinterpret_cast<uint64_t>(&f.counters[0].value));
+}
+
+TEST(PercounterResourceOrder, MovesOnlyGapsThatPreserveDependenciesAndGraphBoundary) {
+    const int32_t left = 0;
+    const int32_t gap = 1;
+    const std::vector<uint8_t> width{3, 0, 3};
+    const std::vector<uint8_t> synchronous{1, 1, 1};
+    FullWidthOrder initial{{0, 1, 2}, {{0, 1, 0, 3, true}, {1, 2, 0, 0, false}, {2, 3, 0, 3, true}}, {1}, {1, 2}};
+    TaskInput tasks[]{task(7, 2, true), task(1), task(7, 2, true)};
+    tasks[2].fanin_count = 1;
+    tasks[2].fanin_ids = &gap;
+    const auto forward = merge_full_width_spans(tasks, initial, width, synchronous);
+    EXPECT_EQ(forward.tasks, (std::vector<uint32_t>{1, 0, 2}));
+    ASSERT_EQ(forward.spans.size(), 2U);
+    EXPECT_EQ(forward.spans[1].end - forward.spans[1].begin, 2U);
+    tasks[1].fanin_count = 1;
+    tasks[1].fanin_ids = &left;
+    EXPECT_EQ(merge_full_width_spans(tasks, initial, width, synchronous).spans.size(), 3U);
+    tasks[2].fanin_count = 0;
+    const auto backward = merge_full_width_spans(tasks, initial, width, synchronous);
+    EXPECT_EQ(backward.tasks, (std::vector<uint32_t>{0, 2, 1}));
+    EXPECT_EQ(backward.spans.size(), 2U);
+    initial.spans[2].graph_segment = 1;
+    EXPECT_EQ(merge_full_width_spans(tasks, initial, width, synchronous).tasks, initial.tasks);
+}
+
+TEST(PercounterResourceOrder, EdgeFreeOrdinaryTasksDoNotCreateMergeGaps) {
+    const TaskInput inputs[]{task(7, 2, true), task(1), task(7, 2, true), task(2)};
+    const std::vector<uint8_t> width{3, 0, 3, 0};
+    const auto first = make_full_width_order(inputs, {0, 1, 2, 3}, width, {1, 1, 1, 1}, {0, 0, 0, 0});
+    EXPECT_EQ(first.tasks, (std::vector<uint32_t>{1, 3, 0, 2}));
+    EXPECT_TRUE(first.edge_consumers.empty());
+    EXPECT_TRUE(first.merge_gaps.empty());
+}
+
+TEST(PercounterResourceOrder, MultipleMergedSpansKeepEarlierGapsBeforeTheInterval) {
+    const int32_t gaps[]{1, 3};
+    TaskInput inputs[]{task(7, 2, true), task(1), task(7, 2, true), task(2), task(7, 2, true)};
+    inputs[2].fanin_ids = &gaps[0];
+    inputs[2].fanin_count = 1;
+    inputs[4].fanin_ids = &gaps[1];
+    inputs[4].fanin_count = 1;
+    const FullWidthOrder initial{
+        {0, 1, 2, 3, 4},
+        {{0, 1, 0, 3, true}, {1, 2, 0, 0, false}, {2, 3, 0, 3, true}, {3, 4, 0, 0, false}, {4, 5, 0, 3, true}},
+        {1, 3},
+        {2, 4}
+    };
+    const auto merged = merge_full_width_spans(inputs, initial, {3, 0, 3, 0, 3}, {1, 1, 1, 1, 1});
+    EXPECT_EQ(merged.tasks, (std::vector<uint32_t>{1, 3, 0, 2, 4}));
+    ASSERT_EQ(merged.spans.size(), 3U);
+    EXPECT_EQ(merged.spans.back().end - merged.spans.back().begin, 3U);
+}
+
 TEST(PercounterAcquire, CompletedEvenBlocksDoNotReleaseConsumerBeforeOddBlock) {
     int32_t producer = 0;
     auto consumer = task(2);
@@ -1231,7 +1350,7 @@ TEST(PercounterPayload, NotifyTableCarriesOnlyTheMappedSetAddress) {
     ExternalAddresses external{};
     external.sync_notify = sets.data();
     external.sync_notify_count = sets.size();
-    ASSERT_TRUE(build_tables(inputs.data(), inputs.size(), layout, base, address, 2, external));
+    ASSERT_TRUE(build_test_tables(inputs.data(), inputs.size(), layout, base, address, 2, external));
     const auto *table = region_at<uint64_t>(base, layout.sync_notify_offset);
     EXPECT_EQ(table[0], first);
     EXPECT_EQ(table[1], 0U);
@@ -1363,7 +1482,7 @@ TEST(PercounterAcquire, MixTaskCountMustMatchMergedVectorList) {
     layout.mix_task_count = 0;
     std::vector<uint8_t> backing(layout.total_size + 127);
     auto *bytes = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(backing.data()) + 127) & ~uintptr_t{127});
-    EXPECT_FALSE(build_tables(f.inputs.data(), f.inputs.size(), layout, bytes, 0, 2));
+    EXPECT_FALSE(build_test_tables(f.inputs.data(), f.inputs.size(), layout, bytes, 0, 2));
 }
 
 TEST(PercounterAcquire, RealTopologyRejectsOverwideSync) {
@@ -1380,7 +1499,7 @@ TEST(PercounterAcquire, RejectsUnrepresentableSpmdBlockCount) {
     auto *base = reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(storage.data()) + 127) & ~uintptr_t{127});
     const auto input = task(1, 65536);
     BuildResult result;
-    EXPECT_FALSE(build_tables(&input, 1, layout, base, 0, 2, {}, &result));
+    EXPECT_FALSE(build_test_tables(&input, 1, layout, base, 0, 2, {}, &result));
     EXPECT_EQ(result.status, BuildStatus::INVALID_ARGUMENT);
 }
 
@@ -1582,7 +1701,7 @@ TEST(PercounterAcquire, GraphBodyRanksAndSyncBoundariesExistBeforeMaterializatio
     ASSERT_TRUE(plan_layout(3, 6, 1, counts, &layout, 1, 1, 1, graph_layout));
     std::vector<uint8_t> backing(layout.total_size + 127);
     auto *bytes = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(backing.data()) + 127) & ~uintptr_t{127});
-    ASSERT_TRUE(build_tables(inputs.data(), inputs.size(), layout, bytes, 0, 2, {}, nullptr, graph));
+    ASSERT_TRUE(build_test_tables(inputs.data(), inputs.size(), layout, bytes, 0, 2, {}, nullptr, graph));
     const auto *metadata = region_at<PercounterTaskMetadata>(bytes, layout.metadata_offset);
     EXPECT_EQ(metadata[3].global_order_id, 0U);
     EXPECT_EQ(metadata[4].global_order_id, 1U);
@@ -1621,7 +1740,7 @@ TEST(PercounterAcquire, HostSeedsGraphCompletionBeforeAnyBodyClaim) {
     ASSERT_TRUE(plan_layout(1, blocks + 1, 0, counts, &layout, 0, 1, 0, graph_layout));
     std::vector<uint8_t> bytes(layout.total_size + 128, 0xa5);
     auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(bytes.data()) + 127) & ~uintptr_t{127});
-    ASSERT_TRUE(build_tables(&shell, 1, layout, base, reinterpret_cast<uint64_t>(base), 2, {}, nullptr, graph));
+    ASSERT_TRUE(build_test_tables(&shell, 1, layout, base, reinterpret_cast<uint64_t>(base), 2, {}, nullptr, graph));
     const auto *counters = region_at<PercounterCounter>(base, layout.counters_offset);
     const auto *claims = region_at<PercounterTaskClaim>(base, layout.task_claims_offset);
     EXPECT_EQ(counters[1].value, percounter_counter_preset(blocks));
@@ -2202,7 +2321,7 @@ TEST(PercounterAcquire, CommittedFullWidthEntryKeepsLaterReadyClaim) {
         f.step(lane);
     if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
         ASSERT_GE(f.state[2].committed, 0);
-        EXPECT_TRUE(f.state[2].committed_interval_entry);
+        EXPECT_NE(f.state[2].committed_dispatch_flags & PERCOUNTER_DISPATCH_INTERVAL_ENTRY, 0U);
         EXPECT_TRUE(f.state[2].slots[0].ready);
         EXPECT_TRUE(f.calls.empty());
     } else {
@@ -3642,7 +3761,7 @@ TEST(PercounterPayload, TaskTimingPartitionsOwnWholeCacheLines) {
     TaskInput task{};
     task.block_num = 3;
     task.subtask_count = 1;
-    ASSERT_TRUE(build_tables(&task, 1, layout, base, address, 2, {}));
+    ASSERT_TRUE(build_test_tables(&task, 1, layout, base, address, 2, {}));
     const auto *buffers = region_at<PercounterProfileBuffer>(base, layout.profile_buffers_offset);
     for (uint32_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         EXPECT_EQ(buffers[worker].task_records_offset % 64, 0) << worker;

@@ -110,6 +110,10 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     }
 
     cache_invalidate_range(control, sizeof(*control));
+    if (control->planned_clusters != 0 && control->planned_clusters != static_cast<uint32_t>(aic_count)) {
+        LOG_ERROR("A5 percounter: static dispatch needs %u clusters, got %d", control->planned_clusters, aic_count);
+        return -1;
+    }
     if (!percounter_sync_widths_fit(control->max_sync_blocks, aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM)) {
         LOG_ERROR("A5 percounter: sync_start width exceeds the reported topology");
         return -1;

@@ -33,6 +33,7 @@
 #include "host_build_graph/host/completion_counter_plan.h"
 #include "host_build_graph/host/control_folding.h"
 #include "host_build_graph/runtime_types.h"
+#include "full_width_order.h"
 #include "resource_order.h"
 #include "terminal_pipeline.h"
 #include "scheduler/wire_types.h"
@@ -207,7 +208,7 @@ inline bool plan_layout(
     task_count = table_task_count + graph.body_task_count;
     if (block_total < task_count) return false;
     if (mix_task_count > order_count[1]) return false;
-    if (sync_cohort_count > boundary_task_count || boundary_task_count > task_count ||
+    if (sync_cohort_count > task_count || boundary_task_count > task_count ||
         boundary_task_count > UINT32_MAX - PERCOUNTER_LIST_COUNT)
         return false;
     uint64_t placed = 0;
@@ -511,6 +512,163 @@ struct BuildResult {
     int32_t fanin_index = -1;
 };
 
+struct HostDispatchPlan {
+    struct IntervalTask {
+        uint32_t flags{0};
+        uint32_t next[PERCOUNTER_LIST_COUNT]{UINT32_MAX, UINT32_MAX};
+    };
+
+    std::vector<uint32_t> order;
+    std::optional<TerminalPipeline> terminal;
+    std::vector<IntervalTask> intervals;
+    uint64_t order_count[PERCOUNTER_LIST_COUNT]{};
+    uint64_t mix_task_count{0};
+    uint64_t boundary_task_count{0};
+    uint64_t sync_cohort_count{0};
+    uint32_t planned_clusters{0};
+
+    bool is_terminal(uint32_t id) const {
+        return terminal && std::find(terminal->steps.begin(), terminal->steps.end(), id) != terminal->steps.end();
+    }
+
+    bool is_interior(uint32_t id) const {
+        return !intervals.empty() && intervals[id].flags == PERCOUNTER_DISPATCH_INTERVAL_MEMBER;
+    }
+};
+
+inline std::optional<HostDispatchPlan> plan_host_dispatch(
+    const TaskInput *tasks, size_t task_count, uint32_t clusters, const GraphPlanInput &graph, bool enable_terminal,
+    const std::function<bool(uint32_t)> &may_defer
+) {
+    if ((tasks == nullptr && task_count != 0) || task_count > UINT32_MAX) return std::nullopt;
+    std::vector<ResourceOrderTask> nodes(task_count);
+    for (uint32_t id = 0; id < task_count; ++id) {
+        const auto &task = tasks[id];
+        auto &node = nodes[id];
+        if (task.fanin_count < 0 || (task.fanin_count != 0 && task.fanin_ids == nullptr) || task.block_num < 1 ||
+            static_cast<uint64_t>(task.block_num) > PERCOUNTER_ORDER_BLOCK_MASK)
+            return std::nullopt;
+        for (int32_t i = 0; i < task.fanin_count; ++i) {
+            const uint32_t producer = static_cast<uint32_t>(task.fanin_ids[i]);
+            if (producer >= id) return std::nullopt;
+            node.predecessors.push_back(producer);
+        }
+        if (task.graph_invocation >= 0) {
+            const size_t invocation = static_cast<size_t>(task.graph_invocation);
+            if (invocation >= graph.invocation_count || graph.invocations == nullptr || graph.templates == nullptr ||
+                graph.invocations[invocation].template_index >= graph.template_count)
+                return std::nullopt;
+            const auto &body = graph.templates[graph.invocations[invocation].template_index];
+            node.active_mask = body.active_mask;
+            node.reserve_types = true;
+            node.duration = body.virtual_duration;
+            node.depth = body.depth;
+        } else if (task.inline_completed || task.published_off_lane) {
+            node.duration = 0;
+        } else {
+            node.active_mask = task.active_mask;
+            node.blocks = static_cast<uint32_t>(task.block_num);
+            node.sync = task.sync_start;
+            if (task.active_mask == 0) node.duration = 0;
+        }
+    }
+    HostDispatchPlan plan;
+    if (enable_terminal && may_defer && graph.invocation_count == 0 && task_count != 0) {
+        auto terminal = plan_proven_terminal_pipeline(tasks, task_count, clusters, may_defer);
+        if (terminal && terminal->steps.size() <= PERCOUNTER_TERMINAL_MAX_STEPS &&
+            terminal->prerequisites.size() <= PERCOUNTER_TERMINAL_MAX_PREREQUISITES)
+            plan.terminal = std::move(terminal);
+    }
+    auto schedule = make_resource_order(nodes, clusters);
+    if (!schedule) return std::nullopt;
+    plan.order = std::move(schedule->tasks);
+    if (plan.terminal) {
+        const auto retained = std::remove_if(plan.order.begin(), plan.order.end(), [&](uint32_t id) {
+            return plan.is_terminal(id);
+        });
+        plan.order.erase(retained, plan.order.end());
+        plan.order.insert(plan.order.end(), plan.terminal->steps.begin(), plan.terminal->steps.end());
+    }
+    if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
+        if (may_defer) {
+            std::vector<uint8_t> width(task_count);
+            uint32_t candidate_count = 0;
+            for (const uint32_t id : plan.order) {
+                const uint8_t type = percounter_full_width_type(tasks[id], clusters);
+                if (type == 0 || plan.is_terminal(id) || may_defer(id)) continue;
+                width[id] = type;
+                ++candidate_count;
+            }
+            if (candidate_count != 0) {
+                plan.intervals.resize(task_count);
+                for (const uint32_t id : plan.order)
+                    if (width[id] != 0) plan.intervals[id].flags = PERCOUNTER_DISPATCH_INTERVAL_ENTRY;
+            }
+            if (candidate_count > 1) {
+                std::vector<uint8_t> synchronous(task_count);
+                std::vector<uint32_t> groups(task_count);
+                uint32_t group = 0;
+                for (const uint32_t id : plan.order) {
+                    if (tasks[id].graph_invocation >= 0 || plan.is_terminal(id)) {
+                        groups[id] = ++group;
+                        ++group;
+                        continue;
+                    }
+                    groups[id] = group;
+                    synchronous[id] = !tasks[id].published_off_lane && (width[id] != 0 || !may_defer(id));
+                }
+                auto first = make_full_width_order(tasks, plan.order, width, synchronous, groups);
+                auto merged = merge_full_width_spans(tasks, std::move(first), width, synchronous);
+                bool compressed = false;
+                for (const auto &span : merged.spans) {
+                    if (span.types == 0) continue;
+                    uint32_t next[PERCOUNTER_LIST_COUNT]{UINT32_MAX, UINT32_MAX};
+                    const bool split_entry =
+                        span.types == PERCOUNTER_TYPES_BOTH && width[merged.tasks[span.begin]] != PERCOUNTER_TYPES_BOTH;
+                    const uint32_t entry_end = span.begin + (split_entry ? 2 : 1);
+                    if (span.end == entry_end) continue;
+                    compressed = true;
+                    for (uint32_t rank = span.end; rank-- > span.begin;) {
+                        const uint32_t id = merged.tasks[rank];
+                        auto &link = plan.intervals[id];
+                        link.flags = PERCOUNTER_DISPATCH_INTERVAL_MEMBER;
+                        if (rank < entry_end) link.flags |= PERCOUNTER_DISPATCH_INTERVAL_ENTRY;
+                        for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
+                            if ((width[id] & (1U << l)) == 0) continue;
+                            link.next[l] = next[l];
+                            next[l] = id;
+                        }
+                    }
+                }
+                if (compressed) {
+                    plan.order = std::move(merged.tasks);
+                    plan.planned_clusters = clusters;
+                }
+            }
+        }
+    }
+    for (uint32_t id = 0; id < task_count; ++id) {
+        const auto &task = tasks[id];
+        if (task.inline_completed || task.published_off_lane || plan.is_interior(id)) continue;
+        if (task.graph_invocation >= 0) {
+            const auto &body = graph.templates[graph.invocations[task.graph_invocation].template_index];
+            for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l)
+                plan.order_count[l] += body.orders[l].size();
+            plan.mix_task_count += body.mix_task_count;
+            plan.boundary_task_count += body.boundary_task_count;
+            plan.sync_cohort_count += body.sync_cohort_count;
+        } else {
+            plan.sync_cohort_count += task.sync_start;
+            if (plan.is_terminal(id)) continue;
+            if (task.core_type_index >= PERCOUNTER_LIST_COUNT) return std::nullopt;
+            ++plan.order_count[task.is_mix ? 1 : task.core_type_index];
+            plan.mix_task_count += task.is_mix;
+            plan.boundary_task_count += task.block_num > 1 || task.is_mix;
+        }
+    }
+    return plan;
+}
+
 template <typename T>
 inline T *region_at(void *base, uint64_t offset) {
     return reinterpret_cast<T *>(static_cast<uint8_t *>(base) + offset);
@@ -530,9 +688,9 @@ inline T *region_at(void *base, uint64_t offset) {
  * failure rather than a device spinning on a counter nobody will set.
  */
 inline bool build_tables(
-    const TaskInput *tasks, uint64_t task_count, const PercounterLayout &layout, void *base, uint64_t device_base,
-    uint32_t clusters, const ExternalAddresses &external = {}, BuildResult *result = nullptr,
-    const GraphPlanInput &graph = {}, bool enable_terminal = false, const std::function<bool(uint32_t)> &may_defer = {}
+    const TaskInput *tasks, uint64_t task_count, const HostDispatchPlan &dispatch, const PercounterLayout &layout,
+    void *base, uint64_t device_base, const ExternalAddresses &external = {}, BuildResult *result = nullptr,
+    const GraphPlanInput &graph = {}
 ) {
     const auto fail = [&](BuildStatus status, int64_t task_id, int32_t fanin_index) {
         if (result != nullptr) *result = BuildResult{status, task_id, fanin_index};
@@ -540,13 +698,14 @@ inline bool build_tables(
     };
     if (result != nullptr) *result = BuildResult{};
     if (base == nullptr || (tasks == nullptr && task_count != 0) || task_count != layout.table_task_count ||
-        graph.invocation_count != layout.graph_invocation_count ||
+        dispatch.order.size() != task_count || graph.invocation_count != layout.graph_invocation_count ||
         (graph.invocation_count != 0 && (graph.invocations == nullptr || graph.templates == nullptr)))
         return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
 
     std::memset(base, 0, static_cast<size_t>(layout.upload_size));
 
     auto *control = region_at<PercounterControl>(base, layout.control_offset);
+    control->planned_clusters = dispatch.planned_clusters;
     for (auto &head : control->first_boundary_segment)
         head = PERCOUNTER_NO_BOUNDARY;
     auto *fanin = region_at<PercounterFanin>(base, layout.fanin_offset);
@@ -693,13 +852,12 @@ inline bool build_tables(
         // keeps the sync sentinel a value no real block index takes.
         if (task.sync_start && (task.block_num < 2 || task.block_num >= PERCOUNTER_ORDER_BLOCK_IDX_SPMD))
             return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
-        const uint64_t placed = 1;
+        if (dispatch.is_interior(id)) continue;
+        if (task.sync_start) ++sync_cohorts;
+        if (dispatch.is_terminal(id)) continue;
         if (task.block_num > 1 || task.is_mix) ++boundary_tasks;
         if (task.is_mix) ++mix_tasks;
-        if (task.sync_start) {
-            ++sync_cohorts;
-        }
-        if (!accept(task.is_mix ? 1 : task.core_type_index, placed, id))
+        if (!accept(task.is_mix ? 1 : task.core_type_index, 1, id))
             return fail(BuildStatus::ORDER_COUNT_MISMATCH, static_cast<int64_t>(id), -1);
     }
     if (boundary_tasks != layout.boundary_task_count || sync_cohorts != layout.sync_cohort_count ||
@@ -720,54 +878,15 @@ inline bool build_tables(
         sinks[sink_count++] = id;
     }
 
-    if (enable_terminal && may_defer && graph.invocation_count == 0 && task_count > 0) {
-        const auto plan = plan_proven_terminal_pipeline(tasks, task_count, clusters, may_defer);
-        if (plan && plan->steps.size() <= std::size(control->terminal.steps) &&
-            plan->prerequisites.size() <= std::size(control->terminal.prerequisites)) {
-            auto &list = eligible[1];
-            const auto kept = std::remove_if(list.begin(), list.end(), [&](int64_t id) {
-                return std::find(plan->steps.begin(), plan->steps.end(), id) != plan->steps.end();
-            });
-            if (static_cast<size_t>(list.end() - kept) != plan->steps.size())
-                return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
-            list.erase(kept, list.end());
-            list_count[1] -= plan->steps.size();
-            entries[1] -= plan->steps.size();
-            for (const auto id : plan->steps) {
-                boundary_tasks -= tasks[id].is_mix || tasks[id].block_num > 1;
-                mix_tasks -= tasks[id].is_mix;
-            }
-            control->terminal.step_count = static_cast<uint32_t>(plan->steps.size());
-            std::copy(plan->steps.begin(), plan->steps.end(), control->terminal.steps);
-            control->terminal.prerequisite_count = static_cast<uint32_t>(plan->prerequisites.size());
-            std::copy(plan->prerequisites.begin(), plan->prerequisites.end(), control->terminal.prerequisites);
-        }
+    if (dispatch.terminal) {
+        const auto &plan = *dispatch.terminal;
+        control->terminal.step_count = static_cast<uint32_t>(plan.steps.size());
+        std::copy(plan.steps.begin(), plan.steps.end(), control->terminal.steps);
+        control->terminal.prerequisite_count = static_cast<uint32_t>(plan.prerequisites.size());
+        std::copy(plan.prerequisites.begin(), plan.prerequisites.end(), control->terminal.prerequisites);
     }
 
-    std::vector<ResourceOrderTask> order_tasks(task_count);
-    for (uint64_t id = 0; id < task_count; ++id) {
-        const auto &task = tasks[id];
-        auto &node = order_tasks[id];
-        for (int32_t e = 0; e < task.fanin_count; ++e)
-            node.predecessors.push_back(static_cast<uint32_t>(task.fanin_ids[e]));
-        if (task.graph_invocation >= 0) {
-            const auto &body = template_of(task);
-            node.active_mask = body.active_mask;
-            node.reserve_types = true;
-            node.duration = body.virtual_duration;
-            node.depth = body.depth;
-        } else if (task.inline_completed || task.published_off_lane) {
-            node.duration = 0;
-        } else {
-            node.active_mask = task.active_mask;
-            node.blocks = static_cast<uint32_t>(task.block_num);
-            node.sync = task.sync_start;
-            if (task.active_mask == 0) node.duration = 0;
-        }
-    }
-    const auto schedule = make_resource_order(order_tasks, clusters);
-    if (!schedule) return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
-    const auto &global_order = schedule->tasks;
+    const auto &global_order = dispatch.order;
     std::vector<uint32_t> position(task_count);
     for (uint32_t rank = 0; rank < global_order.size(); ++rank)
         position[global_order[rank]] = rank;
@@ -789,10 +908,16 @@ inline bool build_tables(
             }
             global_rank += static_cast<uint32_t>(tmpl.tasks.size());
         } else {
+            const bool needs_start = task.sync_start && !dispatch.is_interior(id);
             metadata[id] = {
                 global_rank++, static_cast<uint16_t>(task.active_mask), static_cast<uint16_t>(task.block_num),
-                task.sync_start ? sync_index++ : PERCOUNTER_NO_SYNC, PERCOUNTER_NO_BOUNDARY
+                needs_start ? sync_index++ : PERCOUNTER_NO_SYNC, PERCOUNTER_NO_BOUNDARY
             };
+            if (!dispatch.intervals.empty()) {
+                const auto &link = dispatch.intervals[id];
+                counters[id].dispatch_flags = link.flags;
+                std::copy(std::begin(link.next), std::end(link.next), counters[id].next_task);
+            }
         }
     }
     if (sync_index != layout.sync_cohort_count) return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
@@ -877,13 +1002,8 @@ inline bool build_tables(
         uint32_t segment[PERCOUNTER_LIST_COUNT]{};
         for (const int64_t id : global_order) {
             const auto &task = tasks[id];
-            if (!task.sync_start || task.has_predicate || task.graph_invocation >= 0 || !may_defer) continue;
+            if ((counters[id].dispatch_flags & PERCOUNTER_DISPATCH_INTERVAL_ENTRY) == 0) continue;
             const uint32_t mask = task.active_mask;
-            const uint32_t blocks = static_cast<uint32_t>(task.block_num);
-            if (!(mask == 1 && blocks == clusters) &&
-                !(mask == 2 && blocks == clusters * PLATFORM_AIV_CORES_PER_BLOCKDIM) &&
-                !(mask == 7 && blocks == clusters))
-                continue;
             // Both lists are projections of global rank, including expanded Graph bodies.
             const uint32_t rank = metadata[id].global_order_id;
             for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
@@ -891,12 +1011,7 @@ inline bool build_tables(
                        metadata[percounter_order_task_id(orders[l][prefix[l]])].global_order_id < rank)
                     ++prefix[l];
             }
-            const uint32_t domain = mask == 1 ? 0 : 1;
-            if (prefix[domain] == list_count[domain] ||
-                percounter_order_task_id(orders[domain][prefix[domain]]) != id || may_defer(static_cast<uint32_t>(id)))
-                continue;
             auto &counter = counters[id];
-            counter.dispatch_flags = PERCOUNTER_DISPATCH_INTERVAL_ENTRY;
             for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
                 counter.entry_prefix_end[l] = UINT64_MAX;
                 if ((mask & (l == 0 ? 1U : 6U)) == 0 || prefix[l] == 0) continue;

@@ -521,6 +521,9 @@ struct HostDispatchPlan {
     std::vector<uint32_t> order;
     std::optional<TerminalPipeline> terminal;
     std::vector<IntervalTask> intervals;
+    std::vector<FullWidthSpan> interval_spans;
+    std::vector<uint32_t> fanin_offsets;
+    std::vector<uint32_t> fanin_ids;
     uint64_t order_count[PERCOUNTER_LIST_COUNT]{};
     uint64_t mix_task_count{0};
     uint64_t boundary_task_count{0};
@@ -535,6 +538,54 @@ struct HostDispatchPlan {
         return !intervals.empty() && intervals[id].flags == PERCOUNTER_DISPATCH_INTERVAL_MEMBER;
     }
 };
+
+inline bool plan_device_fanin(
+    const TaskInput *tasks, HostDispatchPlan &plan, const std::vector<uint8_t> &width,
+    const std::vector<uint8_t> &synchronous, uint32_t clusters
+) {
+    const size_t count = plan.order.size();
+    std::vector<uint32_t> rank;
+    std::vector<uint32_t> common_barrier;
+    if (!plan.interval_spans.empty()) {
+        rank.resize(count);
+        common_barrier.resize(count);
+        for (uint32_t p = 0; p < count; ++p)
+            rank[plan.order[p]] = p + 1;
+        for (const auto &span : plan.interval_spans) {
+            uint32_t full = 0;
+            for (uint32_t p = span.begin; p < span.end; ++p) {
+                const uint32_t id = plan.order[p];
+                if (width[id] == PERCOUNTER_TYPES_BOTH) full = p + 1;
+                // Both lane types pass through a common MIX before moving
+                // past it in the interval, even when the next task is pure.
+                common_barrier[id] = full;
+            }
+        }
+    }
+    plan.fanin_offsets.reserve(count + 1);
+    for (uint32_t id = 0; id < count; ++id) {
+        plan.fanin_offsets.push_back(static_cast<uint32_t>(plan.fanin_ids.size()));
+        const uint8_t consumer = rank.empty() ? 0 : width[id];
+        for (int32_t e = 0; e < tasks[id].fanin_count; ++e) {
+            const uint32_t producer = static_cast<uint32_t>(tasks[id].fanin_ids[e]);
+            if (tasks[producer].inline_completed) continue;
+            if (consumer != 0 && synchronous[producer]) {
+                const uint8_t roles = percounter_task_types(tasks[producer].active_mask);
+                // The target's own barrier covers its participating types.
+                // The prior common barrier covers both, strictly below it.
+                const uint32_t bound = (consumer & roles) == roles ? rank[id] : common_barrier[id];
+                if (roles != 0 && rank[producer] < bound) {
+                    plan.planned_clusters = clusters;
+                    continue;
+                }
+            }
+            plan.fanin_ids.push_back(producer);
+        }
+        if (plan.fanin_ids.size() > static_cast<size_t>(INT32_MAX)) return false;
+    }
+    plan.fanin_offsets.push_back(static_cast<uint32_t>(plan.fanin_ids.size()));
+    return true;
+}
 
 inline std::optional<HostDispatchPlan> plan_host_dispatch(
     const TaskInput *tasks, size_t task_count, uint32_t clusters, const GraphPlanInput &graph, bool enable_terminal,
@@ -589,9 +640,11 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
         plan.order.erase(retained, plan.order.end());
         plan.order.insert(plan.order.end(), plan.terminal->steps.begin(), plan.terminal->steps.end());
     }
+    std::vector<uint8_t> width;
+    std::vector<uint8_t> synchronous;
     if constexpr (PERCOUNTER_PENDING_CAPACITY == 1) {
         if (may_defer) {
-            std::vector<uint8_t> width(task_count);
+            width.resize(task_count);
             uint32_t candidate_count = 0;
             for (const uint32_t id : plan.order) {
                 const uint8_t type = percounter_full_width_type(tasks[id], clusters);
@@ -601,11 +654,14 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
             }
             if (candidate_count != 0) {
                 plan.intervals.resize(task_count);
+                synchronous.resize(task_count);
                 for (const uint32_t id : plan.order)
                     if (width[id] != 0) plan.intervals[id].flags = PERCOUNTER_DISPATCH_INTERVAL_ENTRY;
+                for (const uint32_t id : plan.order)
+                    synchronous[id] = tasks[id].graph_invocation < 0 && !tasks[id].published_off_lane &&
+                                      !plan.is_terminal(id) && (width[id] != 0 || !may_defer(id));
             }
             if (candidate_count > 1) {
-                std::vector<uint8_t> synchronous(task_count);
                 std::vector<uint32_t> groups(task_count);
                 uint32_t group = 0;
                 for (const uint32_t id : plan.order) {
@@ -615,7 +671,6 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
                         continue;
                     }
                     groups[id] = group;
-                    synchronous[id] = !tasks[id].published_off_lane && (width[id] != 0 || !may_defer(id));
                 }
                 auto first = make_full_width_order(tasks, plan.order, width, synchronous, groups);
                 auto merged = merge_full_width_spans(tasks, std::move(first), width, synchronous);
@@ -643,10 +698,23 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
                 if (compressed) {
                     plan.order = std::move(merged.tasks);
                     plan.planned_clusters = clusters;
+                    for (const auto &span : merged.spans)
+                        if (span.types != 0) plan.interval_spans.push_back(span);
+                }
+            }
+            if (candidate_count != 0 && plan.interval_spans.empty()) {
+                uint32_t group = 0;
+                for (uint32_t p = 0; p < plan.order.size(); ++p) {
+                    const uint32_t id = plan.order[p];
+                    if (tasks[id].graph_invocation >= 0 || plan.is_terminal(id)) group += 2;
+                    const uint8_t types = width[id];
+                    if (types != 0)
+                        plan.interval_spans.push_back({p, p + 1, group, types, types == PERCOUNTER_TYPES_BOTH});
                 }
             }
         }
     }
+    if (!plan_device_fanin(tasks, plan, width, synchronous, clusters)) return std::nullopt;
     for (uint32_t id = 0; id < task_count; ++id) {
         const auto &task = tasks[id];
         if (task.inline_completed || task.published_off_lane || plan.is_interior(id)) continue;
@@ -701,6 +769,8 @@ inline bool build_tables(
         dispatch.order.size() != task_count || graph.invocation_count != layout.graph_invocation_count ||
         (graph.invocation_count != 0 && (graph.invocations == nullptr || graph.templates == nullptr)))
         return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
+    if (dispatch.fanin_offsets.size() != task_count + 1 || dispatch.fanin_ids.size() != layout.edge_count)
+        return fail(BuildStatus::EDGE_COUNT_MISMATCH, -1, -1);
 
     std::memset(base, 0, static_cast<size_t>(layout.upload_size));
 
@@ -739,7 +809,6 @@ inline bool build_tables(
     std::vector<int64_t> eligible[PERCOUNTER_LIST_COUNT];
     for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l)
         eligible[l].reserve(static_cast<size_t>(list_count[l]));
-    uint64_t edge_cursor = 0;
     // Set by the fanin walk below. What it leaves clear is a top-level sink:
     // no task in the table waits on it, so nothing but its own completion
     // reports that its branch of the graph is finished.
@@ -781,30 +850,25 @@ inline bool build_tables(
         if (task.fanin_count < 0 || (task.fanin_count > 0 && task.fanin_ids == nullptr))
             return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
 
-        const uint64_t row_begin = edge_cursor;
-        auto &row = fanin[id];
-        row.count = 0;
-        row.begin = static_cast<int32_t>(row_begin);
         for (int32_t e = 0; e < task.fanin_count; ++e) {
-            if (edge_cursor >= layout.edge_count)
-                return fail(BuildStatus::EDGE_COUNT_MISMATCH, static_cast<int64_t>(id), e);
             const int32_t producer = task.fanin_ids[e];
             if (producer < 0 || static_cast<uint64_t>(producer) >= task_count)
                 return fail(BuildStatus::PRODUCER_OUT_OF_RANGE, static_cast<int64_t>(id), e);
             if (static_cast<uint64_t>(producer) >= id)
                 return fail(BuildStatus::PRODUCER_NOT_BEFORE_CONSUMER, static_cast<int64_t>(id), e);
-            const auto &source = tasks[producer];
-            // The device row contains only dependencies that can block at run time.
-            if (!source.inline_completed) {
-                auto &ref = fanin_addr[row_begin + row.count];
-                ref =
-                    device_base + layout.counters_offset + static_cast<uint64_t>(producer) * sizeof(PercounterCounter);
-                if (counters[producer].completion_notify_address != 0) ref |= PERCOUNTER_COMPLETION_NOTIFY;
-                ++row.count;
-            }
             // Edge validation and sink discovery use the input DAG.
             consumed[static_cast<size_t>(producer)] = true;
-            ++edge_cursor;
+        }
+        const uint32_t begin = dispatch.fanin_offsets[id];
+        const uint32_t end = dispatch.fanin_offsets[id + 1];
+        fanin[id].begin = static_cast<int32_t>(begin);
+        fanin[id].count = static_cast<int32_t>(end - begin);
+        for (uint32_t e = begin; e < end; ++e) {
+            const uint32_t producer = dispatch.fanin_ids[e];
+            uint64_t address =
+                device_base + layout.counters_offset + static_cast<uint64_t>(producer) * sizeof(PercounterCounter);
+            if (counters[producer].completion_notify_address != 0) address |= PERCOUNTER_COMPLETION_NOTIFY;
+            fanin_addr[e] = address;
         }
 
         if (task.block_num < 1 || static_cast<uint64_t>(task.block_num) > PERCOUNTER_ORDER_BLOCK_MASK)
@@ -946,7 +1010,6 @@ inline bool build_tables(
         }
         if (cursor != list_count[l]) return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
     }
-    if (edge_cursor != layout.edge_count) return fail(BuildStatus::EDGE_COUNT_MISMATCH, -1, -1);
 
     auto *segments = region_at<PercounterSegment>(base, layout.segments_offset);
     auto *summaries = region_at<PercounterClaimSummary>(base, layout.claim_summary_offset);

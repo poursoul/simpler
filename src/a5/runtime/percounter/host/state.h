@@ -236,11 +236,7 @@ inline StateSelection select_percounter_state(
         LOG_ERROR("A5 percounter: invalid dependency-only task fanin");
         return StateSelection::FAILED;
     }
-    uint64_t edge_count = edges.size();
     if (!folded.empty()) {
-        edge_count = 0;
-        for (const auto &input : inputs)
-            edge_count += static_cast<uint64_t>(input.fanin_count);
         execution_count -= folded.size();
         LOG_TIMING("A5 percounter: folded %zu dependency-only tasks", folded.size());
     }
@@ -270,8 +266,8 @@ inline StateSelection select_percounter_state(
     const uint64_t sync_cohort_count = dispatch->sync_cohort_count;
     PercounterLayout layout{};
     if (!plan_layout(
-            task_count, block_total, edge_count, dispatch->order_count, &layout, dispatch->mix_task_count,
-            dispatch->boundary_task_count, sync_cohort_count, graph.layout, execution_count,
+            task_count, block_total, dispatch->fanin_ids.size(), dispatch->order_count, &layout,
+            dispatch->mix_task_count, dispatch->boundary_task_count, sync_cohort_count, graph.layout, execution_count,
             runtime->dev.chip_swimlane_level
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");

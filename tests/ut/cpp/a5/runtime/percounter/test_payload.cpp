@@ -110,11 +110,10 @@ struct Fixture {
             std::vector<int64_t> folded;
             EXPECT_TRUE(percounter_fold_dependency_tasks(inputs, folded_rows, folded));
         }
-        uint64_t blocks = 0, edges = 0;
+        uint64_t blocks = 0;
         for (size_t i = 0; i < inputs.size(); ++i) {
             const auto &t = inputs[i];
             blocks += t.block_num;
-            edges += t.fanin_count;
             scalars[i] = i;
             storage[i].task.task_id = TaskId::make_global(i);
             storage[i].payload.scalar_count = 1;
@@ -126,7 +125,7 @@ struct Fixture {
             plan_host_dispatch(inputs.data(), inputs.size(), clusters, {}, enable_terminal, may_defer);
         EXPECT_TRUE(dispatch.has_value());
         EXPECT_TRUE(plan_layout(
-            inputs.size(), blocks, edges, dispatch->order_count, &layout, dispatch->mix_task_count,
+            inputs.size(), blocks, dispatch->fanin_ids.size(), dispatch->order_count, &layout, dispatch->mix_task_count,
             dispatch->boundary_task_count, dispatch->sync_cohort_count
         ));
         region.resize(layout.total_size + 128);
@@ -785,6 +784,135 @@ TEST(PercounterAcquire, StaticSuccessorKeepsFaninAndDropsStart) {
     EXPECT_EQ(f.cfg[2].metadata[1].sync_index, PERCOUNTER_NO_SYNC);
     EXPECT_EQ(f.cfg[2].fanin[1].count, 1);
     EXPECT_EQ(f.cfg[2].fanin_addresses[f.cfg[2].fanin[1].begin], reinterpret_cast<uint64_t>(&f.counters[0].value));
+}
+
+TEST(PercounterAcquire, CommonBarrierRemovesOnlyTheEarlierMixFromVectorFanin) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Barrier trimming requires a single pending slot.";
+    const int32_t producers[]{0, 1};
+    auto second_mix = task(7, 2, true);
+    second_mix.fanin_ids = &producers[0];
+    second_mix.fanin_count = 1;
+    auto vector = task(2, 4, true);
+    vector.fanin_ids = producers;
+    vector.fanin_count = 2;
+    Fixture f({task(7, 2, true), second_mix, vector}, 2, {}, false, false, synchronous_task);
+    EXPECT_EQ(f.layout.edge_count, 1U);
+    EXPECT_EQ(f.cfg[0].fanin[1].count, 0);
+    ASSERT_EQ(f.cfg[0].fanin[2].count, 1);
+    EXPECT_EQ(f.cfg[0].fanin_addresses[0], reinterpret_cast<uint64_t>(&f.counters[1].value));
+    ASSERT_EQ(f.control->sink_count, 1U);
+    const auto *sinks = scheduler_state_at<uint64_t>(f.control, f.control->sinks_offset);
+    EXPECT_EQ(sinks[0], 2U);
+}
+
+TEST(PercounterAcquire, VectorBarrierKeepsDeferredAndCrossTypePrefixFanin) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Barrier trimming requires a single pending slot.";
+    const int32_t producers[]{0, 1, 2, 3};
+    auto external = task(2);
+    external.published_off_lane = true;
+    auto barrier = task(2, 4, true);
+    barrier.fanin_ids = producers;
+    barrier.fanin_count = 4;
+    Fixture f({task(2), task(1), task(2), external, barrier}, 2, {}, false, false, [](uint32_t id) {
+        return id == 2;
+    });
+    ASSERT_EQ(f.cfg[2].fanin[4].count, 3);
+    for (uint32_t i = 0; i < 3; ++i)
+        EXPECT_EQ(f.cfg[2].fanin_addresses[i], reinterpret_cast<uint64_t>(&f.counters[i + 1].value));
+    EXPECT_EQ(f.control->planned_clusters, 2U);
+}
+
+TEST(PercounterAcquire, TrimmedMixStartsBeforeProducerDoneAndReadsAfterItsBarrier) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Barrier trimming requires a single pending slot.";
+    for (const bool notify : {false, true}) {
+        const int32_t producer = 0;
+        auto successor = task(7, 2, true);
+        successor.fanin_ids = &producer;
+        successor.fanin_count = 1;
+        const std::vector<TaskInput> inputs{task(7, 2, true), successor};
+        alignas(32) uint32_t credits = 0;
+        const uint64_t address = reinterpret_cast<uint64_t>(&credits);
+        SchedulerCompletionCounterPlan plan;
+        ExternalAddresses external;
+        if (notify) {
+            std::string error;
+            ASSERT_TRUE(plan_percounter_completion_counters(inputs, &plan, &error)) << error;
+            ASSERT_EQ(plan.task_chains[0], plan.task_chains[1]);
+            external.completion_plan = &plan;
+            external.completion_notify = &address;
+            external.completion_notify_count = 1;
+        }
+        Fixture f(inputs, 2, external, false, false, synchronous_task);
+        ASSERT_EQ(f.cfg[0].fanin[1].count, 0);
+        std::array<std::atomic<uint32_t>, 6> outputs{};
+        std::atomic<bool> delayed{false};
+        std::atomic<bool> released{false};
+        std::atomic<bool> abort{false};
+        std::atomic<uint32_t> arrived{0};
+        std::atomic<uint32_t> consumed{0};
+        std::atomic<uint32_t> finished{0};
+        execute = [&](int64_t *args) {
+            const uint32_t block = get_block_idx(args);
+            ASSERT_LT(block, f.signals.size());
+            size_t role = 0;
+            while (role < 3 && current_context != &f.signals[block].contexts[role].value)
+                ++role;
+            if (args[0] == 0) {
+                if (block == 1 && role == 2) {
+                    delayed.store(true, std::memory_order_release);
+                    while (!released.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                }
+                EXPECT_LT(role, 3U);
+                if (role < 3) outputs[3 * block + role].store(3 * block + role + 1, std::memory_order_relaxed);
+                return;
+            }
+            arrived.fetch_add(1, std::memory_order_acq_rel);
+            while (arrived.load(std::memory_order_acquire) != outputs.size()) {
+                if (abort.load(std::memory_order_acquire)) return;
+                std::this_thread::yield();
+            }
+            for (uint32_t i = 0; i < outputs.size(); ++i)
+                EXPECT_EQ(outputs[i].load(std::memory_order_relaxed), i + 1);
+            consumed.fetch_add(1, std::memory_order_release);
+        };
+        std::vector<std::thread> lanes;
+        for (uint32_t i = 0; i < f.cfg.size(); ++i) {
+            lanes.emplace_back([&, i] {
+                const uint32_t role = i % 3;
+                percounter_bind_sim_context(&f.signals[i / 3].contexts[role].value);
+                if (role == 0) percounter_lane_loop<0>(f.cfg[i]);
+                if (role == 1) percounter_lane_loop<1>(f.cfg[i]);
+                if (role == 2) percounter_lane_loop<2>(f.cfg[i]);
+                finished.fetch_add(1, std::memory_order_release);
+            });
+        }
+        const auto wait = std::chrono::seconds(2);
+        const auto deadline = std::chrono::steady_clock::now() + wait;
+        while ((!delayed.load(std::memory_order_acquire) || arrived.load(std::memory_order_acquire) == 0) &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        EXPECT_TRUE(delayed.load(std::memory_order_acquire));
+        EXPECT_NE(arrived.load(std::memory_order_acquire), 0U);
+        EXPECT_EQ(consumed.load(std::memory_order_acquire), 0U);
+        if (notify) EXPECT_LT(percounter_notify_query(credits), f.counters[0].completion_notify_target);
+        else EXPECT_FALSE(percounter_counter_published(percounter_gm_read(f.counters[0].value)));
+        released.store(true, std::memory_order_release);
+        const auto finish = std::chrono::steady_clock::now() + wait;
+        while (finished.load(std::memory_order_acquire) != lanes.size() && std::chrono::steady_clock::now() < finish)
+            std::this_thread::yield();
+        if (finished.load(std::memory_order_acquire) != lanes.size()) {
+            abort.store(true, std::memory_order_release);
+            percounter_gm_store(f.control->lane_error, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+        }
+        for (auto &lane : lanes)
+            lane.join();
+        EXPECT_EQ(f.control->lane_error, 0U);
+        EXPECT_EQ(consumed.load(std::memory_order_acquire), outputs.size());
+        if (notify) EXPECT_TRUE(f.completed(0));
+        else f.expect_completed(0);
+        f.expect_completed(1);
+    }
 }
 
 TEST(PercounterResourceOrder, MovesOnlyGapsThatPreserveDependenciesAndGraphBoundary) {

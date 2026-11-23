@@ -101,7 +101,7 @@ Host 逐条处理原有 fanin，仅用全宽 SPMD 区间的 barrier 裁掉已覆
 | ---- | ---------- |
 | `PercounterCounter` 的 36 字节预留区 | 32 位派发标志区分入口和区间成员，两项 32 位 `next_aic`、`next_aiv` 使用 `UINT32_MAX` 表示结束。一个 64 位 `per_core_pre_dispatch_tasks` 表引用挂共同末端批，两个 64 位入口截止位置分别对应 AIC、AIV/MIX。保持 counter 128 字节及对齐。 |
 | 入口截止位置 | 每项包含 32 位 segment 索引和 32 位排他 order position。定位到最终普通列表，`UINT64_MAX` 表示本核型无截止位置。 |
-| `PercounterControl` | 只读启动表引用，保持全局 async 计数所在扇区的隔离。 |
+| `PercounterControl` | 只读启动表引用和规划时的集群数。使用静态链接、fanin 裁剪或预派发时，AICPU 在 READY 前确认实测集群数完全匹配。保持全局 async 计数所在扇区的隔离。 |
 | GM 预派发表 | 表引用为 8 字节对齐的镜像相对 offset，0 表示无表。低位表示启动按核型布局。该布局用两项 64 位字分别表达 AIC 和 AIV，block 按全宽映射推导。逐核布局按 `3 * cluster_idx + cluster_lane` 索引，使用现有 `percounter_order_entry(task_id, block_idx, block_num)` 编码。尾部固定使用逐核布局。task ID 为 `UINT32_MAX` 表示 `invalid`。 |
 | 簇 SSBUF | 增加三项 32 位到达 token 和一项 32 位放行 token，放在 `PercounterSsbufRegion` 尾部预留区。参与角色只写自己的到达 token，最低活动角色写放行 token。0 表示未到达，启动批使用 1，尾部批使用尾任务的 `global_order_id + 2`。每轮在 READY 后、本簇首次派发前清零并发布初始化完成。 |
 

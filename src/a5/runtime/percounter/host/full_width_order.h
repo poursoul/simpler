@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <queue>
 #include <utility>
 #include <vector>
@@ -38,11 +39,11 @@ inline uint8_t percounter_full_width_shape(uint32_t mask, uint32_t blocks, uint3
 }
 
 template <typename Task>
-inline uint8_t percounter_full_width_type(const Task &task, uint32_t clusters) {
-    if (!task.sync_start || task.has_predicate || task.graph_invocation >= 0 || task.inline_completed ||
-        task.published_off_lane)
-        return 0;
-    return percounter_full_width_shape(task.active_mask, static_cast<uint32_t>(task.block_num), clusters);
+inline uint8_t percounter_static_width(const Task &task, uint32_t clusters) {
+    if (task.has_predicate || task.graph_invocation >= 0 || task.inline_completed || task.published_off_lane) return 0;
+    const uint8_t width =
+        percounter_full_width_shape(task.active_mask, static_cast<uint32_t>(task.block_num), clusters);
+    return task.sync_start || width != PERCOUNTER_TYPES_BOTH ? width : 0;
 }
 
 struct FullWidthSpan {
@@ -98,29 +99,48 @@ inline FullWidthOrder make_full_width_order(
             ++end;
 
         using Ready = std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<uint32_t>>;
-        std::array<Ready, 4> ready;
+        constexpr uint8_t after_entry = PERCOUNTER_TYPES_BOTH;
+        std::array<Ready, after_entry + PERCOUNTER_TYPE_AIV + 1> ready;
+        const auto queue_for = [&](uint32_t id) {
+            return width[id] == 0 || tasks[id].sync_start ? width[id] : width[id] + after_entry;
+        };
         for (uint32_t i = begin; i < end; ++i) {
             const uint32_t id = original[i];
-            if (pending[id] == 0) ready[width[id]].push(i);
+            if (pending[id] == 0) ready[queue_for(id)].push(i);
         }
-        const auto pop = [&](uint8_t types) {
-            const uint32_t id = original[ready[types].top()];
-            ready[types].pop();
+        const auto earliest = [&](std::initializer_list<uint8_t> queues) {
+            uint8_t selected = UINT8_MAX;
+            uint32_t priority = UINT32_MAX;
+            for (const uint8_t queue : queues) {
+                if (ready[queue].empty() || ready[queue].top() >= priority) continue;
+                priority = ready[queue].top();
+                selected = queue;
+            }
+            return selected;
+        };
+        const auto earliest_ordinary = [&] {
+            return earliest({0, after_entry + PERCOUNTER_TYPE_AIC, after_entry + PERCOUNTER_TYPE_AIV});
+        };
+        const auto pop = [&](uint8_t queue) {
+            const uint32_t id = original[ready[queue].top()];
+            ready[queue].pop();
             return id;
         };
         const auto emit = [&](uint32_t id) {
             assigned[id] = static_cast<uint32_t>(next.tasks.size());
             next.tasks.push_back(id);
             for (const uint32_t consumer : successors[id])
-                if (--pending[consumer] == 0) ready[width[consumer]].push(rank[consumer]);
+                if (--pending[consumer] == 0) ready[queue_for(consumer)].push(rank[consumer]);
         };
 
         while (next.tasks.size() < end) {
             const uint32_t first = static_cast<uint32_t>(next.tasks.size());
-            if (!ready[0].empty()) {
+            uint8_t ordinary = earliest_ordinary();
+            if (ordinary != UINT8_MAX) {
                 do {
-                    emit(pop(0));
-                } while (!ready[0].empty());
+                    emit(pop(ordinary));
+                    ordinary = earliest_ordinary();
+                } while (ordinary != UINT8_MAX);
                 next.spans.push_back({first, static_cast<uint32_t>(next.tasks.size()), group, 0, false});
                 continue;
             }
@@ -144,19 +164,14 @@ inline FullWidthOrder make_full_width_order(
                 add_entry(aic);
                 add_entry(aiv);
             } else {
-                uint8_t entry = 0;
-                uint32_t earliest = UINT32_MAX;
-                for (uint8_t kind = PERCOUNTER_TYPE_AIC; kind <= PERCOUNTER_TYPES_BOTH; ++kind) {
-                    if (ready[kind].empty() || ready[kind].top() >= earliest) continue;
-                    earliest = ready[kind].top();
-                    entry = kind;
-                }
-                add_entry(pop(entry));
+                add_entry(pop(earliest({PERCOUNTER_TYPE_AIC, PERCOUNTER_TYPE_AIV, PERCOUNTER_TYPES_BOTH})));
             }
 
-            const auto can_append = [&](uint8_t active) {
-                if ((types & active) != active || ready[active].empty()) return false;
-                const uint32_t id = original[ready[active].top()];
+            const auto can_append = [&](uint8_t queue) {
+                if (ready[queue].empty()) return false;
+                const uint32_t id = original[ready[queue].top()];
+                const uint8_t active = width[id];
+                if ((types & active) != active) return false;
                 const uint64_t attempt = generation | static_cast<uint64_t>(joined);
                 if (rejected[id] == attempt) return false;
                 const uint8_t prefix_types = joined ? types : active;
@@ -179,15 +194,17 @@ inline FullWidthOrder make_full_width_order(
             while (true) {
                 // A ready MIX closes the interval when there is no other
                 // reachable work to place before it.
-                uint8_t active = 0;
-                for (uint8_t kind = PERCOUNTER_TYPE_AIC; kind <= PERCOUNTER_TYPES_BOTH; ++kind) {
+                uint8_t queue = 0;
+                for (const uint8_t kind :
+                     {PERCOUNTER_TYPE_AIC, uint8_t{after_entry + PERCOUNTER_TYPE_AIC}, PERCOUNTER_TYPE_AIV,
+                      uint8_t{after_entry + PERCOUNTER_TYPE_AIV}, PERCOUNTER_TYPES_BOTH}) {
                     if (!can_append(kind)) continue;
-                    active = kind;
+                    queue = kind;
                     break;
                 }
-                if (active == 0) break;
-                emit(pop(active));
-                joined |= active == PERCOUNTER_TYPES_BOTH;
+                if (queue == 0) break;
+                emit(pop(queue));
+                joined |= queue == PERCOUNTER_TYPES_BOTH;
             }
             const size_t span = next.spans.size();
             if (span >= 2 && next.spans[span - 1].types == 0 && next.spans[span - 2].types != 0 &&

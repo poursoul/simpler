@@ -598,7 +598,7 @@ inline bool plan_device_fanin(
     plan.fanin_offsets.reserve(count + 1);
     for (uint32_t id = 0; id < count; ++id) {
         plan.fanin_offsets.push_back(static_cast<uint32_t>(plan.fanin_ids.size()));
-        const uint8_t consumer = rank.empty() ? 0 : width[id];
+        const uint8_t consumer = !rank.empty() && tasks[id].sync_start ? width[id] : 0;
         const uint32_t anchor = tail_anchor.empty() ? UINT32_MAX : tail_anchor[id];
         for (int32_t e = 0; e < tasks[id].fanin_count; ++e) {
             const uint32_t producer = static_cast<uint32_t>(tasks[id].fanin_ids[e]);
@@ -683,22 +683,25 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
         if (may_defer) {
             width.resize(task_count);
             uint32_t candidate_count = 0;
+            uint32_t entry_count = 0;
             for (const uint32_t id : plan.order) {
-                const uint8_t type = percounter_full_width_type(tasks[id], clusters);
+                const uint8_t type = percounter_static_width(tasks[id], clusters);
                 if (type == 0 || plan.is_terminal(id) || may_defer(id)) continue;
                 width[id] = type;
                 ++candidate_count;
+                entry_count += tasks[id].sync_start;
             }
-            if (candidate_count != 0) {
+            if (entry_count != 0) {
                 plan.intervals.resize(task_count);
                 synchronous.resize(task_count);
                 for (const uint32_t id : plan.order)
-                    if (width[id] != 0) plan.intervals[id].flags = PERCOUNTER_DISPATCH_INTERVAL_ENTRY;
+                    if (width[id] != 0 && tasks[id].sync_start)
+                        plan.intervals[id].flags = PERCOUNTER_DISPATCH_INTERVAL_ENTRY;
                 for (const uint32_t id : plan.order)
                     synchronous[id] = tasks[id].graph_invocation < 0 && !tasks[id].published_off_lane &&
                                       !plan.is_terminal(id) && (width[id] != 0 || !may_defer(id));
             }
-            if (candidate_count > 1) {
+            if (entry_count != 0 && candidate_count > 1) {
                 std::vector<uint32_t> groups(task_count);
                 uint32_t group = 0;
                 for (const uint32_t id : plan.order) {
@@ -739,13 +742,13 @@ inline std::optional<HostDispatchPlan> plan_host_dispatch(
                         if (span.types != 0) plan.interval_spans.push_back(span);
                 }
             }
-            if (candidate_count != 0 && plan.interval_spans.empty()) {
+            if (entry_count != 0 && plan.interval_spans.empty()) {
                 uint32_t group = 0;
                 for (uint32_t p = 0; p < plan.order.size(); ++p) {
                     const uint32_t id = plan.order[p];
                     if (tasks[id].graph_invocation >= 0 || plan.is_terminal(id)) group += 2;
                     const uint8_t types = width[id];
-                    if (types != 0)
+                    if (types != 0 && tasks[id].sync_start)
                         plan.interval_spans.push_back({p, p + 1, group, types, types == PERCOUNTER_TYPES_BOTH});
                 }
             }

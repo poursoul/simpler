@@ -788,6 +788,23 @@ TEST(PercounterAcquire, StaticSuccessorKeepsFaninAndDropsStart) {
     EXPECT_EQ(f.cfg[2].fanin_addresses[f.cfg[2].fanin[1].begin], reinterpret_cast<uint64_t>(&f.counters[0].value));
 }
 
+TEST(PercounterAcquire, OrdinaryFullWidthPureSuccessorsKeepTaskCompletion) {
+    if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Static links require a single pending slot.";
+    for (const uint32_t mask : {1U, 2U}) {
+        const int32_t producer = 0;
+        auto successor = task(mask, mask == 1 ? 2 : 4);
+        successor.fanin_ids = &producer;
+        successor.fanin_count = 1;
+        Fixture f({task(mask, successor.block_num, true), successor}, 2, {}, false, false, synchronous_task);
+        EXPECT_EQ(f.layout.order_count[mask - 1], 1U);
+        EXPECT_EQ(f.layout.sync_cohort_count, 1U);
+        EXPECT_EQ(f.counters[0].next_task[mask - 1], 1U);
+        EXPECT_EQ(f.cfg[0].metadata[1].sync_index, PERCOUNTER_NO_SYNC);
+        ASSERT_EQ(f.cfg[0].fanin[1].count, 1);
+        EXPECT_EQ(f.cfg[0].fanin_addresses[f.cfg[0].fanin[1].begin], reinterpret_cast<uint64_t>(&f.counters[0].value));
+    }
+}
+
 TEST(PercounterAcquire, CommonBarrierRemovesOnlyTheEarlierMixFromVectorFanin) {
     if constexpr (PERCOUNTER_PENDING_CAPACITY != 1) GTEST_SKIP() << "Barrier trimming requires a single pending slot.";
     const int32_t producers[]{0, 1};
@@ -1076,7 +1093,7 @@ TEST(PercounterAcquire, TailTablePlacesNarrowMixAndKeepsTheAnchorFanin) {
     next_wave.fanin_ids = &predecessors[2];
     next_wave.fanin_count = 1;
     auto full_vectors = task(2, 4);
-    full_vectors.fanin_ids = &predecessors[1];
+    full_vectors.fanin_ids = &predecessors[2];
     full_vectors.fanin_count = 1;
     Fixture f(
         {task(7, 2, true), tail, vector, cube, mix, next_wave, full_vectors}, 2, {}, false, false, synchronous_task,
